@@ -315,6 +315,11 @@ class FilesPanel(Gtk.Box):
         self._photo_grid.set_selection_mode(Gtk.SelectionMode.NONE)
         photo_scroll.set_child(self._photo_grid)
 
+        # Keyboard shortcut: Ctrl+C copies selected photos
+        key_ctrl = Gtk.EventControllerKey()
+        key_ctrl.connect("key-pressed", self._on_key_pressed)
+        self.add_controller(key_ctrl)
+
         # Photo empty placeholder
         self._photo_empty = Adw.StatusPage()
         self._photo_empty.set_icon_name("camera-photo-symbolic")
@@ -675,6 +680,12 @@ class FilesPanel(Gtk.Box):
             gesture = Gtk.GestureClick()
             gesture.connect("pressed", self._on_photo_clicked, tile)
             fb_child.add_controller(gesture)
+
+            # Right-click context menu
+            right_click = Gtk.GestureClick(button=3)
+            right_click.connect("pressed", self._on_photo_right_clicked, tile, fb_child)
+            fb_child.add_controller(right_click)
+
             self._photo_grid.append(fb_child)
 
         # Load thumbnails in background
@@ -719,12 +730,52 @@ class FilesPanel(Gtk.Box):
             self._update_selection_buttons()
         elif n_press == 2:
             # Double-click: open the photo
-            try:
-                Gio.AppInfo.launch_default_for_uri(
-                    f"file://{tile.full_path}", None
-                )
-            except GLib.Error as e:
-                self._photo_status.set_label(f"Cannot open: {e.message}")
+            self._open_file(tile.full_path, self._photo_status)
+
+    def _on_photo_right_clicked(self, gesture, n_press, x, y, tile: PhotoTile, widget):
+        self._show_photo_context_menu(tile, widget, x, y)
+
+    def _show_photo_context_menu(self, tile: PhotoTile, widget, x: float, y: float):
+        menu = Gio.Menu()
+        menu.append("Open", f"files.open-photo::{tile.full_path}")
+        menu.append("Copy", f"files.copy-photo::{tile.full_path}")
+        menu.append("Save As…", f"files.save-photo::{tile.full_path}")
+
+        popover = Gtk.PopoverMenu.new_from_model(menu)
+        popover.set_parent(widget)
+        popover.set_pointing_to(Gdk.Rectangle(x=int(x), y=int(y), width=1, height=1))
+
+        group = Gio.SimpleActionGroup()
+
+        open_action = Gio.SimpleAction.new_with_parameter(
+            "open-photo", GLib.VariantType.new("s")
+        )
+        open_action.connect("activate", lambda a, v: self._open_file(v.get_string(), self._photo_status))
+        group.add_action(open_action)
+
+        copy_action = Gio.SimpleAction.new_with_parameter(
+            "copy-photo", GLib.VariantType.new("s")
+        )
+        copy_action.connect("activate", lambda a, v: self._copy_paths([v.get_string()], self._photo_status))
+        group.add_action(copy_action)
+
+        save_action = Gio.SimpleAction.new_with_parameter(
+            "save-photo", GLib.VariantType.new("s")
+        )
+        save_action.connect("activate", lambda a, v: self._save_file_dialog([v.get_string()], self._photo_status))
+        group.add_action(save_action)
+
+        popover.insert_action_group("files", group)
+        popover.popup()
+
+    def _on_key_pressed(self, _ctrl, keyval, _keycode, state):
+        ctrl = bool(state & Gdk.ModifierType.CONTROL_MASK)
+        if ctrl and keyval == Gdk.KEY_c:
+            selected = self._get_selected_paths()
+            if selected:
+                self._copy_paths(selected, self._photo_status)
+                return True
+        return False
 
     def _update_selection_buttons(self):
         count = sum(1 for t in self._photo_tiles if t.is_selected)
@@ -747,35 +798,70 @@ class FilesPanel(Gtk.Box):
 
     def _on_save_selected(self, _btn):
         paths = self._get_selected_paths()
-        if not paths:
-            return
+        if paths:
+            self._save_file_dialog(paths, self._photo_status)
 
-        dialog = Gtk.FileDialog()
-        dialog.set_title("Save Photos To…")
-        dialog.select_folder(
-            self.get_root(),
-            None,
-            self._on_save_folder_chosen,
+    def _on_copy_selected(self, _btn):
+        paths = self._get_selected_paths()
+        if paths:
+            self._copy_paths(paths, self._photo_status)
+            for t in self._photo_tiles:
+                t.set_selected(False)
+            self._update_selection_buttons()
+
+    # ── Shared file actions ────────────────────────────────────────
+
+    def _open_file(self, path: str, status_label: Gtk.Label):
+        try:
+            Gio.AppInfo.launch_default_for_uri(f"file://{path}", None)
+        except GLib.Error as e:
+            status_label.set_label(f"Cannot open: {e.message}")
+
+    def _copy_paths(self, paths: list[str], status_label: Gtk.Label):
+        """Copy image data (single) or file URIs (multiple) to clipboard."""
+        clipboard = self.get_clipboard()
+        if len(paths) == 1 and _is_image(paths[0]):
+            try:
+                pixbuf = GdkPixbuf.Pixbuf.new_from_file(paths[0])
+                clipboard.set_texture(Gdk.Texture.new_for_pixbuf(pixbuf))
+                status_label.set_label(f"Copied {os.path.basename(paths[0])} to clipboard")
+                return
+            except GLib.Error:
+                pass
+        # Fall back to URI list (works for files, videos, etc.)
+        content = Gdk.ContentProvider.new_for_value(
+            GLib.Variant("as", [f"file://{p}" for p in paths])
+        )
+        clipboard.set_content(content)
+        status_label.set_label(
+            f"Copied {os.path.basename(paths[0])} to clipboard"
+            if len(paths) == 1
+            else f"Copied {len(paths)} files to clipboard"
         )
 
-    def _on_save_folder_chosen(self, dialog, result):
+    def _save_file_dialog(self, paths: list[str], status_label: Gtk.Label):
+        """Open a folder picker and copy paths there."""
+        dialog = Gtk.FileDialog()
+        dialog.set_title("Save to Folder…")
+        dialog.select_folder(
+            self.get_root(), None,
+            lambda d, r: self._do_save_to_folder(d, r, paths, status_label),
+        )
+
+    def _do_save_to_folder(self, dialog, result, paths: list[str], status_label: Gtk.Label):
         try:
             folder = dialog.select_folder_finish(result)
         except GLib.Error:
             return
         if not folder:
             return
-
         dest_dir = folder.get_path()
         if not dest_dir:
             return
-
-        paths = self._get_selected_paths()
         saved = 0
         for src in paths:
             name = os.path.basename(src)
             dest = os.path.join(dest_dir, name)
-            # Avoid overwrites
             if os.path.exists(dest):
                 base, ext = os.path.splitext(name)
                 counter = 1
@@ -786,42 +872,12 @@ class FilesPanel(Gtk.Box):
                 shutil.copy2(src, dest)
                 saved += 1
             except OSError as e:
-                self._photo_status.set_label(f"Error saving {name}: {e}")
+                status_label.set_label(f"Error saving {name}: {e}")
                 return
-
-        # Deselect after save
         for t in self._photo_tiles:
             t.set_selected(False)
         self._update_selection_buttons()
-        self._photo_status.set_label(f"Saved {saved} photo{'s' if saved != 1 else ''} to {dest_dir}")
-
-    def _on_copy_selected(self, _btn):
-        """Copy selected photos to the clipboard."""
-        paths = self._get_selected_paths()
-        if not paths:
-            return
-
-        if len(paths) == 1:
-            # Single photo: copy the image data to clipboard
-            try:
-                pixbuf = GdkPixbuf.Pixbuf.new_from_file(paths[0])
-                texture = Gdk.Texture.new_for_pixbuf(pixbuf)
-                clipboard = self.get_clipboard()
-                clipboard.set_texture(texture)
-                self._photo_status.set_label("Photo copied to clipboard")
-            except GLib.Error as e:
-                self._photo_status.set_label(f"Copy failed: {e.message}")
-        else:
-            # Multiple: copy file URIs
-            uris = "\n".join(f"file://{p}" for p in paths)
-            clipboard = self.get_clipboard()
-            clipboard.set(uris)
-            self._photo_status.set_label(f"Copied {len(paths)} file paths to clipboard")
-
-        # Deselect
-        for t in self._photo_tiles:
-            t.set_selected(False)
-        self._update_selection_buttons()
+        status_label.set_label(f"Saved {saved} file{'s' if saved != 1 else ''} to {dest_dir}")
 
     # ── Shortcuts sidebar ──────────────────────────────────────────
 
@@ -969,6 +1025,10 @@ class FilesPanel(Gtk.Box):
             row_widget = FileRow(name, full, is_dir, size)
             row = Gtk.ListBoxRow()
             row.set_child(row_widget)
+            # Right-click context menu on file rows
+            rc = Gtk.GestureClick(button=3)
+            rc.connect("pressed", self._on_file_right_clicked, row_widget)
+            row.add_controller(rc)
             self._file_list.append(row)
 
         total = len(dirs) + len(files)
@@ -990,12 +1050,55 @@ class FilesPanel(Gtk.Box):
         if child.is_dir:
             self._navigate_to(child.full_path)
         else:
-            try:
-                Gio.AppInfo.launch_default_for_uri(
-                    f"file://{child.full_path}", None
-                )
-            except GLib.Error as e:
-                self._status_bar.set_label(f"Cannot open: {e.message}")
+            self._open_file(child.full_path, self._status_bar)
+
+    def _on_file_right_clicked(self, gesture, n_press, x, y, file_row: FileRow):
+        menu = Gio.Menu()
+        if file_row.is_dir:
+            menu.append("Open", f"files.open-file::{file_row.full_path}")
+        else:
+            menu.append("Open", f"files.open-file::{file_row.full_path}")
+            menu.append("Copy", f"files.copy-file::{file_row.full_path}")
+            menu.append("Save As…", f"files.save-file::{file_row.full_path}")
+
+        popover = Gtk.PopoverMenu.new_from_model(menu)
+        widget = gesture.get_widget()
+        popover.set_parent(widget)
+        popover.set_pointing_to(Gdk.Rectangle(x=int(x), y=int(y), width=1, height=1))
+
+        group = Gio.SimpleActionGroup()
+
+        open_action = Gio.SimpleAction.new_with_parameter(
+            "open-file", GLib.VariantType.new("s")
+        )
+        open_action.connect(
+            "activate",
+            lambda a, v: (self._navigate_to(v.get_string()) if file_row.is_dir
+                          else self._open_file(v.get_string(), self._status_bar))
+        )
+        group.add_action(open_action)
+
+        if not file_row.is_dir:
+            copy_action = Gio.SimpleAction.new_with_parameter(
+                "copy-file", GLib.VariantType.new("s")
+            )
+            copy_action.connect(
+                "activate",
+                lambda a, v: self._copy_paths([v.get_string()], self._status_bar)
+            )
+            group.add_action(copy_action)
+
+            save_action = Gio.SimpleAction.new_with_parameter(
+                "save-file", GLib.VariantType.new("s")
+            )
+            save_action.connect(
+                "activate",
+                lambda a, v: self._save_file_dialog([v.get_string()], self._status_bar)
+            )
+            group.add_action(save_action)
+
+        popover.insert_action_group("files", group)
+        popover.popup()
 
     def _on_go_up(self, _btn):
         if not self._current_path:
