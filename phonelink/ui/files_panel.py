@@ -68,13 +68,30 @@ class PhotoTile(Gtk.Overlay):
 
         self.set_size_request(THUMB_SIZE, THUMB_SIZE)
 
-        # Image area
+        # Container that holds either placeholder or image
+        self._stack = Gtk.Stack()
+        self._stack.set_size_request(THUMB_SIZE, THUMB_SIZE)
+        self._stack.add_css_class("photo-tile")
+        self.set_child(self._stack)
+
+        # Placeholder (visible while loading)
+        placeholder = Gtk.Box(orientation=Gtk.Orientation.VERTICAL, spacing=4)
+        placeholder.set_halign(Gtk.Align.CENTER)
+        placeholder.set_valign(Gtk.Align.CENTER)
+        icon = Gtk.Image.new_from_icon_name("image-x-generic-symbolic")
+        icon.set_pixel_size(32)
+        icon.set_opacity(0.4)
+        placeholder.append(icon)
+        self._stack.add_named(placeholder, "placeholder")
+
+        # Image area (shown once thumbnail loads)
         self._picture = Gtk.Picture()
         self._picture.set_can_shrink(True)
         self._picture.set_content_fit(Gtk.ContentFit.COVER)
         self._picture.set_size_request(THUMB_SIZE, THUMB_SIZE)
-        self._picture.add_css_class("photo-tile")
-        self.set_child(self._picture)
+        self._stack.add_named(self._picture, "image")
+
+        self._stack.set_visible_child_name("placeholder")
 
         # Selection check overlay
         self._check = Gtk.Image.new_from_icon_name("object-select-symbolic")
@@ -95,17 +112,12 @@ class PhotoTile(Gtk.Overlay):
         name_label.add_css_class("photo-label")
         self.add_overlay(name_label)
 
-        # Placeholder icon while loading
-        self._placeholder = Gtk.Image.new_from_icon_name("image-loading-symbolic")
-        self._placeholder.set_pixel_size(48)
-        self._placeholder.set_opacity(0.3)
-        self._picture.set_paintable(None)
-
     def set_thumbnail(self, pixbuf):
         """Set the loaded thumbnail pixbuf (called from main thread)."""
         if pixbuf:
             texture = Gdk.Texture.new_for_pixbuf(pixbuf)
             self._picture.set_paintable(texture)
+            self._stack.set_visible_child_name("image")
 
     def set_selected(self, selected: bool):
         self._selected = selected
@@ -164,6 +176,7 @@ class FilesPanel(Gtk.Box):
         self.client = client
         self._device = None
         self._mount_point = ""
+        self._storage_base = ""  # e.g. mount_point/storage/emulated/0
         self._current_path = ""
         self._is_mounted = False
         self._signal_ids: list[int] = []
@@ -285,6 +298,9 @@ class FilesPanel(Gtk.Box):
         self._photo_actions.append(self._copy_btn)
 
         right_area.append(Gtk.Separator(orientation=Gtk.Orientation.HORIZONTAL))
+
+        self._view_stack.set_vexpand(True)
+        right_area.append(self._view_stack)
 
         # ── Photo grid view ────────────────────────────────────────
         photo_page = Gtk.Box(orientation=Gtk.Orientation.VERTICAL)
@@ -418,7 +434,7 @@ class FilesPanel(Gtk.Box):
         if device and device.reachable:
             if not old or old.id != device.id or not old.reachable:
                 self._subscribe_signals(device.id)
-                self._check_mount(device.id)
+                self._auto_mount_and_load(device.id)
                 self._build_shortcuts(device.id)
             self._outer_stack.set_visible_child_name("content")
         elif device:
@@ -469,9 +485,24 @@ class FilesPanel(Gtk.Box):
 
     # ── Mount management ───────────────────────────────────────────
 
-    def _check_mount(self, device_id: str):
-        self._mount_point = self.client.sftp_mount_point(device_id)
+    def _auto_mount_and_load(self, device_id: str):
+        """Auto-mount the phone if needed and load photos."""
         self._is_mounted = self.client.sftp_is_mounted(device_id)
+        self._mount_point = self.client.sftp_mount_point(device_id)
+
+        if not self._is_mounted:
+            self._photo_status.set_label("Connecting to phone…")
+            self._status_bar.set_label("Mounting…")
+            ok = self.client.sftp_mount_and_wait(device_id)
+            if ok:
+                self._is_mounted = True
+                self._mount_point = self.client.sftp_mount_point(device_id)
+            else:
+                err = self.client.sftp_get_mount_error(device_id)
+                self._photo_status.set_label(f"Mount failed: {err}")
+                self._status_bar.set_label(f"Mount failed: {err}")
+
+        self._resolve_storage_base(device_id)
         self._update_mount_ui()
         if self._is_mounted and self._mount_point:
             self._load_recent_photos()
@@ -481,9 +512,28 @@ class FilesPanel(Gtk.Box):
             return
         self._is_mounted = self.client.sftp_is_mounted(self._device.id)
         self._mount_point = self.client.sftp_mount_point(self._device.id)
+        if not self._is_mounted:
+            ok = self.client.sftp_mount_and_wait(self._device.id)
+            if ok:
+                self._is_mounted = True
+                self._mount_point = self.client.sftp_mount_point(self._device.id)
+        self._resolve_storage_base(self._device.id)
         self._update_mount_ui()
         if self._is_mounted and self._mount_point:
             self._load_recent_photos()
+
+    def _resolve_storage_base(self, device_id: str):
+        """Find the actual accessible base dir (e.g. .../storage/emulated/0)."""
+        self._storage_base = ""
+        if not self._mount_point:
+            return
+        dirs = self.client.sftp_get_directories(device_id)
+        if dirs:
+            # Use the first directory returned by the phone
+            self._storage_base = next(iter(dirs))
+        else:
+            # Fallback: try the mount point directly
+            self._storage_base = self._mount_point
 
     def _update_mount_ui(self):
         if self._is_mounted:
@@ -560,12 +610,13 @@ class FilesPanel(Gtk.Box):
         self._loading_cancelled = False
         self._photo_status.set_label("Scanning for photos…")
 
-        # Search in common photo directories
+        # Use the resolved storage base (e.g. .../storage/emulated/0)
+        base = self._storage_base or self._mount_point
         search_dirs = [
-            os.path.join(self._mount_point, "DCIM", "Camera"),
-            os.path.join(self._mount_point, "DCIM"),
-            os.path.join(self._mount_point, "Pictures"),
-            os.path.join(self._mount_point, "Download"),
+            os.path.join(base, "DCIM", "Camera"),
+            os.path.join(base, "DCIM"),
+            os.path.join(base, "Pictures"),
+            os.path.join(base, "Download"),
         ]
 
         # Collect image files with mtime
@@ -641,6 +692,8 @@ class FilesPanel(Gtk.Box):
 
     def _load_thumbnails_async(self, image_files: list[tuple[str, float]]):
         """Load thumbnails in a background thread, posting to main thread."""
+        total = len(image_files)
+
         def worker():
             for i, (full_path, _) in enumerate(image_files):
                 if self._loading_cancelled:
@@ -652,12 +705,17 @@ class FilesPanel(Gtk.Box):
                     if not self._loading_cancelled and i < len(self._photo_tiles):
                         tile = self._photo_tiles[i]
                         GLib.idle_add(tile.set_thumbnail, pixbuf)
+                        if (i + 1) % 5 == 0 or i == total - 1:
+                            GLib.idle_add(
+                                self._photo_status.set_label,
+                                f"Loading {i + 1}/{total} photos\u2026"
+                            )
                 except GLib.Error:
                     pass
             if not self._loading_cancelled:
                 GLib.idle_add(
                     self._photo_status.set_label,
-                    f"{len(image_files)} photos"
+                    f"{total} photos"
                 )
 
         t = threading.Thread(target=worker, daemon=True)
