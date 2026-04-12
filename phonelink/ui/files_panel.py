@@ -226,27 +226,18 @@ class FilesPanel(Gtk.Box):
 
         sidebar.append(Gtk.Separator(orientation=Gtk.Orientation.HORIZONTAL))
 
-        # Action buttons
-        actions = Gtk.Box(orientation=Gtk.Orientation.VERTICAL, spacing=6)
-        actions.set_margin_top(8)
-        actions.set_margin_start(12)
-        actions.set_margin_end(12)
-        sidebar.append(actions)
-
-        send_btn = Gtk.Button(label="Send File to Phone")
-        send_btn.set_icon_name("document-send-symbolic")
+        # Send file button (the only action needed — navigation is via shortcuts)
+        send_btn = Gtk.Button()
+        send_btn.add_css_class("flat")
+        send_btn.set_margin_start(8)
+        send_btn.set_margin_end(8)
+        send_btn.set_margin_top(8)
+        send_row = Gtk.Box(orientation=Gtk.Orientation.HORIZONTAL, spacing=8)
+        send_row.append(Gtk.Image.new_from_icon_name("document-send-symbolic"))
+        send_row.append(Gtk.Label(label="Send File to Phone", xalign=0))
+        send_btn.set_child(send_row)
         send_btn.connect("clicked", self._on_send_file)
-        actions.append(send_btn)
-
-        open_dl_btn = Gtk.Button(label="Open Downloads")
-        open_dl_btn.set_icon_name("folder-download-symbolic")
-        open_dl_btn.connect("clicked", self._on_open_downloads)
-        actions.append(open_dl_btn)
-
-        self._mount_btn = Gtk.Button(label="Mount Phone")
-        self._mount_btn.set_icon_name("media-mount-symbolic")
-        self._mount_btn.connect("clicked", self._on_mount_toggle)
-        actions.append(self._mount_btn)
+        sidebar.append(send_btn)
 
         content.append(Gtk.Separator(orientation=Gtk.Orientation.VERTICAL))
 
@@ -320,7 +311,7 @@ class FilesPanel(Gtk.Box):
         self._photo_grid.set_margin_end(8)
         self._photo_grid.set_margin_top(8)
         self._photo_grid.set_margin_bottom(8)
-        self._photo_grid.set_homogeneous(True)
+        self._photo_grid.set_homogeneous(False)
         self._photo_grid.set_selection_mode(Gtk.SelectionMode.NONE)
         photo_scroll.set_child(self._photo_grid)
 
@@ -679,8 +670,11 @@ class FilesPanel(Gtk.Box):
             tile = PhotoTile(full_path, name)
             self._photo_tiles.append(tile)
 
-            # Wrap in a FlowBoxChild — add click gesture
+            # Wrap in a FlowBoxChild — fixed square size, no expanding
             fb_child = Gtk.FlowBoxChild()
+            fb_child.set_size_request(THUMB_SIZE, THUMB_SIZE)
+            fb_child.set_halign(Gtk.Align.CENTER)
+            fb_child.set_valign(Gtk.Align.START)
             fb_child.set_child(tile)
             gesture = Gtk.GestureClick()
             gesture.connect("pressed", self._on_photo_clicked, tile)
@@ -1059,7 +1053,3 @@ class FilesPanel(Gtk.Box):
 
         names = [os.path.basename(u) for u in urls]
         self._status_bar.set_label(f"Sending: {', '.join(names)}")
-
-    def _on_open_downloads(self, _btn):
-        self._navigate_to(self._downloads_dir)
-        self._view_stack.set_visible_child_name("browser")

@@ -85,14 +85,14 @@ class MainWindow(Adw.ApplicationWindow):
 
         header.pack_start(self._device_box)
 
-        # Center: view switcher
+        # Center: view switcher (Messages + Files only)
         self.stack = Adw.ViewStack()
         switcher = Adw.ViewSwitcher()
         switcher.set_stack(self.stack)
         switcher.set_policy(Adw.ViewSwitcherPolicy.WIDE)
         header.set_title_widget(switcher)
 
-        # Right side: battery + ring button
+        # Right side: battery + notifications toggle + ring button
         right_box = Gtk.Box(orientation=Gtk.Orientation.HORIZONTAL, spacing=6)
 
         self._battery_icon = Gtk.Image()
@@ -110,16 +110,51 @@ class MainWindow(Adw.ApplicationWindow):
         ring_btn.connect("clicked", self._on_ring_phone)
         header.pack_end(ring_btn)
 
+        self._notif_toggle = Gtk.ToggleButton(icon_name="bell-outline-symbolic")
+        self._notif_toggle.set_tooltip_text("Notifications")
+        self._notif_toggle.connect("toggled", self._on_notif_toggled)
+        header.pack_end(self._notif_toggle)
+
         outer.append(header)
 
-        # ── Tab content (full width, no sidebar) ───────────────────
+        # ── Body: [notif tray revealer] + [separator] + [main tabs] ─
+        body = Gtk.Box(orientation=Gtk.Orientation.HORIZONTAL)
+        body.set_vexpand(True)
+        outer.append(body)
+
+        # Notifications tray (collapsible)
+        self._notif_revealer = Gtk.Revealer()
+        self._notif_revealer.set_transition_type(Gtk.RevealerTransitionType.SLIDE_RIGHT)
+        self._notif_revealer.set_reveal_child(False)
+
+        notif_box = Gtk.Box(orientation=Gtk.Orientation.VERTICAL)
+        notif_box.set_size_request(300, -1)
+
+        notif_header = Gtk.Label(label="Notifications")
+        notif_header.add_css_class("heading")
+        notif_header.set_xalign(0)
+        notif_header.set_margin_start(12)
+        notif_header.set_margin_top(10)
+        notif_header.set_margin_bottom(6)
+        notif_box.append(notif_header)
+
+        notif_box.append(Gtk.Separator(orientation=Gtk.Orientation.HORIZONTAL))
+
+        self.notif_panel = NotificationsPanel(client=self.client)
+        self.notif_panel.set_vexpand(True)
+        notif_box.append(self.notif_panel)
+
+        self._notif_revealer.set_child(notif_box)
+        body.append(self._notif_revealer)
+
+        self._notif_sep = Gtk.Separator(orientation=Gtk.Orientation.VERTICAL)
+        self._notif_sep.set_visible(False)
+        body.append(self._notif_sep)
+
+        # Main tab content
         self.sms_panel = SmsPanel(client=self.client)
         page = self.stack.add_titled(self.sms_panel, "sms", "Messages")
         page.set_icon_name("mail-unread-symbolic")
-
-        self.notif_panel = NotificationsPanel(client=self.client)
-        page = self.stack.add_titled(self.notif_panel, "notifications", "Notifications")
-        page.set_icon_name("dialog-information-symbolic")
 
         self.files_panel = FilesPanel(client=self.client)
         page = self.stack.add_titled(self.files_panel, "files", "Files")
@@ -127,7 +162,12 @@ class MainWindow(Adw.ApplicationWindow):
 
         self.stack.set_vexpand(True)
         self.stack.set_hexpand(True)
-        outer.append(self.stack)
+        body.append(self.stack)
+
+    def _on_notif_toggled(self, btn):
+        revealed = btn.get_active()
+        self._notif_revealer.set_reveal_child(revealed)
+        self._notif_sep.set_visible(revealed)
 
     # ── Data refresh ───────────────────────────────────────────────
 
