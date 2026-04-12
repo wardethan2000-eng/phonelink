@@ -244,9 +244,21 @@ class SmsPanel(Gtk.Box):
         GLib.idle_add(self._handle_signal_variant, params)
 
     def _on_dbus_conversation_loaded(self, conn, sender, path, iface, sig, params):
-        """A conversation finished loading — reload from cache."""
+        """A conversation finished loading — debounce and reload from cache."""
+        # Cancel any pending reload and schedule a new one 500ms from now.
+        # This prevents hammering reload when many signals fire in sequence.
+        if hasattr(self, '_conv_loaded_timer') and self._conv_loaded_timer:
+            GLib.source_remove(self._conv_loaded_timer)
+        self._conv_loaded_timer = GLib.timeout_add(
+            500, self._deferred_reload_conversations
+        )
+
+    def _deferred_reload_conversations(self):
+        """Debounced handler for conversationLoaded signals."""
+        self._conv_loaded_timer = None
         if self._device:
-            GLib.idle_add(self._load_active_conversations, self._device.id)
+            self._load_active_conversations(self._device.id)
+        return GLib.SOURCE_REMOVE
 
     def _on_contacts_synced(self, conn, sender, path, iface, sig, params):
         """Contact cache was updated — reload names."""

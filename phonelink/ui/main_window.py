@@ -26,6 +26,7 @@ class MainWindow(Adw.ApplicationWindow):
         self.set_size_request(640, 420)
 
         self.connect("close-request", self._on_close)
+        self.connect("realize", self._on_realize)
 
         # ── Connect to KDE Connect daemon ──────────────────────────
         if not self.client.connect():
@@ -298,8 +299,44 @@ class MainWindow(Adw.ApplicationWindow):
     # ── Cleanup ────────────────────────────────────────────────────
 
     def _on_close(self, _window):
-        if self._poll_source:
-            GLib.source_remove(self._poll_source)
-            self._poll_source = None
-        self.client.cleanup()
-        return False  # False = allow the close to proceed
+        # If quitting from the tray menu, allow close to proceed
+        if getattr(self, '_quitting', False):
+            if self._poll_source:
+                GLib.source_remove(self._poll_source)
+                self._poll_source = None
+            self.client.cleanup()
+            return False  # allow close
+
+        # Otherwise, hide to system tray instead of quitting
+        self.set_visible(False)
+        return True  # True = prevent the close / destroy
+
+    def _on_realize(self, _widget):
+        """Set skip-taskbar hint so the window only appears in the system tray."""
+        GLib.timeout_add(500, self._set_skip_taskbar)
+
+    def _set_skip_taskbar(self):
+        try:
+            from Xlib import display, Xatom
+
+            surface = self.get_surface()
+            # Get the X11 window ID directly from the GTK4 surface
+            xid = surface.get_xid() if hasattr(surface, "get_xid") else None
+            if xid is None:
+                return GLib.SOURCE_REMOVE
+
+            d = display.Display()
+            NET_WM_STATE = d.intern_atom('_NET_WM_STATE')
+            SKIP_TASKBAR = d.intern_atom('_NET_WM_STATE_SKIP_TASKBAR')
+            SKIP_PAGER = d.intern_atom('_NET_WM_STATE_SKIP_PAGER')
+
+            wid = d.create_resource_object('window', xid)
+            wid.change_property(
+                NET_WM_STATE, Xatom.ATOM, 32,
+                [SKIP_TASKBAR, SKIP_PAGER],
+            )
+            d.flush()
+            d.close()
+        except Exception:
+            pass
+        return GLib.SOURCE_REMOVE
