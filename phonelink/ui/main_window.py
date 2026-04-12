@@ -117,16 +117,19 @@ class MainWindow(Adw.ApplicationWindow):
 
         outer.append(header)
 
-        # ── Body: [notif tray revealer] + [separator] + [main tabs] ─
-        body = Gtk.Box(orientation=Gtk.Orientation.HORIZONTAL)
-        body.set_vexpand(True)
-        outer.append(body)
+        # ── Main tab content ────────────────────────────────────────
+        self.sms_panel = SmsPanel(client=self.client)
+        page = self.stack.add_titled(self.sms_panel, "sms", "Messages")
+        page.set_icon_name("mail-unread-symbolic")
 
-        # Notifications tray (collapsible)
-        self._notif_revealer = Gtk.Revealer()
-        self._notif_revealer.set_transition_type(Gtk.RevealerTransitionType.SLIDE_RIGHT)
-        self._notif_revealer.set_reveal_child(False)
+        self.files_panel = FilesPanel(client=self.client)
+        page = self.stack.add_titled(self.files_panel, "files", "Files")
+        page.set_icon_name("folder-symbolic")
 
+        self.stack.set_vexpand(True)
+        self.stack.set_hexpand(True)
+
+        # ── Notifications sidebar ───────────────────────────────────
         notif_box = Gtk.Box(orientation=Gtk.Orientation.VERTICAL)
         notif_box.set_size_request(300, -1)
 
@@ -144,30 +147,23 @@ class MainWindow(Adw.ApplicationWindow):
         self.notif_panel.set_vexpand(True)
         notif_box.append(self.notif_panel)
 
-        self._notif_revealer.set_child(notif_box)
-        body.append(self._notif_revealer)
-
-        self._notif_sep = Gtk.Separator(orientation=Gtk.Orientation.VERTICAL)
-        self._notif_sep.set_visible(False)
-        body.append(self._notif_sep)
-
-        # Main tab content
-        self.sms_panel = SmsPanel(client=self.client)
-        page = self.stack.add_titled(self.sms_panel, "sms", "Messages")
-        page.set_icon_name("mail-unread-symbolic")
-
-        self.files_panel = FilesPanel(client=self.client)
-        page = self.stack.add_titled(self.files_panel, "files", "Files")
-        page.set_icon_name("folder-symbolic")
-
-        self.stack.set_vexpand(True)
-        self.stack.set_hexpand(True)
-        body.append(self.stack)
+        # OverlaySplitView: sidebar overlays content (doesn't push it)
+        self._split_view = Adw.OverlaySplitView()
+        self._split_view.set_sidebar_position(Gtk.PackType.END)
+        self._split_view.set_sidebar(notif_box)
+        self._split_view.set_content(self.stack)
+        self._split_view.set_show_sidebar(False)
+        self._split_view.set_vexpand(True)
+        # Keep toggle button in sync if user swipes sidebar closed
+        self._split_view.connect("notify::show-sidebar", self._on_sidebar_notify)
+        outer.append(self._split_view)
 
     def _on_notif_toggled(self, btn):
-        revealed = btn.get_active()
-        self._notif_revealer.set_reveal_child(revealed)
-        self._notif_sep.set_visible(revealed)
+        self._split_view.set_show_sidebar(btn.get_active())
+
+    def _on_sidebar_notify(self, split_view, _param):
+        # Sync the toggle button when sidebar is dismissed via gesture
+        self._notif_toggle.set_active(split_view.get_show_sidebar())
 
     # ── Data refresh ───────────────────────────────────────────────
 
