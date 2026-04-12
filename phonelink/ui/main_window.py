@@ -11,6 +11,7 @@ from phonelink.dbus_client import IFACE_DAEMON
 from phonelink.ui.sms_panel import SmsPanel
 from phonelink.ui.notifications_panel import NotificationsPanel
 from phonelink.ui.files_panel import FilesPanel
+from phonelink.ui.settings_dialog import SettingsDialog
 
 
 class MainWindow(Adw.ApplicationWindow):
@@ -115,6 +116,11 @@ class MainWindow(Adw.ApplicationWindow):
         self._notif_toggle.connect("toggled", self._on_notif_toggled)
         header.pack_end(self._notif_toggle)
 
+        settings_btn = Gtk.Button(icon_name="preferences-system-symbolic")
+        settings_btn.set_tooltip_text("Preferences")
+        settings_btn.connect("clicked", self._on_open_settings)
+        header.pack_end(settings_btn)
+
         outer.append(header)
 
         # ── Main tab content ────────────────────────────────────────
@@ -164,6 +170,10 @@ class MainWindow(Adw.ApplicationWindow):
     def _on_sidebar_notify(self, split_view, _param):
         # Sync the toggle button when sidebar is dismissed via gesture
         self._notif_toggle.set_active(split_view.get_show_sidebar())
+
+    def _on_open_settings(self, _btn):
+        dialog = SettingsDialog()
+        dialog.present(self)
 
     # ── Data refresh ───────────────────────────────────────────────
 

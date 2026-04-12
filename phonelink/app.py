@@ -11,6 +11,7 @@ from gi.repository import Gtk, Gdk, Gio, Adw
 
 from phonelink.dbus_client import KDEConnectClient
 from phonelink.ui.main_window import MainWindow
+from phonelink.ui.settings_dialog import apply_saved_color_scheme
 
 
 class PhoneLinkApp(Adw.Application):
@@ -25,6 +26,7 @@ class PhoneLinkApp(Adw.Application):
         Adw.Application.do_startup(self)
         self._load_css()
         self._set_icon()
+        apply_saved_color_scheme()
 
     def do_activate(self):
         win = self.props.active_window

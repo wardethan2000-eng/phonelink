@@ -8,6 +8,7 @@ from gi.repository import Gtk, Adw, GLib, GdkPixbuf
 
 from phonelink.dbus_client import IFACE_NOTIFICATIONS
 from phonelink.models import Notification
+from phonelink.settings import get_settings
 
 
 # ── Single notification row (expandable in-place) ─────────────────
@@ -335,8 +336,17 @@ class NotificationsPanel(Gtk.Box):
             self._list_box.remove(self._list_box.get_row_at_index(0))
         self._rows.clear()
 
+        settings = get_settings()
+
+        if not settings.notifications_enabled:
+            self._count_label.set_label("Notifications disabled")
+            return
+
         sorted_notifs = sorted(
-            self._notifications.values(),
+            (
+                n for n in self._notifications.values()
+                if not settings.is_app_ignored(n.app_name or "")
+            ),
             key=lambda n: n.timestamp,
             reverse=True,
         )
