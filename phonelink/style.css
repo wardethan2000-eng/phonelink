@@ -1,0 +1,72 @@
+/* Phone Link for Linux — custom styles */
+
+/* Sidebar background — subtle contrast with the main content */
+.sidebar-pane {
+    background-color: alpha(@window_bg_color, 0.97);
+}
+
+/* Battery level bar coloring */
+levelbar block.low {
+    background-color: @error_color;
+}
+
+levelbar block.high {
+    background-color: @warning_color;
+}
+
+levelbar block.full {
+    background-color: @success_color;
+}
+
+/* Make the level bar a bit thicker */
+levelbar trough {
+    min-height: 8px;
+}
+
+levelbar trough block {
+    min-height: 8px;
+    border-radius: 4px;
+}
+
+/* ── Conversation list ─────────────────────────────────────── */
+
+.conversation-avatar {
+    background-color: @accent_bg_color;
+    color: @accent_fg_color;
+    border-radius: 50%;
+    min-width: 40px;
+    min-height: 40px;
+    font-weight: bold;
+    font-size: 16px;
+}
+
+.unread-dot {
+    color: @accent_bg_color;
+    font-size: 10px;
+}
+
+/* ── Chat bubbles ──────────────────────────────────────────── */
+
+.message-bubble-sent {
+    background-color: @accent_bg_color;
+    color: @accent_fg_color;
+    border-radius: 16px 16px 4px 16px;
+    padding: 8px 14px;
+}
+
+.message-bubble-received {
+    background-color: alpha(@view_fg_color, 0.08);
+    border-radius: 16px 16px 16px 4px;
+    padding: 8px 14px;
+}
+
+.date-separator {
+    padding: 4px 12px;
+    border-radius: 12px;
+    background-color: alpha(@view_fg_color, 0.05);
+    font-size: 11px;
+}
+
+.thread-header {
+    min-height: 40px;
+}

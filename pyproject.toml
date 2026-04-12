@@ -1,0 +1,13 @@
+[project]
+name = "phonelink"
+version = "0.1.0"
+description = "A unified desktop frontend for KDE Connect — Phone Link for Linux"
+requires-python = ">=3.8"
+license = {text = "MIT"}
+
+dependencies = [
+    "PyGObject>=3.42",
+]
+
+[project.scripts]
+phonelink = "run:main"
