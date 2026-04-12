@@ -116,7 +116,7 @@ class MainWindow(Adw.ApplicationWindow):
         self._notif_toggle.connect("toggled", self._on_notif_toggled)
         header.pack_end(self._notif_toggle)
 
-        settings_btn = Gtk.Button(icon_name="preferences-system-symbolic")
+        settings_btn = Gtk.Button(icon_name="emblem-system-symbolic")
         settings_btn.set_tooltip_text("Preferences")
         settings_btn.connect("clicked", self._on_open_settings)
         header.pack_end(settings_btn)
