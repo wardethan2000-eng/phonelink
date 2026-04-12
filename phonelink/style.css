@@ -43,6 +43,15 @@ levelbar trough block {
 .unread-dot {
     color: @accent_bg_color;
     font-size: 10px;
+    min-width: 12px;
+}
+
+.unread-dot-hidden {
+    opacity: 0;
+}
+
+.conversation-name-unread {
+    font-weight: 700;
 }
 
 /* ── Chat bubbles ──────────────────────────────────────────── */

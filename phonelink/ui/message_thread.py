@@ -153,7 +153,8 @@ class MessageThread(Gtk.Box):
         # ── Messages scroll area ──────────────────────────────────
         self._scroll = Gtk.ScrolledWindow()
         self._scroll.set_vexpand(True)
-        self._scroll.set_policy(Gtk.PolicyType.NEVER, Gtk.PolicyType.AUTOMATIC)
+        self._scroll.set_policy(Gtk.PolicyType.AUTOMATIC, Gtk.PolicyType.AUTOMATIC)
+        self._scroll.set_propagate_natural_width(False)
         thread_box.append(self._scroll)
 
         self._messages_box = Gtk.Box(orientation=Gtk.Orientation.VERTICAL)

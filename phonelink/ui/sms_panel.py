@@ -72,6 +72,7 @@ class SmsPanel(Gtk.Box):
         self._signal_ids: list[int] = []
         self._contact_map: dict[str, str] = {}  # normalised phone → display name
         self._read_thread_ids: set[int] = set()  # threads the user has opened this session
+        self._was_reachable: bool = False  # track reachability transitions
 
         # ── Stack: disconnected status vs content ──────────────────
         self._stack = Gtk.Stack()
@@ -87,17 +88,22 @@ class SmsPanel(Gtk.Box):
         self._status.set_description("No device connected.\nPair a phone to view messages.")
         self._stack.add_named(self._status, "status")
 
-        # Message UI: conversation list + thread
+        # Message UI: fixed-width conversation pane + flexible thread pane
         content = Gtk.Box(orientation=Gtk.Orientation.HORIZONTAL)
         self._stack.add_named(content, "content")
 
         # Left: conversation list
+        sidebar = Gtk.Box(orientation=Gtk.Orientation.VERTICAL)
+        sidebar.set_size_request(280, -1)
+        sidebar.set_hexpand(False)
+
         self._conv_list = ConversationList()
         self._conv_list.connect("conversation-selected", self._on_conversation_selected)
-        self._conv_list.connect("new-conversation", self._on_new_conversation)
+        self._conv_list.connect("start-conversation", self._on_start_conversation)
         self._conv_list.connect("rename-contact", self._on_rename_contact)
         self._conv_list.connect("import-contacts", self._on_import_contacts)
-        content.append(self._conv_list)
+        sidebar.append(self._conv_list)
+        content.append(sidebar)
 
         content.append(Gtk.Separator(orientation=Gtk.Orientation.VERTICAL))
 
@@ -114,12 +120,26 @@ class SmsPanel(Gtk.Box):
         old_id = self._device.id if self._device else None
         self._device = device
 
-        if not device or not device.reachable:
+        if not device:
             self._show_disconnected()
             self._unsubscribe_signals()
             return
 
+        if not device.reachable:
+            # Keep existing conversations visible if we have any;
+            # only show the disconnected status page when we have nothing.
+            # Keep signal subscriptions alive so we pick up the reconnection
+            # instantly (D-Bus signals resume when the phone comes back).
+            if self._conversations:
+                self._stack.set_visible_child_name("content")
+            else:
+                self._show_disconnected()
+            self._was_reachable = False
+            return
+
         self._stack.set_visible_child_name("content")
+        just_reconnected = not self._was_reachable
+        self._was_reachable = True
 
         if device.id != old_id:
             # New device — full reset
@@ -135,9 +155,10 @@ class SmsPanel(Gtk.Box):
             self.client.request_all_conversations(device.id)
             self._harvest_from_notifications(device.id)
             self._scan_downloads_for_vcf(device.id)
-        elif not self._signal_ids:
+        elif not self._signal_ids or just_reconnected:
             # Same device reconnected — re-subscribe signals and refresh
-            self._subscribe_signals(device.id)
+            if not self._signal_ids:
+                self._subscribe_signals(device.id)
             self._load_active_conversations(device.id)
             self.client.request_all_conversations(device.id)
 
@@ -399,18 +420,27 @@ class SmsPanel(Gtk.Box):
         self._refresh_conversation_list(force_rebuild=True)
 
     def _refresh_conversation_list(self, force_rebuild=False):
-        # Safety net: always ensure the conversation the user is currently
-        # viewing cannot appear as unread, regardless of what signals or
-        # cache data may have done to conv.is_read in the meantime.
-        if self._active_thread_id is not None:
-            active_conv = self._conversations.get(self._active_thread_id)
-            if active_conv:
-                active_conv.is_read = True
-        self._conv_list.set_conversations(
-            list(self._conversations.values()), force_rebuild=force_rebuild
-        )
-        if self._active_thread_id:
-            self._conv_list.select_thread(self._active_thread_id)
+        # Guard against re-entrant calls (select_thread can trigger
+        # row-selected → conversation-selected → refresh again).
+        if getattr(self, "_refreshing", False):
+            return
+        self._refreshing = True
+        try:
+            # Safety net: always ensure the conversation the user is currently
+            # viewing cannot appear as unread, regardless of what signals or
+            # cache data may have done to conv.is_read in the meantime.
+            if self._active_thread_id is not None:
+                active_conv = self._conversations.get(self._active_thread_id)
+                if active_conv:
+                    active_conv.is_read = True
+            self._conv_list.set_contact_map(self._contact_map)
+            self._conv_list.set_conversations(
+                list(self._conversations.values()), force_rebuild=force_rebuild
+            )
+            if self._active_thread_id:
+                self._conv_list.select_thread(self._active_thread_id)
+        finally:
+            self._refreshing = False
 
     # ── UI event handlers ──────────────────────────────────────────
 
@@ -427,6 +457,11 @@ class SmsPanel(Gtk.Box):
 
         # Rebuild the list immediately so the unread dot disappears
         self._refresh_conversation_list(force_rebuild=True)
+
+        # Draft conversations (negative thread_id) don't exist on the phone
+        if thread_id < 0:
+            self._show_thread(thread_id)
+            return
 
         # Notify the phone (after the UI update so the user sees instant feedback)
         if was_unread and self._device:
@@ -452,49 +487,69 @@ class SmsPanel(Gtk.Box):
             thread_id=thread_id,
         )
 
-    def _on_new_conversation(self, widget):
-        """Show a dialog to compose a new message."""
+    _next_draft_id = -1  # class-level counter for draft thread IDs
+
+    def _on_start_conversation(self, widget, address, name):
+        """Handle starting a new conversation from contact search."""
         if not self._device or not self._device.reachable:
             return
+        self._open_or_create_conversation(address, name)
 
-        dialog = Adw.MessageDialog(
-            transient_for=self.get_root(),
-            heading="New Message",
-            body="Enter a phone number and message:",
+    def _open_or_create_conversation(self, address, display_name):
+        """Navigate to an existing conversation or create a draft for a new one."""
+        from phonelink.contacts import _normalize_phone
+
+        norm = _normalize_phone(address)
+
+        # Check if a conversation already exists for this number
+        for conv in self._conversations.values():
+            conv_norm = _normalize_phone(conv.address)
+            if conv_norm == norm or (
+                len(norm) >= 10 and len(conv_norm) >= 10
+                and conv_norm[-10:] == norm[-10:]
+            ):
+                # Existing conversation — just select it
+                self._active_thread_id = conv.thread_id
+                self._read_thread_ids.add(conv.thread_id)
+                conv.is_read = True
+                self._refresh_conversation_list()
+                self._show_thread(conv.thread_id)
+                return
+
+        # Create a draft conversation with a negative thread_id
+        draft_id = SmsPanel._next_draft_id
+        SmsPanel._next_draft_id -= 1
+
+        conv = Conversation(
+            thread_id=draft_id,
+            address=address,
+            display_name=display_name if display_name != address else "",
+            is_read=True,
         )
-        dialog.add_response("cancel", "Cancel")
-        dialog.add_response("send", "Send")
-        dialog.set_response_appearance("send", Adw.ResponseAppearance.SUGGESTED)
-
-        content = Gtk.Box(orientation=Gtk.Orientation.VERTICAL, spacing=8)
-        content.set_margin_start(12)
-        content.set_margin_end(12)
-
-        number_entry = Gtk.Entry()
-        number_entry.set_placeholder_text("Phone number")
-        content.append(number_entry)
-
-        msg_entry = Gtk.Entry()
-        msg_entry.set_placeholder_text("Message")
-        content.append(msg_entry)
-
-        dialog.set_extra_child(content)
-
-        def on_response(dlg, response):
-            if response == "send":
-                number = number_entry.get_text().strip()
-                text = msg_entry.get_text().strip()
-                if number and text:
-                    self.client.send_sms(self._device.id, [number], text)
-
-        dialog.connect("response", on_response)
-        dialog.present()
+        self._conversations[draft_id] = conv
+        self._active_thread_id = draft_id
+        self._refresh_conversation_list()
+        self._conv_list.select_thread(draft_id)
+        self._show_thread(draft_id)
 
     def _on_send_message(self, widget, thread_id, text):
         """Handle send from the compose bar."""
         if not self._device or not self._device.reachable:
             return
-        self.client.reply_to_conversation(self._device.id, thread_id, text)
+
+        if thread_id < 0:
+            # Draft conversation — send as new SMS
+            conv = self._conversations.get(thread_id)
+            if conv:
+                self.client.send_sms(self._device.id, [conv.address], text)
+                # Remove the draft; the phone will create a real conversation
+                # which will arrive via D-Bus signal
+                self._conversations.pop(thread_id, None)
+                self._active_thread_id = None
+                self._thread.show_empty()
+                self._refresh_conversation_list()
+        else:
+            self.client.reply_to_conversation(self._device.id, thread_id, text)
 
     def _on_rename_contact(self, widget, thread_id, address):
         """Show a dialog to set a contact name for a phone number."""
