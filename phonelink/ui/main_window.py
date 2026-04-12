@@ -110,7 +110,7 @@ class MainWindow(Adw.ApplicationWindow):
         ring_btn.connect("clicked", self._on_ring_phone)
         header.pack_end(ring_btn)
 
-        self._notif_toggle = Gtk.ToggleButton(icon_name="notification-symbolic")
+        self._notif_toggle = Gtk.ToggleButton(icon_name="xsi-notifications-symbolic")
         self._notif_toggle.set_tooltip_text("Notifications")
         self._notif_toggle.connect("toggled", self._on_notif_toggled)
         header.pack_end(self._notif_toggle)
