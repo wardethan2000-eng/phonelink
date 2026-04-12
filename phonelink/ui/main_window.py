@@ -172,7 +172,10 @@ class MainWindow(Adw.ApplicationWindow):
         self._settings_panel = SettingsPanel(on_back=self._show_main)
         self._body_stack.add_named(self._settings_panel, "settings")
 
-        outer.append(self._body_stack)
+        self._toast_overlay = Adw.ToastOverlay()
+        self._toast_overlay.set_child(self._body_stack)
+        self._toast_overlay.set_vexpand(True)
+        outer.append(self._toast_overlay)
 
     def _on_notif_toggled(self, btn):
         self._split_view.set_show_sidebar(btn.get_active())
@@ -281,8 +284,16 @@ class MainWindow(Adw.ApplicationWindow):
     # ── Actions ────────────────────────────────────────────────────
 
     def _on_ring_phone(self, _btn):
-        if self.active_device and self.active_device.reachable:
-            self.client.ring_device(self.active_device.id)
+        if not self.active_device:
+            self._show_toast("No paired device found")
+            return
+        self.client.ring_device(self.active_device.id)
+        self._show_toast("Finding your phone…")
+
+    def _show_toast(self, message: str):
+        toast = Adw.Toast.new(message)
+        toast.set_timeout(3)
+        self._toast_overlay.add_toast(toast)
 
     # ── Cleanup ────────────────────────────────────────────────────
 
