@@ -528,23 +528,19 @@ class FilesPanel(Gtk.Box):
 
     def _update_mount_ui(self):
         if self._is_mounted:
-            self._mount_btn.set_label("Unmount Phone")
-            self._mount_btn.set_icon_name("media-eject-symbolic")
             self._file_empty.set_title("Empty Folder")
             self._file_empty.set_description("This folder is empty.")
         else:
-            self._mount_btn.set_label("Mount Phone")
-            self._mount_btn.set_icon_name("media-mount-symbolic")
-            self._file_empty.set_title("Phone Not Mounted")
+            self._file_empty.set_title("Connecting to phone…")
             self._file_empty.set_description(
-                "Click \"Mount Phone\" to browse files.\n\n"
-                "If mounting fails, grant \"Files and media\" permission\n"
+                "Waiting for file system access.\n\n"
+                "If this persists, grant \"Files and media\" permission\n"
                 "to KDE Connect in your phone's Settings → Apps → "
                 "KDE Connect → Permissions."
             )
             self._photo_empty.set_description(
-                "Mount your phone to see recent photos.\n"
-                "Click \"Mount Phone\" in the sidebar."
+                "Connecting to phone…\n"
+                "Grant \"Files and media\" permission to KDE Connect if prompted."
             )
             self._photo_stack.set_visible_child_name("empty")
             self._clear_photo_grid()
