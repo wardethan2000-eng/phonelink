@@ -77,3 +77,33 @@ levelbar trough block {
     color: @accent_bg_color;
     opacity: 0.8;
 }
+
+/* ── Photo grid ────────────────────────────────────────────── */
+
+.photo-tile {
+    border-radius: 8px;
+    background-color: alpha(@view_fg_color, 0.05);
+}
+
+.photo-tile-selected .photo-tile {
+    outline: 3px solid @accent_bg_color;
+    outline-offset: -3px;
+    border-radius: 8px;
+}
+
+.photo-check {
+    background-color: @accent_bg_color;
+    color: @accent_fg_color;
+    border-radius: 50%;
+    padding: 2px;
+    min-width: 24px;
+    min-height: 24px;
+}
+
+.photo-label {
+    background-color: alpha(black, 0.55);
+    color: white;
+    font-size: 10px;
+    padding: 2px 6px;
+    border-radius: 0 0 8px 8px;
+}
