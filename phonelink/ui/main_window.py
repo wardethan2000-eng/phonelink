@@ -106,10 +106,10 @@ class MainWindow(Adw.ApplicationWindow):
 
         header.pack_end(right_box)
 
-        ring_btn = Gtk.Button(icon_name="audio-volume-high-symbolic")
-        ring_btn.set_tooltip_text("Ring phone")
-        ring_btn.connect("clicked", self._on_ring_phone)
-        header.pack_end(ring_btn)
+        find_btn = Gtk.Button(icon_name="find-location-symbolic")
+        find_btn.set_tooltip_text("Find Phone — makes your phone ring via KDE Connect")
+        find_btn.connect("clicked", self._on_ring_phone)
+        header.pack_end(find_btn)
 
         self._notif_toggle = Gtk.ToggleButton(icon_name="xsi-notifications-symbolic")
         self._notif_toggle.set_tooltip_text("Notifications")
