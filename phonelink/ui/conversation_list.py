@@ -86,6 +86,7 @@ class ConversationList(Gtk.Box):
         super().__init__(orientation=Gtk.Orientation.VERTICAL)
         self.set_size_request(280, -1)
         self._conversations = []
+        self._rendered_read_states: dict[int, bool] = {}  # thread_id → is_read at last render
 
         # Search bar
         search_box = Gtk.Box(orientation=Gtk.Orientation.HORIZONTAL, spacing=6)
@@ -120,8 +121,10 @@ class ConversationList(Gtk.Box):
 
         self._listbox = Gtk.ListBox()
         self._listbox.set_selection_mode(Gtk.SelectionMode.SINGLE)
+        self._listbox.set_activate_on_single_click(True)
         self._listbox.set_placeholder(self._make_placeholder())
         self._listbox.connect("row-activated", self._on_row_activated)
+        self._listbox.connect("row-selected", self._on_row_selected)
         self._listbox.set_filter_func(self._filter_func)
         scrolled.set_child(self._listbox)
 
@@ -131,6 +134,7 @@ class ConversationList(Gtk.Box):
         self._listbox.add_controller(gesture)
 
         self._search_text = ""
+        self._last_selected_id = None
 
     def set_conversations(self, conversations, force_rebuild=False):
         """Update the conversation list, rebuilding only when the set changes."""
@@ -140,10 +144,16 @@ class ConversationList(Gtk.Box):
         new_ids = [c.thread_id for c in sorted_convs]
         old_ids = [c.thread_id for c in self._conversations]
 
+        # Detect read-state changes (snapshot comparison, not object identity)
+        new_read_states = {c.thread_id: c.is_read for c in sorted_convs}
+        read_changed = new_read_states != self._rendered_read_states
+
         self._conversations = sorted_convs
 
-        # Rebuild if the conversation set/order changed or a force rebuild was requested
-        if force_rebuild or new_ids != old_ids:
+        # Rebuild if the conversation set/order/read-state changed or forced
+        if force_rebuild or new_ids != old_ids or read_changed:
+            self._rendered_read_states = new_read_states
+            self._last_selected_id = None
             # Remove old rows
             while True:
                 row = self._listbox.get_row_at_index(0)
@@ -168,7 +178,17 @@ class ConversationList(Gtk.Box):
 
     def _on_row_activated(self, listbox, row):
         if row and hasattr(row, "conversation"):
+            self._last_selected_id = row.conversation.thread_id
             self.emit("conversation-selected", row.conversation.thread_id)
+
+    def _on_row_selected(self, listbox, row):
+        # Backup path: emit conversation-selected on selection change too,
+        # unless row-activated already handled this exact row.
+        if row and hasattr(row, "conversation"):
+            tid = row.conversation.thread_id
+            if getattr(self, "_last_selected_id", None) != tid:
+                self._last_selected_id = tid
+                self.emit("conversation-selected", tid)
 
     def _on_search_changed(self, entry):
         self._search_text = entry.get_text().lower()

@@ -257,6 +257,15 @@ class KDEConnectClient:
             GLib.Variant("(xii)", (thread_id, start, end)),
         )
 
+    def mark_conversation_as_read(self, device_id, thread_id: int):
+        """Inform the phone that a conversation has been read."""
+        self._call(
+            self._device_path(device_id),
+            IFACE_CONVERSATIONS,
+            "markConversationAsRead",
+            GLib.Variant("(x)", (thread_id,)),
+        )
+
     def reply_to_conversation(self, device_id, thread_id: int,
                                message: str, attachments=None):
         """Reply to an existing conversation thread."""

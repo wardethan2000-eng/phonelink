@@ -71,6 +71,7 @@ class SmsPanel(Gtk.Box):
         self._active_thread_id: int | None = None
         self._signal_ids: list[int] = []
         self._contact_map: dict[str, str] = {}  # normalised phone → display name
+        self._read_thread_ids: set[int] = set()  # threads the user has opened this session
 
         # ── Stack: disconnected status vs content ──────────────────
         self._stack = Gtk.Stack()
@@ -120,24 +121,25 @@ class SmsPanel(Gtk.Box):
 
         self._stack.set_visible_child_name("content")
 
-        # Only re-request if the device changed
         if device.id != old_id:
+            # New device — full reset
             self._unsubscribe_signals()
             self._conversations.clear()
+            self._read_thread_ids.clear()
             self._conv_list.set_conversations([])
             self._thread.show_empty()
             self._active_thread_id = None
-            # Load contact names from local store + vCard cache
             self._contact_map = load_contact_map(device.id)
             self._subscribe_signals(device.id)
-            # Load cached conversations synchronously first
             self._load_active_conversations(device.id)
-            # Then ask for a fresh sync from the phone
             self.client.request_all_conversations(device.id)
-            # Harvest contact names from active SMS notifications
             self._harvest_from_notifications(device.id)
-            # Scan Downloads for any VCF files shared from the phone
             self._scan_downloads_for_vcf(device.id)
+        elif not self._signal_ids:
+            # Same device reconnected — re-subscribe signals and refresh
+            self._subscribe_signals(device.id)
+            self._load_active_conversations(device.id)
+            self.client.request_all_conversations(device.id)
 
     def _load_active_conversations(self, device_id):
         """Load cached conversations from the daemon via activeConversations()."""
@@ -361,9 +363,21 @@ class SmsPanel(Gtk.Box):
 
         # Update conversation metadata if this is the newest message
         if msg.date >= conv.last_date:
+            is_new_message = msg.date > conv.last_date
             conv.last_date = msg.date
             conv.last_message = msg.body
-            conv.is_read = bool(msg.read)
+            # Don't downgrade a thread the user is currently viewing;
+            # but DO mark as unread if the user has navigated away and a
+            # genuinely new message arrives (date strictly greater).
+            if msg.thread_id == self._active_thread_id:
+                conv.is_read = True
+            elif msg.thread_id not in self._read_thread_ids:
+                conv.is_read = bool(msg.read)
+            elif is_new_message and not msg.is_sent and not msg.read:
+                # New incoming message on a previously-opened conversation
+                # that the user is no longer viewing — mark unread again.
+                conv.is_read = False
+                self._read_thread_ids.discard(msg.thread_id)
 
     def _remove_conversation(self, thread_id):
         self._conversations.pop(thread_id, None)
@@ -382,14 +396,19 @@ class SmsPanel(Gtk.Box):
         for conv in self._conversations.values():
             new_name = resolve_name(self._contact_map, conv.address)
             conv.display_name = new_name
-        self._conv_list.set_conversations(
-            list(self._conversations.values()), force_rebuild=True
-        )
-        if self._active_thread_id:
-            self._conv_list.select_thread(self._active_thread_id)
+        self._refresh_conversation_list(force_rebuild=True)
 
-    def _refresh_conversation_list(self):
-        self._conv_list.set_conversations(list(self._conversations.values()))
+    def _refresh_conversation_list(self, force_rebuild=False):
+        # Safety net: always ensure the conversation the user is currently
+        # viewing cannot appear as unread, regardless of what signals or
+        # cache data may have done to conv.is_read in the meantime.
+        if self._active_thread_id is not None:
+            active_conv = self._conversations.get(self._active_thread_id)
+            if active_conv:
+                active_conv.is_read = True
+        self._conv_list.set_conversations(
+            list(self._conversations.values()), force_rebuild=force_rebuild
+        )
         if self._active_thread_id:
             self._conv_list.select_thread(self._active_thread_id)
 
@@ -400,6 +419,18 @@ class SmsPanel(Gtk.Box):
         conv = self._conversations.get(thread_id)
         if not conv:
             return
+
+        # Mark as read locally
+        self._read_thread_ids.add(thread_id)
+        was_unread = not conv.is_read
+        conv.is_read = True
+
+        # Rebuild the list immediately so the unread dot disappears
+        self._refresh_conversation_list(force_rebuild=True)
+
+        # Notify the phone (after the UI update so the user sees instant feedback)
+        if was_unread and self._device:
+            self.client.mark_conversation_as_read(self._device.id, thread_id)
 
         # If we have few messages, request more from the phone
         if self._device and len(conv.messages) < 20:
