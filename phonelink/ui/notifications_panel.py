@@ -193,7 +193,7 @@ class NotificationsPanel(Gtk.Box):
 
         # Status page (no device / disconnected)
         self._status = Adw.StatusPage()
-        self._status.set_icon_name("bell-outline-symbolic")
+        self._status.set_icon_name("notification-symbolic")
         self._status.set_title("No Notifications")
         self._status.set_description("No device connected.")
         self._stack.add_named(self._status, "status")
@@ -242,7 +242,7 @@ class NotificationsPanel(Gtk.Box):
         scroll.set_child(self._list_box)
 
         ph = Adw.StatusPage()
-        ph.set_icon_name("bell-outline-symbolic")
+        ph.set_icon_name("notification-symbolic")
         ph.set_title("No Notifications")
         ph.set_description("Phone has no active notifications.")
         self._list_box.set_placeholder(ph)
