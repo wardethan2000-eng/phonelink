@@ -44,68 +44,128 @@ A desktop app that brings your Android phone's messages, notifications, and file
 
 ## Installation
 
-### 1. Install system dependencies
+This app has **no Python package dependencies** — everything is installed via your system package manager. Follow these steps in order.
+
+---
+
+### Step 1 — Install system packages on your Linux PC
+
+These packages provide Python, GTK4, Libadwaita, and the KDE Connect daemon. Install the group for your distro:
 
 **Debian / Ubuntu / Linux Mint:**
-
 ```bash
-sudo apt install kdeconnect python3-gi gir1.2-gtk-4.0 gir1.2-adw-1
+sudo apt update
+sudo apt install kdeconnect python3-gi python3-gi-cairo gir1.2-gtk-4.0 gir1.2-adw-1
 ```
 
 **Fedora:**
-
 ```bash
 sudo dnf install kdeconnect python3-gobject gtk4 libadwaita
 ```
 
-**Arch Linux:**
-
+**Arch Linux / Manjaro:**
 ```bash
 sudo pacman -S kdeconnect python-gobject gtk4 libadwaita
 ```
 
-### 2. Install KDE Connect on your Android phone
+**openSUSE:**
+```bash
+sudo zypper install kdeconnect-kde python3-gobject typelib-1_0-Gtk-4_0 typelib-1_0-Adw-1
+```
 
-Download from [Google Play](https://play.google.com/store/apps/details?id=org.kde.kdeconnect_tp) or [F-Droid](https://f-droid.org/packages/org.kde.kdeconnect_tp/).
+What each package does:
 
-When you first open KDE Connect on Android it will ask for several permissions — **grant all of them**. If you skipped any, you can go back to Android Settings → Apps → KDE Connect → Permissions and enable them manually.
+| Package | Purpose |
+|---------|---------|
+| `kdeconnect` | The KDE Connect daemon (`kdeconnectd`) — handles all phone communication |
+| `python3-gi` | Python GObject Introspection bindings — lets Python talk to GTK |
+| `gir1.2-gtk-4.0` | GTK4 introspection data |
+| `gir1.2-adw-1` | Libadwaita introspection data (modern GNOME UI widgets) |
 
-### 3. Pair your phone
+After installing, verify KDE Connect is available:
+```bash
+kdeconnect-cli --list-available
+```
+If that command errors, start the daemon manually: `kdeconnectd &`
+
+---
+
+### Step 2 — Install KDE Connect on your Android phone
+
+Install the **KDE Connect** app on your Android phone from one of these sources:
+
+- [Google Play Store](https://play.google.com/store/apps/details?id=org.kde.kdeconnect_tp)
+- [F-Droid](https://f-droid.org/packages/org.kde.kdeconnect_tp/) (open-source store, no Google account needed)
+
+When you first open the app, Android will prompt you to grant permissions. **Grant all of them.** If you accidentally denied any, fix them in the next step.
+
+---
+
+### Step 3 — Grant Android permissions to KDE Connect
+
+This is the most important setup step. KDE Connect needs several Android system permissions to function. Without them, features will be missing or broken.
+
+#### Normal app permissions
+Go to: **Android Settings → Apps → KDE Connect → Permissions**
+
+| Permission | Grant it for… |
+|-----------|--------------|
+| **SMS** (Send and view SMS messages) | Reading your conversation history and sending texts from your PC |
+| **Contacts** | Looking up contact names |
+| **Files and media** (or "All files access" on Android 11+) | Browsing your phone's file system and viewing photos in the Files tab |
+| **Phone** | Optional — some features may use this |
+
+#### Special permission: Notification access
+This permission is **not** in the normal Permissions screen. You must find it separately:
+
+**Android Settings → Apps → Special app access → Notification access → KDE Connect → toggle ON**
+
+> Without Notification access, the Notifications tray in Phone Link will always be empty, even if the Notification sync plugin is enabled.
+
+#### Special permission: Files (Android 11+)
+On Android 11 and newer, "Files and media" in the normal permissions screen only grants partial access. For full file system browsing you may also need:
+
+**Android Settings → Apps → Special app access → All files access → KDE Connect → toggle ON**
+
+> If the Files tab of Phone Link shows "Connecting to phone…" indefinitely, this is almost always the cause.
+
+---
+
+### Step 4 — Pair your phone with your PC
 
 1. Make sure your phone and PC are on the **same Wi-Fi network**
-2. Open KDE Connect on your Android phone — your PC should appear in the device list
-3. Tap your PC name → tap **Pair** — a pairing request will pop up on your PC; accept it
-4. The device status should change to **"Paired and reachable"**
+2. Open KDE Connect on your Android phone
+3. Your PC should appear in the device list — tap it
+4. Tap **Pair** — a pairing request notification will appear on your PC; click **Accept**
+5. The device status should now show **"Paired and reachable"**
 
-### 4. Enable plugins in KDE Connect on Android
+If your PC does not appear on the phone, try:
+```bash
+# On your PC — list discovered devices
+kdeconnect-cli --list-available
 
-After pairing, open the paired device in the KDE Connect Android app and make sure these plugins are turned on:
+# Refresh discovery
+kdeconnect-cli --refresh
+```
 
-| Plugin | Required for | Notes |
-|--------|-------------|-------|
-| **SMS** | Messages tab | Lets the app read and send texts |
-| **Notification sync** | Notifications tray | Also powers automatic contact name discovery |
-| **SFTP / Filesystem expose** | Files tab (browsing + photos) | Mounts your phone as a network drive |
-| **Share** | Sending files to phone; receiving VCF contacts | |
-| **Battery report** | Battery indicator in header | Usually on by default |
-| **Find my phone** | Ring phone button | Usually on by default |
+---
 
-### 5. Grant Android system permissions to KDE Connect
+### Step 5 — Enable KDE Connect plugins for your PC
 
-Enabling plugins alone is not enough — Android requires you to separately grant system-level permissions. Go to **Android Settings → Apps → KDE Connect → Permissions** and enable:
+After pairing, open the paired device in the KDE Connect Android app, go to its settings, and confirm these plugins are enabled:
 
-| Permission | Required for |
-|-----------|-------------|
-| **SMS** (Send and view SMS messages) | Reading conversations, sending texts |
-| **Contacts** | Contact name lookups |
-| **Notification access** | Notification sync — this is a *special* permission under Settings → Apps → Special app access → Notification access → KDE Connect |
-| **Files and media / Storage** | SFTP file browsing and photo grid |
+| Plugin name (on Android) | Required for |
+|--------------------------|-------------|
+| **SMS** | Messages tab |
+| **Notification sync** | Notifications tray |
+| **SFTP / Expose filesystem** | File browser and photo grid |
+| **Share** | Sending files to phone; receiving `.vcf` contacts |
+| **Battery report** | Battery level in header bar (usually on by default) |
+| **Find my phone** | Ring phone button (usually on by default) |
 
-> **Notification access note:** This is not in the normal Permissions screen. Go to **Settings → Apps → Special app access → Notification access**, find KDE Connect, and toggle it on. Without this, the Notifications tray will be empty.
+---
 
-> **Files and media note:** On Android 11+, this may be labelled "All files access" or require you to grant access from within the KDE Connect app itself. If the Files tab shows "Connecting to phone…" indefinitely, this permission is missing.
-
-### 6. Clone and run
+### Step 6 — Clone and run Phone Link
 
 ```bash
 git clone https://github.com/wardethan2000-eng/phonelink.git
@@ -113,7 +173,13 @@ cd phonelink
 python3 run.py
 ```
 
-No pip install or virtual environment needed. All dependencies are system packages.
+No `pip install`, no virtual environment, no build step. All dependencies are the system packages installed in Step 1.
+
+If the app starts and shows a **"KDE Connect Not Found"** error, the daemon is not running. Start it:
+```bash
+kdeconnectd &
+```
+Then relaunch the app.
 
 ---
 
