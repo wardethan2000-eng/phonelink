@@ -11,7 +11,7 @@ from phonelink.dbus_client import IFACE_DAEMON
 from phonelink.ui.sms_panel import SmsPanel
 from phonelink.ui.notifications_panel import NotificationsPanel
 from phonelink.ui.files_panel import FilesPanel
-from phonelink.ui.settings_dialog import SettingsDialog
+from phonelink.ui.settings_dialog import SettingsPanel
 
 
 class MainWindow(Adw.ApplicationWindow):
@@ -162,7 +162,17 @@ class MainWindow(Adw.ApplicationWindow):
         self._split_view.set_vexpand(True)
         # Keep toggle button in sync if user swipes sidebar closed
         self._split_view.connect("notify::show-sidebar", self._on_sidebar_notify)
-        outer.append(self._split_view)
+
+        # Body stack — "main" (normal view) or "settings" (settings panel)
+        self._body_stack = Gtk.Stack()
+        self._body_stack.set_vexpand(True)
+        self._body_stack.set_transition_type(Gtk.StackTransitionType.CROSSFADE)
+        self._body_stack.add_named(self._split_view, "main")
+
+        self._settings_panel = SettingsPanel(on_back=self._show_main)
+        self._body_stack.add_named(self._settings_panel, "settings")
+
+        outer.append(self._body_stack)
 
     def _on_notif_toggled(self, btn):
         self._split_view.set_show_sidebar(btn.get_active())
@@ -172,8 +182,10 @@ class MainWindow(Adw.ApplicationWindow):
         self._notif_toggle.set_active(split_view.get_show_sidebar())
 
     def _on_open_settings(self, _btn):
-        dialog = SettingsDialog()
-        dialog.present(self)
+        self._body_stack.set_visible_child_name("settings")
+
+    def _show_main(self):
+        self._body_stack.set_visible_child_name("main")
 
     # ── Data refresh ───────────────────────────────────────────────
 
