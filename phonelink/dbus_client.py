@@ -296,6 +296,71 @@ class KDEConnectClient:
             "synchronizeRemoteWithLocal",
         )
 
+    # ── SFTP / File browsing ───────────────────────────────────────
+
+    def sftp_is_mounted(self, device_id) -> bool:
+        result = self._call(
+            self._device_path(device_id) + "/sftp",
+            IFACE_SFTP,
+            "isMounted",
+            reply_type="(b)",
+        )
+        return result.unpack()[0] if result else False
+
+    def sftp_mount_and_wait(self, device_id) -> bool:
+        result = self._call(
+            self._device_path(device_id) + "/sftp",
+            IFACE_SFTP,
+            "mountAndWait",
+            reply_type="(b)",
+        )
+        return result.unpack()[0] if result else False
+
+    def sftp_unmount(self, device_id):
+        self._call(
+            self._device_path(device_id) + "/sftp",
+            IFACE_SFTP,
+            "unmount",
+        )
+
+    def sftp_mount_point(self, device_id) -> str:
+        result = self._call(
+            self._device_path(device_id) + "/sftp",
+            IFACE_SFTP,
+            "mountPoint",
+            reply_type="(s)",
+        )
+        return result.unpack()[0] if result else ""
+
+    def sftp_get_mount_error(self, device_id) -> str:
+        result = self._call(
+            self._device_path(device_id) + "/sftp",
+            IFACE_SFTP,
+            "getMountError",
+            reply_type="(s)",
+        )
+        return result.unpack()[0] if result else ""
+
+    def sftp_get_directories(self, device_id) -> dict[str, str]:
+        result = self._call(
+            self._device_path(device_id) + "/sftp",
+            IFACE_SFTP,
+            "getDirectories",
+            reply_type="(a{sv})",
+        )
+        if result:
+            return {k: v for k, v in result.unpack()[0].items()}
+        return {}
+
+    def share_urls(self, device_id, urls: list[str]):
+        """Send multiple files/URLs to the device."""
+        self._call(
+            self._device_path(device_id) + "/share",
+            IFACE_SHARE,
+            "shareUrls",
+            GLib.Variant("(as)", (urls,)),
+        )
+
     # ── Notifications ──────────────────────────────────────────────
 
     def get_active_notification_ids(self, device_id) -> list[str]:

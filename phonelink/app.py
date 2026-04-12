@@ -24,6 +24,7 @@ class PhoneLinkApp(Adw.Application):
     def do_startup(self):
         Adw.Application.do_startup(self)
         self._load_css()
+        self._set_icon()
 
     def do_activate(self):
         win = self.props.active_window
@@ -44,3 +45,14 @@ class PhoneLinkApp(Adw.Application):
                 provider,
                 Gtk.STYLE_PROVIDER_PRIORITY_APPLICATION,
             )
+
+    def _set_icon(self):
+        icon_path = os.path.join(
+            os.path.dirname(os.path.dirname(__file__)), "data", "icons", "phonelink.svg"
+        )
+        if os.path.exists(icon_path):
+            Gtk.Window.set_default_icon_name("phonelink")
+            # Add the icon directory to the theme search path
+            icon_theme = Gtk.IconTheme.get_for_display(Gdk.Display.get_default())
+            icon_dir = os.path.dirname(icon_path)
+            icon_theme.add_search_path(icon_dir)

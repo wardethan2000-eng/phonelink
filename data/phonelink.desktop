@@ -1,0 +1,10 @@
+[Desktop Entry]
+Name=Phone Link
+Comment=Connect your Android phone — SMS, notifications, and files
+Exec=/usr/bin/python3 /home/ethan/phonelink/run.py
+Icon=phonelink
+Terminal=false
+Type=Application
+Categories=Utility;Communication;
+Keywords=phone;sms;notifications;kdeconnect;android;
+StartupWMClass=com.github.phonelink
