@@ -322,6 +322,32 @@ class KDEConnectClient:
             return result.unpack()[0]
         return {}
 
+    def dismiss_notification(self, device_id, notif_id: str):
+        """Dismiss a notification on the phone."""
+        self._call(
+            self._device_path(device_id) + f"/notifications/{notif_id}",
+            "org.kde.kdeconnect.device.notifications.notification",
+            "dismiss",
+        )
+
+    def reply_to_notification(self, device_id, notif_id: str, message: str):
+        """Reply to a notification via its sendReply method."""
+        self._call(
+            self._device_path(device_id) + f"/notifications/{notif_id}",
+            "org.kde.kdeconnect.device.notifications.notification",
+            "sendReply",
+            GLib.Variant("(s)", (message,)),
+        )
+
+    def send_notification_reply_by_id(self, device_id, reply_id: str, message: str):
+        """Reply to a notification using the replyId via the notifications interface."""
+        self._call(
+            self._device_path(device_id) + "/notifications",
+            IFACE_NOTIFICATIONS,
+            "sendReply",
+            GLib.Variant("(ss)", (reply_id, message)),
+        )
+
     # ── Signals ────────────────────────────────────────────────────
 
     def subscribe_signal(self, path, iface, signal_name, callback) -> int | None:

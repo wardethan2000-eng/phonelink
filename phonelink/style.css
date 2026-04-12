@@ -70,3 +70,10 @@ levelbar trough block {
 .thread-header {
     min-height: 40px;
 }
+
+/* ── Notification list ─────────────────────────────────────── */
+
+.notif-icon {
+    color: @accent_bg_color;
+    opacity: 0.8;
+}

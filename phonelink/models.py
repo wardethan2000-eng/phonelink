@@ -142,3 +142,59 @@ class Conversation:
     @property
     def sort_key(self) -> int:
         return self.last_date or (self.messages[-1].date if self.messages else 0)
+
+
+# ── Notification model ─────────────────────────────────────────────
+
+
+@dataclass
+class Notification:
+    """A phone notification mirrored via KDE Connect."""
+
+    public_id: str = ""
+    app_name: str = ""
+    title: str = ""
+    text: str = ""
+    ticker: str = ""
+    icon_path: str = ""
+    has_icon: bool = False
+    dismissable: bool = False
+    silent: bool = False
+    reply_id: str = ""
+    internal_id: str = ""
+    timestamp: float = 0.0  # local time we received it
+
+    @property
+    def can_reply(self) -> bool:
+        return bool(self.reply_id)
+
+    @property
+    def time_label(self) -> str:
+        if not self.timestamp:
+            return ""
+        dt = datetime.fromtimestamp(self.timestamp)
+        now = datetime.now()
+        if dt.date() == now.date():
+            return dt.strftime("%I:%M %p").lstrip("0")
+        delta = (now.date() - dt.date()).days
+        if delta == 1:
+            return "Yesterday " + dt.strftime("%I:%M %p").lstrip("0")
+        return dt.strftime("%b %d %I:%M %p").lstrip("0")
+
+    @classmethod
+    def from_properties(cls, public_id: str, props: dict) -> "Notification":
+        import time
+        return cls(
+            public_id=public_id,
+            app_name=props.get("appName", ""),
+            title=props.get("title", ""),
+            text=props.get("text", "").strip(),
+            ticker=props.get("ticker", ""),
+            icon_path=props.get("iconPath", ""),
+            has_icon=props.get("hasIcon", False),
+            dismissable=props.get("dismissable", False),
+            silent=props.get("silent", False),
+            reply_id=props.get("replyId", ""),
+            internal_id=props.get("internalId", ""),
+            timestamp=time.time(),
+        )
