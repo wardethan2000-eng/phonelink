@@ -1,372 +1,255 @@
-"""Notifications panel — view, dismiss, and reply to phone notifications."""
-
-import time
+"""Notifications panel — compact single-column list for the slide-out tray."""
 
 import gi
 
 gi.require_version("Gtk", "4.0")
 gi.require_version("Adw", "1")
-from gi.repository import Gtk, Adw, GLib, GObject, Gio, GdkPixbuf
+from gi.repository import Gtk, Adw, GLib, GdkPixbuf
 
 from phonelink.dbus_client import IFACE_NOTIFICATIONS
 from phonelink.models import Notification
 
 
-# ── Notification row widget ────────────────────────────────────────
+# ── Single notification row (expandable in-place) ─────────────────
 
 
-class NotificationRow(Gtk.Box):
-    """A single notification entry in the list."""
+class NotifRow(Gtk.ListBoxRow):
+    """A notification row that expands to show body + actions."""
 
     def __init__(self, notif: Notification):
-        super().__init__(orientation=Gtk.Orientation.HORIZONTAL, spacing=10)
-        self.set_margin_top(6)
-        self.set_margin_bottom(6)
-        self.set_margin_start(10)
-        self.set_margin_end(10)
+        super().__init__()
         self.notif = notif
+        self._expanded = False
 
-        # Icon
-        if notif.has_icon and notif.icon_path:
-            try:
-                pixbuf = GdkPixbuf.Pixbuf.new_from_file_at_scale(
-                    notif.icon_path, 32, 32, True
-                )
-                texture = Gtk.Image.new_from_pixbuf(pixbuf)
-                texture.set_pixel_size(32)
-                self.append(texture)
-            except GLib.Error:
-                self._add_fallback_icon(notif.app_name)
-        else:
-            self._add_fallback_icon(notif.app_name)
+        outer = Gtk.Box(orientation=Gtk.Orientation.VERTICAL)
+        self.set_child(outer)
 
-        # Text column
-        text_box = Gtk.Box(orientation=Gtk.Orientation.VERTICAL, spacing=2)
-        text_box.set_hexpand(True)
-        self.append(text_box)
+        # ── Summary row ────────────────────────────────────────────
+        summary = Gtk.Box(orientation=Gtk.Orientation.HORIZONTAL, spacing=10)
+        summary.set_margin_start(12)
+        summary.set_margin_end(12)
+        summary.set_margin_top(8)
+        summary.set_margin_bottom(8)
+        outer.append(summary)
 
-        # Top row: app name + time
-        top = Gtk.Box(orientation=Gtk.Orientation.HORIZONTAL, spacing=6)
-        text_box.append(top)
+        # App icon (32 px)
+        self._icon = Gtk.Image()
+        self._icon.set_pixel_size(32)
+        self._load_icon(notif)
+        summary.append(self._icon)
 
-        app_label = Gtk.Label(label=notif.app_name or "Unknown App")
+        # Text block
+        text = Gtk.Box(orientation=Gtk.Orientation.VERTICAL, spacing=1)
+        text.set_hexpand(True)
+        summary.append(text)
+
+        top_row = Gtk.Box(orientation=Gtk.Orientation.HORIZONTAL, spacing=4)
+        text.append(top_row)
+
+        app_label = Gtk.Label(label=notif.app_name or "App")
+        app_label.set_xalign(0)
+        app_label.set_hexpand(True)
+        app_label.set_ellipsize(3)
         app_label.add_css_class("caption")
         app_label.add_css_class("dim-label")
-        app_label.set_xalign(0)
-        top.append(app_label)
-
-        spacer = Gtk.Box()
-        spacer.set_hexpand(True)
-        top.append(spacer)
+        top_row.append(app_label)
 
         time_label = Gtk.Label(label=notif.time_label)
         time_label.add_css_class("caption")
         time_label.add_css_class("dim-label")
-        top.append(time_label)
+        top_row.append(time_label)
 
-        # Title
-        title_label = Gtk.Label(label=notif.title or notif.ticker or "")
+        title = notif.title or notif.ticker or "(no title)"
+        title_label = Gtk.Label(label=title)
         title_label.set_xalign(0)
-        title_label.set_ellipsize(3)  # PANGO_ELLIPSIZE_END
-        title_label.add_css_class("heading")
-        text_box.append(title_label)
+        title_label.set_ellipsize(3)
+        title_label.add_css_class("body")
+        text.append(title_label)
 
-        # Body preview
-        body = notif.text or ""
-        if body:
-            body_label = Gtk.Label(label=body[:120])
-            body_label.set_xalign(0)
-            body_label.set_ellipsize(3)
-            body_label.set_lines(2)
-            body_label.set_wrap(True)
-            body_label.add_css_class("dim-label")
-            text_box.append(body_label)
+        snippet = (notif.text or notif.ticker or "").split("\n")[0]
+        if snippet:
+            snip_label = Gtk.Label(label=snippet)
+            snip_label.set_xalign(0)
+            snip_label.set_ellipsize(3)
+            snip_label.add_css_class("caption")
+            snip_label.add_css_class("dim-label")
+            text.append(snip_label)
 
-        # Reply indicator
+        # Chevron
+        self._chevron = Gtk.Image.new_from_icon_name("go-down-symbolic")
+        self._chevron.set_pixel_size(12)
+        self._chevron.set_opacity(0.5)
+        summary.append(self._chevron)
+
+        # ── Expanded area ───────────────────────────────────────────
+        self._revealer = Gtk.Revealer()
+        self._revealer.set_transition_type(Gtk.RevealerTransitionType.SLIDE_DOWN)
+        self._revealer.set_reveal_child(False)
+        outer.append(self._revealer)
+
+        detail = Gtk.Box(orientation=Gtk.Orientation.VERTICAL, spacing=8)
+        detail.set_margin_start(54)   # indent past icon
+        detail.set_margin_end(12)
+        detail.set_margin_bottom(10)
+        self._revealer.set_child(detail)
+
+        # Full body (if longer than snippet)
+        if notif.text and notif.text != snippet:
+            full_label = Gtk.Label(label=notif.text)
+            full_label.set_xalign(0)
+            full_label.set_wrap(True)
+            full_label.set_selectable(True)
+            full_label.add_css_class("body")
+            detail.append(full_label)
+
+        # Action buttons row
+        btn_row = Gtk.Box(orientation=Gtk.Orientation.HORIZONTAL, spacing=6)
+        detail.append(btn_row)
+
+        self._dismiss_btn = None
+        if notif.dismissable:
+            self._dismiss_btn = Gtk.Button(label="Dismiss")
+            self._dismiss_btn.add_css_class("destructive-action")
+            self._dismiss_btn.add_css_class("flat")
+            btn_row.append(self._dismiss_btn)
+
+        # Reply entry
+        self._reply_entry = None
+        self._reply_btn = None
         if notif.can_reply:
-            reply_icon = Gtk.Image.new_from_icon_name("mail-reply-sender-symbolic")
-            reply_icon.set_pixel_size(14)
-            reply_icon.set_opacity(0.4)
-            reply_icon.set_tooltip_text("Repliable")
-            self.append(reply_icon)
+            reply_box = Gtk.Box(orientation=Gtk.Orientation.HORIZONTAL, spacing=4)
+            reply_box.set_margin_top(4)
+            detail.append(reply_box)
 
-    def _add_fallback_icon(self, app_name: str):
-        icon_map = {
-            "Messages": "mail-unread-symbolic",
-            "Messenger": "user-available-symbolic",
-            "WhatsApp": "user-available-symbolic",
-            "Calendar": "x-office-calendar-symbolic",
-            "Gmail": "mail-unread-symbolic",
-            "Phone": "call-start-symbolic",
-            "Clock": "alarm-symbolic",
-            "Chrome": "web-browser-symbolic",
-            "Firefox": "web-browser-symbolic",
-        }
-        icon_name = "dialog-information-symbolic"
-        for key, val in icon_map.items():
-            if key.lower() in (app_name or "").lower():
-                icon_name = val
-                break
-        icon = Gtk.Image.new_from_icon_name(icon_name)
-        icon.set_pixel_size(32)
-        icon.add_css_class("notif-icon")
-        self.append(icon)
+            self._reply_entry = Gtk.Entry()
+            self._reply_entry.set_hexpand(True)
+            self._reply_entry.set_placeholder_text("Reply…")
+            reply_box.append(self._reply_entry)
 
+            self._reply_btn = Gtk.Button(icon_name="mail-send-symbolic")
+            self._reply_btn.add_css_class("suggested-action")
+            reply_box.append(self._reply_btn)
 
-# ── Detail view ────────────────────────────────────────────────────
+        outer.append(Gtk.Separator(orientation=Gtk.Orientation.HORIZONTAL))
 
+    # ── helpers ────────────────────────────────────────────────────
 
-class NotificationDetail(Gtk.Box):
-    """Right-side detail view for a selected notification."""
-
-    __gsignals__ = {
-        "dismiss-notification": (GObject.SignalFlags.RUN_FIRST, None, (str,)),
-        "reply-notification": (GObject.SignalFlags.RUN_FIRST, None, (str, str)),
-    }
-
-    def __init__(self):
-        super().__init__(orientation=Gtk.Orientation.VERTICAL, spacing=0)
-        self.set_hexpand(True)
-        self.set_vexpand(True)
-        self._current_notif: Notification | None = None
-
-        # Empty state
-        self._empty = Adw.StatusPage()
-        self._empty.set_icon_name("bell-outline-symbolic")
-        self._empty.set_title("No Notification Selected")
-        self._empty.set_description("Select a notification from the list.")
-        self._empty.set_vexpand(True)
-
-        # Detail content
-        self._detail_box = Gtk.Box(orientation=Gtk.Orientation.VERTICAL, spacing=0)
-        self._detail_box.set_vexpand(True)
-
-        # Header
-        self._header = Gtk.Box(orientation=Gtk.Orientation.HORIZONTAL, spacing=12)
-        self._header.set_margin_top(16)
-        self._header.set_margin_bottom(12)
-        self._header.set_margin_start(20)
-        self._header.set_margin_end(20)
-        self._detail_box.append(self._header)
-
-        self._header_icon = Gtk.Image()
-        self._header_icon.set_pixel_size(48)
-        self._header.append(self._header_icon)
-
-        header_text = Gtk.Box(orientation=Gtk.Orientation.VERTICAL, spacing=2)
-        header_text.set_hexpand(True)
-        self._header.append(header_text)
-
-        self._detail_app = Gtk.Label()
-        self._detail_app.set_xalign(0)
-        self._detail_app.add_css_class("caption")
-        self._detail_app.add_css_class("dim-label")
-        header_text.append(self._detail_app)
-
-        self._detail_title = Gtk.Label()
-        self._detail_title.set_xalign(0)
-        self._detail_title.set_wrap(True)
-        self._detail_title.add_css_class("title-2")
-        header_text.append(self._detail_title)
-
-        self._detail_time = Gtk.Label()
-        self._detail_time.add_css_class("caption")
-        self._detail_time.add_css_class("dim-label")
-        self._header.append(self._detail_time)
-
-        self._detail_box.append(Gtk.Separator(orientation=Gtk.Orientation.HORIZONTAL))
-
-        # Body area (scrollable)
-        body_scroll = Gtk.ScrolledWindow()
-        body_scroll.set_vexpand(True)
-        body_scroll.set_policy(Gtk.PolicyType.NEVER, Gtk.PolicyType.AUTOMATIC)
-        self._detail_box.append(body_scroll)
-
-        body_pad = Gtk.Box(orientation=Gtk.Orientation.VERTICAL, spacing=8)
-        body_pad.set_margin_top(16)
-        body_pad.set_margin_bottom(16)
-        body_pad.set_margin_start(20)
-        body_pad.set_margin_end(20)
-        body_scroll.set_child(body_pad)
-
-        self._detail_body = Gtk.Label()
-        self._detail_body.set_xalign(0)
-        self._detail_body.set_wrap(True)
-        self._detail_body.set_selectable(True)
-        body_pad.append(self._detail_body)
-
-        # Action bar
-        self._action_bar = Gtk.Box(orientation=Gtk.Orientation.HORIZONTAL, spacing=8)
-        self._action_bar.set_margin_top(8)
-        self._action_bar.set_margin_bottom(12)
-        self._action_bar.set_margin_start(20)
-        self._action_bar.set_margin_end(20)
-        self._detail_box.append(self._action_bar)
-
-        # Reply entry + button
-        self._reply_box = Gtk.Box(orientation=Gtk.Orientation.HORIZONTAL, spacing=8)
-        self._reply_box.set_hexpand(True)
-
-        self._reply_entry = Gtk.Entry()
-        self._reply_entry.set_placeholder_text("Type a reply…")
-        self._reply_entry.set_hexpand(True)
-        self._reply_entry.connect("activate", self._on_send_reply)
-        self._reply_box.append(self._reply_entry)
-
-        send_btn = Gtk.Button(icon_name="mail-send-symbolic")
-        send_btn.add_css_class("suggested-action")
-        send_btn.set_tooltip_text("Send reply")
-        send_btn.connect("clicked", self._on_send_reply)
-        self._reply_box.append(send_btn)
-
-        self._action_bar.append(self._reply_box)
-
-        # Dismiss button
-        self._dismiss_btn = Gtk.Button(label="Dismiss")
-        self._dismiss_btn.add_css_class("destructive-action")
-        self._dismiss_btn.set_tooltip_text("Dismiss notification on phone")
-        self._dismiss_btn.connect("clicked", self._on_dismiss)
-        self._action_bar.append(self._dismiss_btn)
-
-        # Stack
-        self._stack = Gtk.Stack()
-        self._stack.set_transition_type(Gtk.StackTransitionType.CROSSFADE)
-        self._stack.add_named(self._empty, "empty")
-        self._stack.add_named(self._detail_box, "detail")
-        self._stack.set_visible_child_name("empty")
-        self.append(self._stack)
-
-    def show_notification(self, notif: Notification | None):
-        self._current_notif = notif
-        if not notif:
-            self._stack.set_visible_child_name("empty")
-            return
-
-        # Icon
+    def _load_icon(self, notif: Notification):
         if notif.has_icon and notif.icon_path:
             try:
-                pixbuf = GdkPixbuf.Pixbuf.new_from_file_at_scale(
-                    notif.icon_path, 48, 48, True
+                pb = GdkPixbuf.Pixbuf.new_from_file_at_scale(
+                    notif.icon_path, 32, 32, True
                 )
-                self._header_icon.set_from_pixbuf(pixbuf)
+                self._icon.set_from_pixbuf(pb)
+                return
             except GLib.Error:
-                self._header_icon.set_from_icon_name("dialog-information-symbolic")
-        else:
-            self._header_icon.set_from_icon_name("dialog-information-symbolic")
+                pass
+        icon_map = {
+            "messages": "mail-unread-symbolic",
+            "whatsapp": "mail-unread-symbolic",
+            "telegram": "mail-unread-symbolic",
+            "gmail": "mail-unread-symbolic",
+            "mail": "mail-unread-symbolic",
+            "phone": "call-start-symbolic",
+            "clock": "alarm-symbolic",
+            "chrome": "web-browser-symbolic",
+            "firefox": "web-browser-symbolic",
+            "youtube": "video-x-generic-symbolic",
+        }
+        name = (notif.app_name or "").lower()
+        icon = next(
+            (v for k, v in icon_map.items() if k in name),
+            "dialog-information-symbolic",
+        )
+        self._icon.set_from_icon_name(icon)
 
-        self._detail_app.set_label(notif.app_name or "Unknown App")
-        self._detail_title.set_label(notif.title or notif.ticker or "")
-        self._detail_time.set_label(notif.time_label)
-        self._detail_body.set_label(notif.text or notif.ticker or "(no content)")
-
-        # Show/hide reply
-        self._reply_box.set_visible(notif.can_reply)
-        self._reply_entry.set_text("")
-
-        # Show/hide dismiss
-        self._dismiss_btn.set_visible(notif.dismissable)
-
-        self._stack.set_visible_child_name("detail")
-
-    def _on_send_reply(self, _widget):
-        if not self._current_notif:
-            return
-        text = self._reply_entry.get_text().strip()
-        if not text:
-            return
-        self.emit("reply-notification", self._current_notif.public_id, text)
-        self._reply_entry.set_text("")
-
-    def _on_dismiss(self, _btn):
-        if self._current_notif:
-            self.emit("dismiss-notification", self._current_notif.public_id)
+    def toggle_expand(self):
+        self._expanded = not self._expanded
+        self._revealer.set_reveal_child(self._expanded)
+        self._chevron.set_from_icon_name(
+            "go-up-symbolic" if self._expanded else "go-down-symbolic"
+        )
 
 
 # ── Main panel ─────────────────────────────────────────────────────
 
 
 class NotificationsPanel(Gtk.Box):
-    """Full notifications panel with list + detail view."""
+    """Compact notification list widget for the collapsible header tray."""
 
     def __init__(self, client):
         super().__init__(orientation=Gtk.Orientation.VERTICAL)
         self.client = client
         self._device = None
-        self._notifications: dict[str, Notification] = {}  # public_id → Notification
+        self._notifications: dict[str, Notification] = {}
         self._signal_ids: list[int] = []
-        self._selected_id: str | None = None
+        self._rows: dict[str, NotifRow] = {}
 
-        # Stack: disconnected vs content
+        # Stack: status page || list
         self._stack = Gtk.Stack()
         self._stack.set_vexpand(True)
-        self._stack.set_hexpand(True)
         self._stack.set_transition_type(Gtk.StackTransitionType.CROSSFADE)
         self.append(self._stack)
 
-        # Status page
+        # Status page (no device / disconnected)
         self._status = Adw.StatusPage()
         self._status.set_icon_name("bell-outline-symbolic")
-        self._status.set_title("Notifications")
-        self._status.set_description("No device connected.\nPair a phone to see notifications.")
+        self._status.set_title("No Notifications")
+        self._status.set_description("No device connected.")
         self._stack.add_named(self._status, "status")
 
-        # Content: list + detail
-        content = Gtk.Box(orientation=Gtk.Orientation.HORIZONTAL)
-        self._stack.add_named(content, "content")
+        # List page
+        list_outer = Gtk.Box(orientation=Gtk.Orientation.VERTICAL)
+        self._stack.add_named(list_outer, "list")
 
-        # Left: notification list
-        list_box_outer = Gtk.Box(orientation=Gtk.Orientation.VERTICAL)
-        list_box_outer.set_size_request(340, -1)
-        content.append(list_box_outer)
+        # Mini-header: count + refresh + dismiss-all
+        hdr = Gtk.Box(orientation=Gtk.Orientation.HORIZONTAL, spacing=4)
+        hdr.set_margin_start(12)
+        hdr.set_margin_end(4)
+        hdr.set_margin_top(4)
+        hdr.set_margin_bottom(4)
+        list_outer.append(hdr)
 
-        # Header with count + refresh
-        list_header = Gtk.Box(orientation=Gtk.Orientation.HORIZONTAL, spacing=8)
-        list_header.set_margin_top(8)
-        list_header.set_margin_bottom(4)
-        list_header.set_margin_start(12)
-        list_header.set_margin_end(12)
-        list_box_outer.append(list_header)
-
-        self._count_label = Gtk.Label(label="Notifications")
+        self._count_label = Gtk.Label()
         self._count_label.set_xalign(0)
         self._count_label.set_hexpand(True)
-        self._count_label.add_css_class("heading")
-        list_header.append(self._count_label)
+        self._count_label.add_css_class("caption")
+        self._count_label.add_css_class("dim-label")
+        hdr.append(self._count_label)
 
         refresh_btn = Gtk.Button(icon_name="view-refresh-symbolic")
-        refresh_btn.set_tooltip_text("Refresh notifications")
         refresh_btn.add_css_class("flat")
+        refresh_btn.set_tooltip_text("Refresh")
         refresh_btn.connect("clicked", self._on_refresh)
-        list_header.append(refresh_btn)
+        hdr.append(refresh_btn)
 
-        # Scrollable list
+        clear_btn = Gtk.Button(icon_name="edit-clear-all-symbolic")
+        clear_btn.add_css_class("flat")
+        clear_btn.set_tooltip_text("Dismiss all")
+        clear_btn.connect("clicked", self._on_dismiss_all)
+        hdr.append(clear_btn)
+
+        list_outer.append(Gtk.Separator())
+
         scroll = Gtk.ScrolledWindow()
         scroll.set_vexpand(True)
         scroll.set_policy(Gtk.PolicyType.NEVER, Gtk.PolicyType.AUTOMATIC)
-        list_box_outer.append(scroll)
+        list_outer.append(scroll)
 
         self._list_box = Gtk.ListBox()
-        self._list_box.set_selection_mode(Gtk.SelectionMode.SINGLE)
-        self._list_box.add_css_class("navigation-sidebar")
-        self._list_box.connect("row-selected", self._on_row_selected)
+        self._list_box.set_selection_mode(Gtk.SelectionMode.NONE)
+        self._list_box.connect("row-activated", self._on_row_activated)
         scroll.set_child(self._list_box)
 
-        # Empty list placeholder
-        empty_row = Adw.StatusPage()
-        empty_row.set_icon_name("bell-outline-symbolic")
-        empty_row.set_title("No Notifications")
-        empty_row.set_description("Your phone has no active notifications.")
-        self._list_box.set_placeholder(empty_row)
+        ph = Adw.StatusPage()
+        ph.set_icon_name("bell-outline-symbolic")
+        ph.set_title("No Notifications")
+        ph.set_description("Phone has no active notifications.")
+        self._list_box.set_placeholder(ph)
 
-        content.append(Gtk.Separator(orientation=Gtk.Orientation.VERTICAL))
+        self._stack.set_visible_child_name("status")
 
-        # Right: detail view
-        self._detail = NotificationDetail()
-        self._detail.connect("dismiss-notification", self._on_dismiss)
-        self._detail.connect("reply-notification", self._on_reply)
-        content.append(self._detail)
-
-    # ── Device connection ──────────────────────────────────────────
+    # ── Device ─────────────────────────────────────────────────────
 
     def set_device(self, device):
         old = self._device
@@ -376,43 +259,34 @@ class NotificationsPanel(Gtk.Box):
             if not old or old.id != device.id or not old.reachable:
                 self._subscribe_signals(device.id)
                 self._load_notifications(device.id)
-            self._stack.set_visible_child_name("content")
+            self._stack.set_visible_child_name("list")
         elif device:
             self._status.set_description(
-                f"{device.name} is disconnected.\n"
-                "Connect your phone to see notifications."
+                f"{device.name} is disconnected.\nConnect your phone to see notifications."
             )
             self._stack.set_visible_child_name("status")
         else:
-            self._status.set_description(
-                "No device connected.\nPair a phone to see notifications."
-            )
+            self._status.set_description("No device connected.")
             self._stack.set_visible_child_name("status")
 
-    # ── D-Bus signal subscriptions ─────────────────────────────────
+    # ── D-Bus ──────────────────────────────────────────────────────
 
     def _subscribe_signals(self, device_id: str):
-        # Unsub old
         if self.client.bus:
             for sid in self._signal_ids:
                 self.client.bus.signal_unsubscribe(sid)
         self._signal_ids.clear()
 
-        notif_path = f"/modules/kdeconnect/devices/{device_id}"
-
-        for signal_name, handler in [
+        path = f"/modules/kdeconnect/devices/{device_id}"
+        for sig, handler in [
             ("notificationPosted", self._on_notif_posted),
             ("notificationRemoved", self._on_notif_removed),
             ("notificationUpdated", self._on_notif_updated),
             ("allNotificationsRemoved", self._on_all_removed),
         ]:
-            sid = self.client.subscribe_signal(
-                notif_path, IFACE_NOTIFICATIONS, signal_name, handler
-            )
+            sid = self.client.subscribe_signal(path, IFACE_NOTIFICATIONS, sig, handler)
             if sid is not None:
                 self._signal_ids.append(sid)
-
-    # ── Load existing notifications ────────────────────────────────
 
     def _load_notifications(self, device_id: str):
         self._notifications.clear()
@@ -420,114 +294,108 @@ class NotificationsPanel(Gtk.Box):
         for nid in ids:
             props = self.client.get_notification_properties(device_id, nid)
             if props:
-                notif = Notification.from_properties(nid, props)
-                self._notifications[nid] = notif
+                self._notifications[nid] = Notification.from_properties(nid, props)
         self._rebuild_list()
-
-    # ── Signal handlers ────────────────────────────────────────────
 
     def _on_notif_posted(self, conn, sender, path, iface, signal, params):
         public_id = params.unpack()[0]
-        GLib.idle_add(self._add_or_update_notification, public_id)
+        GLib.idle_add(self._add_or_update, public_id)
 
     def _on_notif_updated(self, conn, sender, path, iface, signal, params):
         public_id = params.unpack()[0]
-        GLib.idle_add(self._add_or_update_notification, public_id)
+        GLib.idle_add(self._add_or_update, public_id)
 
     def _on_notif_removed(self, conn, sender, path, iface, signal, params):
         public_id = params.unpack()[0]
-        GLib.idle_add(self._remove_notification, public_id)
+        GLib.idle_add(self._remove_one, public_id)
 
     def _on_all_removed(self, conn, sender, path, iface, signal, params):
         GLib.idle_add(self._clear_all)
 
-    def _add_or_update_notification(self, public_id: str):
+    def _add_or_update(self, public_id: str):
         if not self._device:
             return
         props = self.client.get_notification_properties(self._device.id, public_id)
         if props:
-            notif = Notification.from_properties(public_id, props)
-            self._notifications[public_id] = notif
+            self._notifications[public_id] = Notification.from_properties(public_id, props)
             self._rebuild_list()
-            # If this was the selected one, refresh detail
-            if self._selected_id == public_id:
-                self._detail.show_notification(notif)
 
-    def _remove_notification(self, public_id: str):
-        if public_id in self._notifications:
-            del self._notifications[public_id]
-            if self._selected_id == public_id:
-                self._selected_id = None
-                self._detail.show_notification(None)
-            self._rebuild_list()
+    def _remove_one(self, public_id: str):
+        self._notifications.pop(public_id, None)
+        self._rebuild_list()
 
     def _clear_all(self):
         self._notifications.clear()
-        self._selected_id = None
-        self._detail.show_notification(None)
         self._rebuild_list()
 
-    # ── List management ────────────────────────────────────────────
+    # ── List ───────────────────────────────────────────────────────
 
     def _rebuild_list(self):
-        # Remove all rows
-        while True:
-            row = self._list_box.get_row_at_index(0)
-            if row is None:
-                break
-            self._list_box.remove(row)
+        while self._list_box.get_row_at_index(0):
+            self._list_box.remove(self._list_box.get_row_at_index(0))
+        self._rows.clear()
 
-        # Sort by timestamp descending (newest first)
         sorted_notifs = sorted(
             self._notifications.values(),
             key=lambda n: n.timestamp,
             reverse=True,
         )
-
         count = len(sorted_notifs)
         self._count_label.set_label(
-            f"Notifications ({count})" if count else "Notifications"
+            f"{count} notification{'s' if count != 1 else ''}" if count else "No notifications"
         )
 
-        select_row = None
         for notif in sorted_notifs:
-            row_widget = NotificationRow(notif)
-            row = Gtk.ListBoxRow()
-            row.set_child(row_widget)
-            row._notif_id = notif.public_id
+            row = NotifRow(notif)
+            if row._dismiss_btn:
+                row._dismiss_btn.connect(
+                    "clicked", self._on_dismiss_clicked, notif.public_id
+                )
+            if row._reply_btn and row._reply_entry:
+                row._reply_btn.connect(
+                    "clicked", self._on_reply_clicked, notif.public_id, row._reply_entry
+                )
+                row._reply_entry.connect(
+                    "activate", self._on_reply_enter, notif.public_id
+                )
+            self._rows[notif.public_id] = row
             self._list_box.append(row)
-            if notif.public_id == self._selected_id:
-                select_row = row
 
-        if select_row:
-            self._list_box.select_row(select_row)
-
-    def _on_row_selected(self, _listbox, row):
-        if row is None:
-            self._selected_id = None
-            self._detail.show_notification(None)
-            return
-        nid = row._notif_id
-        self._selected_id = nid
-        notif = self._notifications.get(nid)
-        self._detail.show_notification(notif)
+    def _on_row_activated(self, _lb, row):
+        if isinstance(row, NotifRow):
+            row.toggle_expand()
 
     # ── Actions ────────────────────────────────────────────────────
 
-    def _on_dismiss(self, _widget, public_id: str):
-        if not self._device:
-            return
-        self.client.dismiss_notification(self._device.id, public_id)
-        # Remove from local view immediately
-        self._remove_notification(public_id)
+    def _on_dismiss_clicked(self, _btn, public_id: str):
+        if self._device:
+            self.client.dismiss_notification(self._device.id, public_id)
+        self._remove_one(public_id)
 
-    def _on_reply(self, _widget, public_id: str, message: str):
-        if not self._device:
+    def _on_reply_clicked(self, _btn, public_id: str, entry: Gtk.Entry):
+        self._send_reply(public_id, entry)
+
+    def _on_reply_enter(self, entry: Gtk.Entry, public_id: str):
+        self._send_reply(public_id, entry)
+
+    def _send_reply(self, public_id: str, entry: Gtk.Entry):
+        text = entry.get_text().strip()
+        if not text or not self._device:
             return
         notif = self._notifications.get(public_id)
         if notif and notif.reply_id:
-            self.client.reply_to_notification(self._device.id, public_id, message)
+            self.client.reply_to_notification(self._device.id, public_id, text)
+        entry.set_text("")
 
     def _on_refresh(self, _btn):
         if self._device and self._device.reachable:
             self._load_notifications(self._device.id)
+
+    def _on_dismiss_all(self, _btn):
+        if not self._device:
+            return
+        for nid in list(self._notifications.keys()):
+            notif = self._notifications.get(nid)
+            if notif and notif.dismissable:
+                self.client.dismiss_notification(self._device.id, nid)
+        self._clear_all()
