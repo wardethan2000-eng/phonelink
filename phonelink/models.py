@@ -108,10 +108,16 @@ class Conversation:
     thread_id: int = 0
     display_name: str = ""
     address: str = ""
+    addresses: list[str] = field(default_factory=list)
     last_message: str = ""
     last_date: int = 0
     is_read: bool = True
     messages: list[SmsMessage] = field(default_factory=list)
+
+    @property
+    def is_group(self) -> bool:
+        """True if this conversation has multiple participants."""
+        return len(self.addresses) > 1
 
     @property
     def preview(self) -> str:

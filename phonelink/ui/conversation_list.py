@@ -25,7 +25,11 @@ class ConversationRow(Gtk.ListBoxRow):
         # Contact avatar placeholder (initial letter circle)
         avatar_label = Gtk.Label()
         avatar_label.set_size_request(40, 40)
-        initial = (conversation.display_name or conversation.address or "?")[0].upper()
+        if conversation.is_group:
+            initial = str(len(conversation.addresses))
+            avatar_label.add_css_class("conversation-avatar-group")
+        else:
+            initial = (conversation.display_name or conversation.address or "?")[0].upper()
         avatar_label.set_label(initial)
         avatar_label.add_css_class("conversation-avatar")
         avatar_label.set_halign(Gtk.Align.CENTER)
@@ -41,9 +45,12 @@ class ConversationRow(Gtk.ListBoxRow):
         top_row = Gtk.Box(orientation=Gtk.Orientation.HORIZONTAL, spacing=8)
         text_col.append(top_row)
 
-        name_label = Gtk.Label(
-            label=conversation.display_name or conversation.address or "Unknown"
-        )
+        if conversation.is_group:
+            display_text = conversation.display_name or "Group"
+        else:
+            display_text = conversation.display_name or conversation.address or "Unknown"
+
+        name_label = Gtk.Label(label=display_text)
         name_label.set_xalign(0)
         name_label.set_halign(Gtk.Align.START)
         name_label.set_hexpand(True)
@@ -132,6 +139,7 @@ class ConversationList(Gtk.Box):
         "conversation-selected": (GObject.SignalFlags.RUN_FIRST, None, (int,)),
         "start-conversation": (GObject.SignalFlags.RUN_FIRST, None, (str, str)),
         "rename-contact": (GObject.SignalFlags.RUN_FIRST, None, (int, str)),
+        "delete-conversation": (GObject.SignalFlags.RUN_FIRST, None, (int,)),
         "import-contacts": (GObject.SignalFlags.RUN_FIRST, None, ()),
     }
 
@@ -399,6 +407,15 @@ class ConversationList(Gtk.Box):
             self.emit("rename-contact", conv.thread_id, conv.address),
         ))
         menu.append(rename_btn)
+
+        delete_btn = Gtk.Button(label="Delete conversation")
+        delete_btn.add_css_class("flat")
+        delete_btn.add_css_class("destructive-action")
+        delete_btn.connect("clicked", lambda _: (
+            popover.popdown(),
+            self.emit("delete-conversation", conv.thread_id),
+        ))
+        menu.append(delete_btn)
 
         popover.set_child(menu)
         popover.set_parent(row)

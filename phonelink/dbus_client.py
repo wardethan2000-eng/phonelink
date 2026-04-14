@@ -195,6 +195,16 @@ class KDEConnectClient:
             GLib.Variant("(s)", (text,)),
         )
 
+    def get_clipboard_content(self, device_id) -> str:
+        """Read the current clipboard content from the phone."""
+        result = self._call(
+            self._device_path(device_id) + "/clipboard",
+            IFACE_CLIPBOARD,
+            "content",
+            reply_type="(s)",
+        )
+        return result.unpack()[0] if result else ""
+
     def share_url(self, device_id, url: str):
         """Send a URL to the device."""
         self._call(
@@ -281,9 +291,24 @@ class KDEConnectClient:
             ),
         )
 
-    def send_sms(self, device_id, addresses: list[str], message: str):
+    def delete_conversation(self, device_id, thread_id: int):
+        """Try to delete a conversation on the phone.
+
+        This calls the deleteConversation method if the KDE Connect
+        version supports it.  Older versions will silently fail.
+        """
+        self._call(
+            self._device_path(device_id),
+            IFACE_CONVERSATIONS,
+            "deleteConversation",
+            GLib.Variant("(x)", (thread_id,)),
+        )
+
+    def send_sms(self, device_id, addresses: list[str], message: str,
+                 attachments: list[str] | None = None):
         """Send a new SMS to one or more phone numbers."""
         addr_variants = [GLib.Variant("s", a) for a in addresses]
+        att_variants = [GLib.Variant("s", a) for a in (attachments or [])]
         self._call(
             self._device_path(device_id),
             IFACE_CONVERSATIONS,
@@ -291,7 +316,7 @@ class KDEConnectClient:
             GLib.Variant.new_tuple(
                 GLib.Variant("av", addr_variants),
                 GLib.Variant("s", message),
-                GLib.Variant("av", []),
+                GLib.Variant("av", att_variants),
             ),
         )
 

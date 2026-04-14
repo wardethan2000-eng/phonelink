@@ -107,9 +107,24 @@ class PhoneLinkApp(Adw.Application):
 
     def _on_tray_quit(self):
         """Actually quit the application (triggered by tray icon SIGUSR2)."""
+        self._cleanup_tray()
         win = self.props.active_window
         if win:
             win._quitting = True
             win.close()
         self.quit()
         return GLib.SOURCE_REMOVE
+
+    def do_shutdown(self):
+        self._cleanup_tray()
+        Adw.Application.do_shutdown(self)
+
+    def _cleanup_tray(self):
+        """Terminate the tray subprocess if it's still running."""
+        if self._tray_proc is not None:
+            try:
+                self._tray_proc.terminate()
+                self._tray_proc.wait(timeout=2)
+            except Exception:
+                pass
+            self._tray_proc = None

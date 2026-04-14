@@ -1,15 +1,19 @@
 """Message thread view — chat-bubble display + text entry."""
 
+import os
+import tempfile
+
 import gi
 
 gi.require_version("Gtk", "4.0")
-from gi.repository import Gtk, GObject, Pango, GLib
+gi.require_version("Gdk", "4.0")
+from gi.repository import Gtk, Gdk, GObject, Pango, GLib, Gio
 
 
 class MessageBubble(Gtk.Box):
     """A single chat bubble."""
 
-    def __init__(self, message):
+    def __init__(self, message, show_time=True):
         super().__init__(orientation=Gtk.Orientation.VERTICAL, spacing=2)
         self.message = message
 
@@ -63,14 +67,15 @@ class MessageBubble(Gtk.Box):
                 att_row.append(att_label)
                 frame.append(att_row)
 
-        # Timestamp
-        time_label = Gtk.Label(label=message.time_label)
-        time_label.set_halign(Gtk.Align.END if sent else Gtk.Align.START)
-        time_label.add_css_class("dim-label")
-        time_label.add_css_class("caption")
-        time_label.set_margin_start(12 if not sent else 0)
-        time_label.set_margin_end(12 if sent else 0)
-        self.append(time_label)
+        # Timestamp (only shown when there's a time gap from previous message)
+        if show_time:
+            time_label = Gtk.Label(label=message.time_label)
+            time_label.set_halign(Gtk.Align.END if sent else Gtk.Align.START)
+            time_label.add_css_class("dim-label")
+            time_label.add_css_class("caption")
+            time_label.set_margin_start(12 if not sent else 0)
+            time_label.set_margin_end(12 if sent else 0)
+            self.append(time_label)
 
 
 class DateSeparator(Gtk.Box):
@@ -94,12 +99,15 @@ class MessageThread(Gtk.Box):
 
     __gsignals__ = {
         "send-message": (GObject.SignalFlags.RUN_FIRST, None, (int, str)),
+        "send-message-with-attachment": (GObject.SignalFlags.RUN_FIRST, None, (int, str, str)),
     }
 
     def __init__(self):
         super().__init__(orientation=Gtk.Orientation.VERTICAL)
         self._thread_id = 0
         self._contact_name = ""
+        self._pending_image_path = None  # path to pasted image awaiting send
+        self._last_message = None  # track last message for smart timestamps
         self.set_hexpand(True)
         self.set_vexpand(True)
 
@@ -171,6 +179,31 @@ class MessageThread(Gtk.Box):
         # ── Compose bar ───────────────────────────────────────────
         thread_box.append(Gtk.Separator())
 
+        # Image preview bar (shown when an image is pasted)
+        self._image_preview_bar = Gtk.Box(orientation=Gtk.Orientation.HORIZONTAL, spacing=8)
+        self._image_preview_bar.set_margin_start(12)
+        self._image_preview_bar.set_margin_end(12)
+        self._image_preview_bar.set_margin_top(6)
+        self._image_preview_bar.set_visible(False)
+
+        self._image_preview_icon = Gtk.Image.new_from_icon_name("image-x-generic-symbolic")
+        self._image_preview_icon.set_pixel_size(20)
+        self._image_preview_bar.append(self._image_preview_icon)
+
+        self._image_preview_label = Gtk.Label(label="Image pasted")
+        self._image_preview_label.add_css_class("caption")
+        self._image_preview_label.set_hexpand(True)
+        self._image_preview_label.set_halign(Gtk.Align.START)
+        self._image_preview_bar.append(self._image_preview_label)
+
+        remove_img_btn = Gtk.Button(icon_name="edit-clear-symbolic")
+        remove_img_btn.add_css_class("flat")
+        remove_img_btn.set_tooltip_text("Remove image")
+        remove_img_btn.connect("clicked", self._on_remove_image)
+        self._image_preview_bar.append(remove_img_btn)
+
+        thread_box.append(self._image_preview_bar)
+
         compose = Gtk.Box(orientation=Gtk.Orientation.HORIZONTAL, spacing=8)
         compose.set_margin_start(12)
         compose.set_margin_end(12)
@@ -181,6 +214,12 @@ class MessageThread(Gtk.Box):
         self._text_entry.set_placeholder_text("Type a message…")
         self._text_entry.set_hexpand(True)
         self._text_entry.connect("activate", self._on_send)
+
+        # Ctrl+V paste handler for images
+        paste_controller = Gtk.EventControllerKey()
+        paste_controller.connect("key-pressed", self._on_key_pressed)
+        self._text_entry.add_controller(paste_controller)
+
         compose.append(self._text_entry)
 
         send_btn = Gtk.Button(icon_name="mail-send-symbolic")
@@ -219,15 +258,38 @@ class MessageThread(Gtk.Box):
         # Sort messages by date ascending
         sorted_msgs = sorted(messages, key=lambda m: m.date)
 
-        # Insert messages with date separators
+        # Insert messages with date separators and smart timestamps
+        # Show timestamp when: first message, sender changes, or 5+ minute gap
+        TIME_GAP_SECONDS = 300  # 5 minutes
         last_date_str = ""
-        for msg in sorted_msgs:
+        prev_msg = None
+        for i, msg in enumerate(sorted_msgs):
             date_str = msg.timestamp.strftime("%A, %B %d, %Y")
             if date_str != last_date_str:
                 self._messages_box.append(DateSeparator(date_str))
                 last_date_str = date_str
-            self._messages_box.append(MessageBubble(msg))
 
+            is_last = (i == len(sorted_msgs) - 1)
+            if is_last:
+                show_time = True
+            elif prev_msg is None:
+                show_time = True
+            elif msg.is_sent != prev_msg.is_sent:
+                show_time = True
+            elif abs(msg.date - prev_msg.date) >= TIME_GAP_SECONDS * 1000:
+                show_time = True
+            else:
+                # Peek ahead: show time if next message changes sender or has gap
+                next_msg = sorted_msgs[i + 1]
+                if next_msg.is_sent != msg.is_sent or abs(next_msg.date - msg.date) >= TIME_GAP_SECONDS * 1000:
+                    show_time = True
+                else:
+                    show_time = False
+
+            self._messages_box.append(MessageBubble(msg, show_time=show_time))
+            prev_msg = msg
+
+        self._last_message = sorted_msgs[-1] if sorted_msgs else None
         self._stack.set_visible_child_name("thread")
 
         # Scroll to bottom after layout
@@ -235,7 +297,9 @@ class MessageThread(Gtk.Box):
 
     def append_message(self, message):
         """Add a single new message and scroll down."""
-        self._messages_box.append(MessageBubble(message))
+        # Always show time on the latest appended message
+        self._messages_box.append(MessageBubble(message, show_time=True))
+        self._last_message = message
         GLib.idle_add(self._scroll_to_bottom)
 
     def _clear_messages(self):
@@ -252,6 +316,50 @@ class MessageThread(Gtk.Box):
 
     def _on_send(self, _widget):
         text = self._text_entry.get_text().strip()
-        if text and self._thread_id:
+        if self._pending_image_path and self._thread_id:
+            self.emit("send-message-with-attachment", self._thread_id, text, self._pending_image_path)
+            self._text_entry.set_text("")
+            self._clear_pending_image()
+        elif text and self._thread_id:
             self.emit("send-message", self._thread_id, text)
             self._text_entry.set_text("")
+
+    def _on_key_pressed(self, controller, keyval, keycode, state):
+        """Handle Ctrl+V to paste images from clipboard."""
+        if keyval == Gdk.KEY_v and (state & Gdk.ModifierType.CONTROL_MASK):
+            clipboard = Gdk.Display.get_default().get_clipboard()
+            # Check for image content
+            formats = clipboard.get_formats()
+            if formats.contain_mime_type("image/png") or formats.contain_mime_type("image/jpeg"):
+                clipboard.read_texture_async(None, self._on_clipboard_texture)
+                return True  # handled
+        return False
+
+    def _on_clipboard_texture(self, clipboard, result):
+        """Callback when clipboard texture is read."""
+        try:
+            texture = clipboard.read_texture_finish(result)
+            if texture is None:
+                return
+            # Save texture to a temp file
+            tmp_dir = os.path.join(tempfile.gettempdir(), "phonelink")
+            os.makedirs(tmp_dir, exist_ok=True)
+            tmp_path = os.path.join(tmp_dir, f"paste_{os.getpid()}.png")
+            texture.save_to_png(tmp_path)
+            self._pending_image_path = tmp_path
+            self._image_preview_label.set_label("Image ready to send")
+            self._image_preview_bar.set_visible(True)
+        except Exception as e:
+            print(f"[phonelink] Clipboard paste error: {e}")
+
+    def _on_remove_image(self, _btn):
+        self._clear_pending_image()
+
+    def _clear_pending_image(self):
+        if self._pending_image_path and os.path.exists(self._pending_image_path):
+            try:
+                os.unlink(self._pending_image_path)
+            except OSError:
+                pass
+        self._pending_image_path = None
+        self._image_preview_bar.set_visible(False)

@@ -1,16 +1,20 @@
 """Main application window — header bar with device info + tabbed content."""
 
+import os
+
 import gi
 
 gi.require_version("Gtk", "4.0")
+gi.require_version("Gdk", "4.0")
 gi.require_version("Adw", "1")
-from gi.repository import Gtk, Adw, GLib
+from gi.repository import Gtk, Gdk, Adw, GLib, Gio
 
 from phonelink.models import Device
-from phonelink.dbus_client import IFACE_DAEMON
+from phonelink.dbus_client import IFACE_DAEMON, IFACE_SHARE
 from phonelink.ui.sms_panel import SmsPanel
 from phonelink.ui.notifications_panel import NotificationsPanel
 from phonelink.ui.files_panel import FilesPanel
+from phonelink.ui.clipboard_panel import ClipboardPanel
 from phonelink.ui.settings_dialog import SettingsPanel
 
 
@@ -19,7 +23,11 @@ class MainWindow(Adw.ApplicationWindow):
         super().__init__(**kwargs)
         self.client = client
         self.active_device = None
+        self._all_devices: list[Device] = []
         self._poll_source = None
+        self._ui_built = False
+        self._daemon_was_available = False
+        self._share_signal_id = None
 
         self.set_title("Phone Link")
         self.set_default_size(960, 640)
@@ -27,6 +35,11 @@ class MainWindow(Adw.ApplicationWindow):
 
         self.connect("close-request", self._on_close)
         self.connect("realize", self._on_realize)
+
+        # Keyboard shortcuts
+        key_ctrl = Gtk.EventControllerKey()
+        key_ctrl.connect("key-pressed", self._on_key_pressed)
+        self.add_controller(key_ctrl)
 
         # ── Connect to KDE Connect daemon ──────────────────────────
         if not self.client.connect():
@@ -36,6 +49,8 @@ class MainWindow(Adw.ApplicationWindow):
                 "Cannot connect to the session bus.\n"
                 "Make sure you are running a desktop session.",
             )
+            # Still start polling so we can recover if the bus appears later
+            self._start_live_updates()
             return
 
         if not self.client.is_daemon_available():
@@ -48,8 +63,10 @@ class MainWindow(Adw.ApplicationWindow):
                 "Then launch the KDE Connect indicator or run:\n"
                 "  kdeconnectd &",
             )
+            self._start_live_updates()
             return
 
+        self._daemon_was_available = True
         self._build_ui()
         self._refresh_devices()
         self._start_live_updates()
@@ -64,13 +81,17 @@ class MainWindow(Adw.ApplicationWindow):
         self.set_content(status)
 
     def _build_ui(self):
+        self._ui_built = True
         outer = Gtk.Box(orientation=Gtk.Orientation.VERTICAL)
         self.set_content(outer)
 
         # ── Header bar ─────────────────────────────────────────────
         header = Adw.HeaderBar()
 
-        # Left side: device info (icon + name + status dot)
+        # Left side: device info — clickable button with popover for switching
+        self._device_btn = Gtk.MenuButton()
+        self._device_btn.add_css_class("flat")
+
         self._device_box = Gtk.Box(orientation=Gtk.Orientation.HORIZONTAL, spacing=8)
 
         self._device_icon = Gtk.Image()
@@ -85,14 +106,28 @@ class MainWindow(Adw.ApplicationWindow):
         self._status_dot.set_use_markup(True)
         self._device_box.append(self._status_dot)
 
-        header.pack_start(self._device_box)
+        # Down arrow indicator for multi-device
+        self._device_arrow = Gtk.Image.new_from_icon_name("pan-down-symbolic")
+        self._device_arrow.set_pixel_size(12)
+        self._device_arrow.set_visible(False)
+        self._device_box.append(self._device_arrow)
 
-        # Center: view switcher (Messages + Files only)
+        self._device_btn.set_child(self._device_box)
+
+        # Device switcher popover
+        self._device_popover = Gtk.Popover()
+        self._device_list_box = Gtk.ListBox()
+        self._device_list_box.set_selection_mode(Gtk.SelectionMode.NONE)
+        self._device_list_box.connect("row-activated", self._on_device_row_activated)
+        self._device_list_box.add_css_class("boxed-list")
+        self._device_popover.set_child(self._device_list_box)
+        self._device_btn.set_popover(self._device_popover)
+
+        header.pack_start(self._device_btn)
+
+        # Center title
         self.stack = Adw.ViewStack()
-        switcher = Adw.ViewSwitcher()
-        switcher.set_stack(self.stack)
-        switcher.set_policy(Adw.ViewSwitcherPolicy.WIDE)
-        header.set_title_widget(switcher)
+        header.set_title_widget(Gtk.Label(label="Phone Link"))
 
         # Right side: battery + notifications toggle + ring button
         right_box = Gtk.Box(orientation=Gtk.Orientation.HORIZONTAL, spacing=6)
@@ -124,6 +159,17 @@ class MainWindow(Adw.ApplicationWindow):
 
         outer.append(header)
 
+        # ── Tab switcher bar (below header for full width) ──────────
+        switcher_bar = Gtk.Box(orientation=Gtk.Orientation.HORIZONTAL)
+        switcher_bar.set_halign(Gtk.Align.CENTER)
+        switcher_bar.set_margin_top(4)
+        switcher_bar.set_margin_bottom(4)
+        switcher = Adw.ViewSwitcher()
+        switcher.set_stack(self.stack)
+        switcher.set_policy(Adw.ViewSwitcherPolicy.WIDE)
+        switcher_bar.append(switcher)
+        outer.append(switcher_bar)
+
         # ── Main tab content ────────────────────────────────────────
         self.sms_panel = SmsPanel(client=self.client)
         page = self.stack.add_titled(self.sms_panel, "sms", "Messages")
@@ -133,8 +179,18 @@ class MainWindow(Adw.ApplicationWindow):
         page = self.stack.add_titled(self.files_panel, "files", "Files")
         page.set_icon_name("folder-symbolic")
 
+        self.clipboard_panel = ClipboardPanel(client=self.client)
+        page = self.stack.add_titled(self.clipboard_panel, "clipboard", "Clipboard")
+        page.set_icon_name("edit-paste-symbolic")
+
         self.stack.set_vexpand(True)
         self.stack.set_hexpand(True)
+
+        # ── Drag-and-drop: accept files dropped anywhere on the window ──
+        drop_target = Gtk.DropTarget.new(Gio.File, Gdk.DragAction.COPY)
+        drop_target.set_gtypes([Gio.File])
+        drop_target.connect("drop", self._on_file_drop)
+        self.stack.add_controller(drop_target)
 
         # ── Notifications sidebar ───────────────────────────────────
         notif_box = Gtk.Box(orientation=Gtk.Orientation.VERTICAL)
@@ -208,23 +264,39 @@ class MainWindow(Adw.ApplicationWindow):
             )
             devices.append(dev)
 
-        # Pick the best device to display
-        paired_reachable = [d for d in devices if d.paired and d.reachable]
-        paired = [d for d in devices if d.paired]
-        self.active_device = (
-            paired_reachable[0]
-            if paired_reachable
-            else paired[0]
-            if paired
-            else devices[0]
-            if devices
-            else None
-        )
+        self._all_devices = devices
+
+        # Pick the best device to display (keep current if still valid)
+        if self.active_device:
+            still_valid = next(
+                (d for d in devices if d.id == self.active_device.id and d.paired),
+                None,
+            )
+            if still_valid:
+                self.active_device = still_valid
+            else:
+                self.active_device = None
+
+        if not self.active_device:
+            paired_reachable = [d for d in devices if d.paired and d.reachable]
+            paired = [d for d in devices if d.paired]
+            self.active_device = (
+                paired_reachable[0]
+                if paired_reachable
+                else paired[0]
+                if paired
+                else devices[0]
+                if devices
+                else None
+            )
 
         self._update_device_header()
+        self._update_device_popover()
+        self._subscribe_share_signal()
 
         # Update panels with active device
-        for panel in (self.sms_panel, self.notif_panel, self.files_panel):
+        for panel in (self.sms_panel, self.notif_panel, self.files_panel,
+                      self.clipboard_panel):
             panel.set_device(self.active_device)
 
     def _update_device_header(self):
@@ -279,10 +351,153 @@ class MainWindow(Adw.ApplicationWindow):
         GLib.idle_add(self._refresh_devices)
 
     def _on_poll(self):
-        self._refresh_devices()
+        # Check if daemon is (still) available
+        if not self.client.bus:
+            self.client.connect()
+
+        daemon_ok = self.client.is_daemon_available() if self.client.bus else False
+
+        if daemon_ok and not self._daemon_was_available:
+            # Daemon just appeared — build the UI if needed
+            self._daemon_was_available = True
+            if not self._ui_built:
+                self._build_ui()
+            self._refresh_devices()
+        elif daemon_ok:
+            self._refresh_devices()
+        elif not daemon_ok and self._daemon_was_available:
+            # Daemon disappeared mid-session
+            self._daemon_was_available = False
+            self.active_device = None
+            if self._ui_built:
+                for panel in (self.sms_panel, self.notif_panel, self.files_panel,
+                              self.clipboard_panel):
+                    panel.set_device(None)
+                self._update_device_header()
+
         return GLib.SOURCE_CONTINUE
 
+    # ── Device switcher popover ──────────────────────────────────
+
+    def _update_device_popover(self):
+        """Rebuild the device list popover."""
+        paired = [d for d in self._all_devices if d.paired]
+        # Only show the arrow + make button clickable if there are multiple devices
+        self._device_arrow.set_visible(len(paired) > 1)
+        self._device_btn.set_sensitive(len(paired) > 1)
+
+        # Remove old rows
+        while True:
+            row = self._device_list_box.get_row_at_index(0)
+            if row is None:
+                break
+            self._device_list_box.remove(row)
+
+        for dev in paired:
+            row = Gtk.ListBoxRow()
+            box = Gtk.Box(orientation=Gtk.Orientation.HORIZONTAL, spacing=10)
+            box.set_margin_start(10)
+            box.set_margin_end(10)
+            box.set_margin_top(6)
+            box.set_margin_bottom(6)
+
+            icon = Gtk.Image.new_from_icon_name(dev.type_icon_name)
+            icon.set_pixel_size(20)
+            box.append(icon)
+
+            name_box = Gtk.Box(orientation=Gtk.Orientation.VERTICAL, spacing=2)
+            name_box.set_hexpand(True)
+            name_label = Gtk.Label(label=dev.name)
+            name_label.set_xalign(0)
+            name_label.add_css_class("heading")
+            name_box.append(name_label)
+
+            status_label = Gtk.Label(label=dev.status_label)
+            status_label.set_xalign(0)
+            status_label.add_css_class("caption")
+            status_label.add_css_class("dim-label")
+            name_box.append(status_label)
+            box.append(name_box)
+
+            if self.active_device and dev.id == self.active_device.id:
+                check = Gtk.Image.new_from_icon_name("object-select-symbolic")
+                check.set_pixel_size(16)
+                box.append(check)
+
+            row.set_child(box)
+            row._device_id = dev.id
+            self._device_list_box.append(row)
+
+    def _on_device_row_activated(self, list_box, row):
+        """Switch to the selected device."""
+        self._device_popover.popdown()
+        target_id = row._device_id
+        if self.active_device and self.active_device.id == target_id:
+            return
+        target = next((d for d in self._all_devices if d.id == target_id), None)
+        if target:
+            self.active_device = target
+            self._update_device_header()
+            self._update_device_popover()
+            self._subscribe_share_signal()
+            for panel in (self.sms_panel, self.notif_panel, self.files_panel,
+                          self.clipboard_panel):
+                panel.set_device(self.active_device)
+
+    # ── Drag-and-drop file transfer ───────────────────────────────
+
+    def _on_file_drop(self, drop_target, value, x, y):
+        """Handle files dropped onto the window."""
+        if not self.active_device or not self.active_device.reachable:
+            self._show_toast("No connected device — cannot send file")
+            return False
+        path = value.get_path()
+        if not path:
+            return False
+        self.client.share_file(self.active_device.id, path)
+        name = os.path.basename(path)
+        self._show_toast(f"Sending {name} to {self.active_device.name}…")
+        return True
+
+    # ── Continue on PC (URL share from phone) ─────────────────────
+
+    def _subscribe_share_signal(self):
+        """Subscribe to shareReceived so URLs from the phone open in the browser."""
+        if self._share_signal_id is not None and self.client.bus:
+            self.client.bus.signal_unsubscribe(self._share_signal_id)
+            self._share_signal_id = None
+        if not self.active_device:
+            return
+        path = f"/modules/kdeconnect/devices/{self.active_device.id}"
+        sid = self.client.subscribe_signal(
+            path, IFACE_SHARE, "shareReceived",
+            self._on_share_received,
+        )
+        self._share_signal_id = sid
+
+    def _on_share_received(self, conn, sender, path, iface, signal, params):
+        url = params.unpack()[0]
+        if url.startswith("http://") or url.startswith("https://"):
+            GLib.idle_add(self._open_url_on_pc, url)
+
+    def _open_url_on_pc(self, url: str):
+        """Open a URL received from the phone in the default browser."""
+        import subprocess
+        try:
+            subprocess.Popen(["xdg-open", url])
+        except FileNotFoundError:
+            pass
+        self._show_toast(f"Opened link from phone")
+
     # ── Actions ────────────────────────────────────────────────────
+
+    def _on_key_pressed(self, controller, keyval, keycode, state):
+        """Handle global keyboard shortcuts."""
+        ctrl = state & Gdk.ModifierType.CONTROL_MASK
+        if ctrl and keyval == Gdk.KEY_n:
+            self._notif_toggle.set_active(not self._notif_toggle.get_active())
+            return True
+        return False
 
     def _on_ring_phone(self, _btn):
         if not self.active_device:
@@ -316,11 +531,15 @@ class MainWindow(Adw.ApplicationWindow):
         GLib.timeout_add(500, self._set_skip_taskbar)
 
     def _set_skip_taskbar(self):
+        # Skip on Wayland — the X11 hint doesn't apply and Xlib isn't available
+        import os
+        session_type = os.environ.get("XDG_SESSION_TYPE", "").lower()
+        if session_type == "wayland":
+            return GLib.SOURCE_REMOVE
         try:
             from Xlib import display, Xatom
 
             surface = self.get_surface()
-            # Get the X11 window ID directly from the GTK4 surface
             xid = surface.get_xid() if hasattr(surface, "get_xid") else None
             if xid is None:
                 return GLib.SOURCE_REMOVE
@@ -337,6 +556,8 @@ class MainWindow(Adw.ApplicationWindow):
             )
             d.flush()
             d.close()
+        except ImportError:
+            pass  # Xlib not installed (e.g. pure Wayland system)
         except Exception:
             pass
         return GLib.SOURCE_REMOVE

@@ -199,6 +199,25 @@ class FilesPanel(Gtk.Box):
         self._status.set_description("No device connected.\nPair a phone to browse files.")
         self._outer_stack.add_named(self._status, "status")
 
+        # Mounting status page (shown while SFTP mount is in progress)
+        mounting_box = Gtk.Box(orientation=Gtk.Orientation.VERTICAL, spacing=16)
+        mounting_box.set_valign(Gtk.Align.CENTER)
+        mounting_box.set_halign(Gtk.Align.CENTER)
+        self._mounting_spinner = Gtk.Spinner()
+        self._mounting_spinner.set_size_request(48, 48)
+        mounting_box.append(self._mounting_spinner)
+        mounting_label = Gtk.Label(label="Mounting phone storage…")
+        mounting_label.add_css_class("title-3")
+        mounting_label.add_css_class("dim-label")
+        mounting_box.append(mounting_label)
+        mounting_hint = Gtk.Label(
+            label="Grant file permission on your phone if prompted."
+        )
+        mounting_hint.add_css_class("dim-label")
+        mounting_hint.add_css_class("caption")
+        mounting_box.append(mounting_hint)
+        self._outer_stack.add_named(mounting_box, "mounting")
+
         # Content area
         content = Gtk.Box(orientation=Gtk.Orientation.HORIZONTAL)
         self._outer_stack.add_named(content, "content")
@@ -487,19 +506,37 @@ class FilesPanel(Gtk.Box):
         self._mount_point = self.client.sftp_mount_point(device_id)
 
         if not self._is_mounted:
-            self._photo_status.set_label("Connecting to phone…")
-            self._status_bar.set_label("Mounting…")
-            ok = self.client.sftp_mount_and_wait(device_id)
-            if ok:
-                self._is_mounted = True
-                self._mount_point = self.client.sftp_mount_point(device_id)
-            else:
-                err = self.client.sftp_get_mount_error(device_id)
-                self._photo_status.set_label(f"Mount failed: {err}")
-                self._status_bar.set_label(f"Mount failed: {err}")
+            # Show mounting spinner while blocking mount call runs in background
+            self._outer_stack.set_visible_child_name("mounting")
+            self._mounting_spinner.start()
+
+            def do_mount():
+                ok = self.client.sftp_mount_and_wait(device_id)
+                GLib.idle_add(self._on_mount_finished, device_id, ok)
+
+            t = threading.Thread(target=do_mount, daemon=True)
+            t.start()
+            return
 
         self._resolve_storage_base(device_id)
         self._update_mount_ui()
+        if self._is_mounted and self._mount_point:
+            self._load_recent_photos()
+
+    def _on_mount_finished(self, device_id: str, ok: bool):
+        """Called on main thread after background mount completes."""
+        self._mounting_spinner.stop()
+        if ok:
+            self._is_mounted = True
+            self._mount_point = self.client.sftp_mount_point(device_id)
+        else:
+            err = self.client.sftp_get_mount_error(device_id)
+            self._photo_status.set_label(f"Mount failed: {err}")
+            self._status_bar.set_label(f"Mount failed: {err}")
+
+        self._resolve_storage_base(device_id)
+        self._update_mount_ui()
+        self._outer_stack.set_visible_child_name("content")
         if self._is_mounted and self._mount_point:
             self._load_recent_photos()
 

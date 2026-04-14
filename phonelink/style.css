@@ -40,6 +40,11 @@ levelbar trough block {
     font-size: 16px;
 }
 
+.conversation-avatar-group {
+    background-color: alpha(@accent_bg_color, 0.7);
+    font-size: 14px;
+}
+
 .unread-dot {
     color: @accent_bg_color;
     font-size: 10px;

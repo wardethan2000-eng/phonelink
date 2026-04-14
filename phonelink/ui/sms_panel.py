@@ -37,18 +37,33 @@ def _parse_message_tuple(t) -> SmsMessage | None:
     try:
         if not isinstance(t, (tuple, list)) or len(t) < 8:
             return None
-        # Extract first address from addresses list
-        # addresses looks like [('22550',)] or [('+13166551221',), ...]
+        # Extract all addresses from addresses list
+        # addresses looks like [('22550',)] or [('+13166551221',), ('+13165559999',)]
         addrs = t[_I_ADDRS]
-        address = ""
-        if addrs and len(addrs) > 0:
-            first = addrs[0]
-            if isinstance(first, (tuple, list)) and len(first) > 0:
-                address = str(first[0])
-            else:
-                address = str(first)
+        raw_addresses = []
+        if addrs:
+            for entry in addrs:
+                if isinstance(entry, (tuple, list)) and len(entry) > 0:
+                    raw_addresses.append(str(entry[0]))
+                else:
+                    raw_addresses.append(str(entry))
 
-        return SmsMessage(
+        # Deduplicate addresses by normalized phone number (KDE Connect
+        # often sends the same number twice for MMS-style threads).
+        all_addresses = []
+        seen_norms: set[str] = set()
+        for a in raw_addresses:
+            norm = re.sub(r"[^\d]", "", a)
+            key = norm[-10:] if len(norm) >= 10 else norm
+            if key and key in seen_norms:
+                continue
+            if key:
+                seen_norms.add(key)
+            all_addresses.append(a)
+
+        address = all_addresses[0] if all_addresses else ""
+
+        msg = SmsMessage(
             uid=int(t[_I_UID]),
             body=str(t[_I_BODY]),
             address=address,
@@ -57,6 +72,9 @@ def _parse_message_tuple(t) -> SmsMessage | None:
             read=int(t[_I_READ]),
             thread_id=int(t[_I_THREAD]),
         )
+        # Stash all addresses for group chat detection
+        msg._all_addresses = all_addresses
+        return msg
     except (IndexError, TypeError, ValueError) as e:
         print(f"[phonelink] Failed to parse message tuple: {e}")
         return None
@@ -68,9 +86,11 @@ class SmsPanel(Gtk.Box):
         self.client = client
         self._device = None
         self._conversations: dict[int, Conversation] = {}  # thread_id → Conversation
+        self._thread_redirects: dict[int, int] = {}  # secondary thread_id → primary thread_id
         self._active_thread_id: int | None = None
         self._signal_ids: list[int] = []
         self._contact_map: dict[str, str] = {}  # normalised phone → display name
+        self._self_number: str = ""  # user's own phone number (last-10 digits), detected from data
         self._read_thread_ids: set[int] = set()  # threads the user has opened this session
         self._was_reachable: bool = False  # track reachability transitions
 
@@ -101,6 +121,7 @@ class SmsPanel(Gtk.Box):
         self._conv_list.connect("conversation-selected", self._on_conversation_selected)
         self._conv_list.connect("start-conversation", self._on_start_conversation)
         self._conv_list.connect("rename-contact", self._on_rename_contact)
+        self._conv_list.connect("delete-conversation", self._on_delete_conversation)
         self._conv_list.connect("import-contacts", self._on_import_contacts)
         sidebar.append(self._conv_list)
         content.append(sidebar)
@@ -110,6 +131,7 @@ class SmsPanel(Gtk.Box):
         # Right: message thread
         self._thread = MessageThread()
         self._thread.connect("send-message", self._on_send_message)
+        self._thread.connect("send-message-with-attachment", self._on_send_message_with_attachment)
         content.append(self._thread)
 
         self._stack.set_visible_child_name("status")
@@ -145,6 +167,7 @@ class SmsPanel(Gtk.Box):
             # New device — full reset
             self._unsubscribe_signals()
             self._conversations.clear()
+            self._thread_redirects.clear()
             self._read_thread_ids.clear()
             self._conv_list.set_conversations([])
             self._thread.show_empty()
@@ -165,6 +188,9 @@ class SmsPanel(Gtk.Box):
     def _load_active_conversations(self, device_id):
         """Load cached conversations from the daemon via activeConversations()."""
         raw_list = self.client.get_active_conversations(device_id)
+        # Detect user's own number before merging (appears in many multi-
+        # address conversations but has no dedicated single-address convo).
+        self._detect_self_number(raw_list)
         count = 0
         for entry in raw_list:
             msg = _parse_message_tuple(entry)
@@ -173,6 +199,57 @@ class SmsPanel(Gtk.Box):
                 count += 1
         if count:
             self._refresh_conversation_list()
+
+    def _detect_self_number(self, raw_list):
+        """Detect the user's own phone number from conversation data.
+
+        In MMS-style threads, the phone includes the user's own number in
+        the addresses list.  We detect it by finding a number that:
+        1. Appears in many multi-address conversations
+        2. Has no dedicated single-address conversation
+        3. Is not in the contact map
+        """
+        from phonelink.contacts import _normalize_phone
+        from collections import Counter
+
+        multi_appearances: Counter[str] = Counter()
+        single_addr_keys: set[str] = set()
+
+        for entry in raw_list:
+            msg = _parse_message_tuple(entry)
+            if not msg:
+                continue
+            addrs = getattr(msg, '_all_addresses', [])
+            norms = []
+            for a in addrs:
+                n = _normalize_phone(a)
+                key = n[-10:] if len(n) >= 10 else n
+                if key:
+                    norms.append(key)
+            if len(norms) == 1:
+                single_addr_keys.add(norms[0])
+            elif len(norms) >= 2:
+                for key in set(norms):
+                    multi_appearances[key] += 1
+
+        # The user's own number appears in many multi-addr convos,
+        # has no single-addr convo, and isn't a known contact.
+        for num, count in multi_appearances.most_common(5):
+            if count < 3:
+                break
+            if num in single_addr_keys:
+                continue
+            # Check if this number is in the contact map
+            in_contacts = False
+            for key in self._contact_map:
+                ckey = key[-10:] if len(key) >= 10 else key
+                if ckey == num:
+                    in_contacts = True
+                    break
+            if not in_contacts:
+                self._self_number = num
+                return
+        self._self_number = ""
 
     def _show_disconnected(self):
         if self._device:
@@ -372,22 +449,77 @@ class SmsPanel(Gtk.Box):
                 self._refresh_conversation_list()
                 if self._active_thread_id == msg.thread_id:
                     self._show_thread(msg.thread_id)
-        except Exception as e:
-            print(f"[phonelink] SMS signal parse error: {e}")
+        except (TypeError, ValueError, IndexError) as e:
+            print(f"[phonelink] SMS signal parse error: {type(e).__name__}: {e}")
 
     # ── Message ingestion ──────────────────────────────────────────
 
     def _merge_message(self, msg: SmsMessage):
-        """Merge a parsed SmsMessage into the conversation store."""
-        conv = self._conversations.get(msg.thread_id)
+        """Merge a parsed SmsMessage into the conversation store.
+
+        When the phone has separate thread IDs for the same contact (e.g.
+        SMS vs MMS threads, dual-SIM), we redirect the secondary thread
+        into the primary conversation so the user sees a single entry.
+        """
+        from phonelink.contacts import _normalize_phone
+
+        # Follow any existing redirect
+        primary_tid = self._thread_redirects.get(msg.thread_id, msg.thread_id)
+        conv = self._conversations.get(primary_tid)
+
         if conv is None:
-            display = resolve_name(self._contact_map, msg.address)
-            conv = Conversation(
-                thread_id=msg.thread_id,
-                address=msg.address,
-                display_name=display,
-            )
-            self._conversations[msg.thread_id] = conv
+            all_addrs = getattr(msg, '_all_addresses', [msg.address] if msg.address else [])
+
+            # Filter out the user's own number from the address list
+            # (MMS-style threads include all participants including self).
+            if self._self_number and len(all_addrs) > 1:
+                filtered = []
+                for a in all_addrs:
+                    n = _normalize_phone(a)
+                    key = n[-10:] if len(n) >= 10 else n
+                    if key != self._self_number:
+                        filtered.append(a)
+                if filtered:
+                    all_addrs = filtered
+                    # Update primary address to first non-self address
+                    msg.address = all_addrs[0]
+
+            # Before creating a new conversation, check if one already exists
+            # for this phone number under a different thread_id.
+            if len(all_addrs) <= 1 and msg.address:
+                norm = _normalize_phone(msg.address)
+                if norm and len(norm) >= 7:
+                    for existing in self._conversations.values():
+                        if existing.is_group or existing.thread_id < 0:
+                            continue
+                        existing_norm = _normalize_phone(existing.address)
+                        if existing_norm == norm or (
+                            len(norm) >= 10 and len(existing_norm) >= 10
+                            and existing_norm[-10:] == norm[-10:]
+                        ):
+                            # Redirect this thread to the existing conversation
+                            self._thread_redirects[msg.thread_id] = existing.thread_id
+                            conv = existing
+                            break
+
+            if conv is None:
+                if len(all_addrs) > 1:
+                    names = [resolve_name(self._contact_map, a) for a in all_addrs]
+                    display = ", ".join(names)
+                else:
+                    display = resolve_name(self._contact_map, msg.address)
+                conv = Conversation(
+                    thread_id=msg.thread_id,
+                    address=msg.address,
+                    addresses=all_addrs,
+                    display_name=display,
+                )
+                self._conversations[msg.thread_id] = conv
+        else:
+            # Update addresses list if we got more addresses from this message
+            all_addrs = getattr(msg, '_all_addresses', [])
+            if all_addrs and len(all_addrs) > len(conv.addresses):
+                conv.addresses = all_addrs
 
         # Avoid duplicates
         existing_uids = {m.uid for m in conv.messages}
@@ -427,8 +559,15 @@ class SmsPanel(Gtk.Box):
         if not self._contact_map:
             return
         for conv in self._conversations.values():
-            new_name = resolve_name(self._contact_map, conv.address)
-            conv.display_name = new_name
+            if conv.is_group:
+                # Build group display name from resolved participant names
+                names = []
+                for addr in conv.addresses:
+                    names.append(resolve_name(self._contact_map, addr))
+                conv.display_name = ", ".join(names)
+            else:
+                new_name = resolve_name(self._contact_map, conv.address)
+                conv.display_name = new_name
         self._refresh_conversation_list(force_rebuild=True)
 
     def _refresh_conversation_list(self, force_rebuild=False):
@@ -447,12 +586,61 @@ class SmsPanel(Gtk.Box):
                     active_conv.is_read = True
             self._conv_list.set_contact_map(self._contact_map)
             self._conv_list.set_conversations(
-                list(self._conversations.values()), force_rebuild=force_rebuild
+                self._deduplicated_conversations(), force_rebuild=force_rebuild
             )
             if self._active_thread_id:
                 self._conv_list.select_thread(self._active_thread_id)
         finally:
             self._refreshing = False
+
+    def _deduplicated_conversations(self) -> list[Conversation]:
+        """Return conversations with same-address non-group threads merged.
+
+        When the phone creates multiple thread IDs for the same contact
+        (e.g. separate SMS and MMS threads), we present them as one entry
+        using the newest thread's metadata and combining all messages.
+        """
+        from phonelink.contacts import _normalize_phone
+
+        # Group conversations are never merged
+        groups = []
+        by_address: dict[str, list[Conversation]] = {}
+        for conv in self._conversations.values():
+            if conv.is_group or conv.thread_id < 0:
+                groups.append(conv)
+                continue
+            norm = _normalize_phone(conv.address)
+            # Use last-10 digits as the key to handle country-code differences
+            key = norm[-10:] if len(norm) >= 10 else norm
+            if not key:
+                groups.append(conv)
+                continue
+            by_address.setdefault(key, []).append(conv)
+
+        result = list(groups)
+        for convs in by_address.values():
+            if len(convs) == 1:
+                result.append(convs[0])
+                continue
+            # Pick the conversation with the newest message as the primary
+            primary = max(convs, key=lambda c: c.last_date)
+            # Merge messages from other threads into the primary
+            primary_uids = {m.uid for m in primary.messages}
+            for other in convs:
+                if other.thread_id == primary.thread_id:
+                    continue
+                for msg in other.messages:
+                    if msg.uid and msg.uid not in primary_uids:
+                        primary.messages.append(msg)
+                        primary_uids.add(msg.uid)
+                # If the user had the secondary thread active, redirect
+                if self._active_thread_id == other.thread_id:
+                    self._active_thread_id = primary.thread_id
+                # Preserve unread state
+                if not other.is_read:
+                    primary.is_read = False
+            result.append(primary)
+        return result
 
     # ── UI event handlers ──────────────────────────────────────────
 
@@ -483,6 +671,13 @@ class SmsPanel(Gtk.Box):
         if self._device and len(conv.messages) < 20:
             self._thread.show_loading(conv.display_name, conv.address)
             self.client.request_conversation(self._device.id, thread_id, 0, 50)
+            # Also request messages from any secondary threads that were
+            # redirected into this conversation (SMS/MMS split, etc.)
+            for sec_tid, primary_tid in self._thread_redirects.items():
+                if primary_tid == thread_id:
+                    self.client.request_conversation(
+                        self._device.id, sec_tid, 0, 50
+                    )
             # Show what we have while waiting
             GLib.timeout_add(300, lambda: self._show_thread(thread_id) or False)
         else:
@@ -544,24 +739,112 @@ class SmsPanel(Gtk.Box):
         self._conv_list.select_thread(draft_id)
         self._show_thread(draft_id)
 
+    def _find_thread_for_address(self, address: str) -> int | None:
+        """Find an existing real thread_id for a phone number, or None."""
+        from phonelink.contacts import _normalize_phone
+        norm = _normalize_phone(address)
+        if not norm:
+            return None
+        for conv in self._conversations.values():
+            if conv.thread_id < 0 or conv.is_group:
+                continue
+            conv_norm = _normalize_phone(conv.address)
+            if conv_norm == norm or (
+                len(norm) >= 10 and len(conv_norm) >= 10
+                and conv_norm[-10:] == norm[-10:]
+            ):
+                return conv.thread_id
+        return None
+
     def _on_send_message(self, widget, thread_id, text):
         """Handle send from the compose bar."""
         if not self._device or not self._device.reachable:
             return
 
         if thread_id < 0:
-            # Draft conversation — send as new SMS
+            # Draft conversation — try to find an existing thread first
+            # (one may have loaded since the draft was created)
             conv = self._conversations.get(thread_id)
             if conv:
-                self.client.send_sms(self._device.id, [conv.address], text)
-                # Remove the draft; the phone will create a real conversation
-                # which will arrive via D-Bus signal
-                self._conversations.pop(thread_id, None)
-                self._active_thread_id = None
-                self._thread.show_empty()
-                self._refresh_conversation_list()
+                existing_tid = self._find_thread_for_address(conv.address)
+                if existing_tid is not None:
+                    # Use existing thread — avoids creating a duplicate on the phone
+                    self.client.reply_to_conversation(
+                        self._device.id, existing_tid, text
+                    )
+                    self._conversations.pop(thread_id, None)
+                    self._active_thread_id = existing_tid
+                    self._read_thread_ids.add(existing_tid)
+                    self._refresh_conversation_list()
+                    self._show_thread(existing_tid)
+                else:
+                    # Truly new contact — create a new thread on the phone
+                    self.client.send_sms(self._device.id, [conv.address], text)
+                    self._conversations.pop(thread_id, None)
+                    self._active_thread_id = None
+                    self._thread.show_empty()
+                    self._refresh_conversation_list()
         else:
             self.client.reply_to_conversation(self._device.id, thread_id, text)
+
+    def _on_send_message_with_attachment(self, widget, thread_id, text, image_path):
+        """Handle send with an image attachment."""
+        if not self._device or not self._device.reachable:
+            return
+
+        if thread_id < 0:
+            conv = self._conversations.get(thread_id)
+            if conv:
+                existing_tid = self._find_thread_for_address(conv.address)
+                if existing_tid is not None:
+                    self.client.reply_to_conversation(
+                        self._device.id, existing_tid, text or "",
+                        attachments=[image_path],
+                    )
+                    self._conversations.pop(thread_id, None)
+                    self._active_thread_id = existing_tid
+                    self._read_thread_ids.add(existing_tid)
+                    self._refresh_conversation_list()
+                    self._show_thread(existing_tid)
+                else:
+                    self.client.send_sms(
+                        self._device.id, [conv.address], text or "",
+                        attachments=[image_path],
+                    )
+                    self._conversations.pop(thread_id, None)
+                    self._active_thread_id = None
+                    self._thread.show_empty()
+                    self._refresh_conversation_list()
+        else:
+            self.client.reply_to_conversation(
+                self._device.id, thread_id, text or "",
+                attachments=[image_path],
+            )
+
+    def _on_delete_conversation(self, widget, thread_id):
+        """Ask for confirmation, then delete the conversation locally and on the phone."""
+        conv = self._conversations.get(thread_id)
+        name = (conv.display_name or conv.address) if conv else f"Thread {thread_id}"
+
+        dialog = Adw.MessageDialog(
+            transient_for=self.get_root(),
+            heading="Delete Conversation",
+            body=f"Delete the conversation with {name}?\n\nThis will also try to delete it on your phone.",
+        )
+        dialog.add_response("cancel", "Cancel")
+        dialog.add_response("delete", "Delete")
+        dialog.set_response_appearance("delete", Adw.ResponseAppearance.DESTRUCTIVE)
+
+        def on_response(dlg, response):
+            if response == "delete":
+                # Try to delete on the phone (silently fails on older KDE Connect)
+                if self._device and self._client:
+                    self._client.delete_conversation(self._device.id, thread_id)
+                # Remove locally
+                self._remove_conversation(thread_id)
+
+        dialog.connect("response", on_response)
+        dialog.present()
 
     def _on_rename_contact(self, widget, thread_id, address):
         """Show a dialog to set a contact name for a phone number."""

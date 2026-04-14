@@ -154,17 +154,6 @@ class SettingsPanel(Gtk.Box):
         )
         sync_group.add(enabled_row)
 
-        sound_row = Adw.SwitchRow(
-            title="Play Sound",
-            subtitle="Play a sound when a new notification arrives",
-        )
-        sound_row.set_active(self._settings.notifications_sound)
-        sound_row.connect(
-            "notify::active",
-            lambda r, _: setattr(self._settings, "notifications_sound", r.get_active()),
-        )
-        sync_group.add(sound_row)
-
         self._ignored_group = Adw.PreferencesGroup(
             title="Hidden Apps",
             description="Notifications from these apps will not appear in the tray.",

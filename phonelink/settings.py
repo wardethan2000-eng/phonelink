@@ -18,7 +18,6 @@ _DEFAULTS = {
     "color_scheme": "system",   # "system" | "light" | "dark"
     "open_on_startup": False,
     "notifications_enabled": True,
-    "notifications_sound": False,
     "notifications_ignored_apps": [],   # list of app_name strings to hide
 }
 
@@ -72,15 +71,6 @@ class Settings:
     @notifications_enabled.setter
     def notifications_enabled(self, value: bool):
         self._data["notifications_enabled"] = bool(value)
-        self.save()
-
-    @property
-    def notifications_sound(self) -> bool:
-        return self._data["notifications_sound"]
-
-    @notifications_sound.setter
-    def notifications_sound(self, value: bool):
-        self._data["notifications_sound"] = bool(value)
         self.save()
 
     @property
