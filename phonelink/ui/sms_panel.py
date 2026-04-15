@@ -18,6 +18,7 @@ from phonelink.dbus_client import (
     IFACE_TELEPHONY,
 )
 from phonelink.contacts import (
+    _normalize_phone,
     load_contact_map, resolve_name, import_vcf_file,
     harvest_contacts_from_notifications,
     harvest_contact_from_notification_signal,
@@ -268,6 +269,79 @@ class SmsPanel(Gtk.Box):
         """Run retroactive contact recovery sources used during startup."""
         self._harvest_from_notifications(device_id)
         self._scan_downloads_for_vcf(device_id)
+
+    def _conversation_identity(self, addresses: list[str] | None, fallback_address: str = "") -> str:
+        participants: list[str] = []
+        for raw_address in list(addresses or []) + ([fallback_address] if fallback_address else []):
+            norm = _normalize_phone(raw_address)
+            if not norm:
+                continue
+            key = norm[-10:] if len(norm) >= 10 else norm
+            if key and key not in participants:
+                participants.append(key)
+
+        if self._self_number and len(participants) > 1:
+            filtered = [key for key in participants if key != self._self_number]
+            if filtered:
+                participants = filtered
+
+        participants.sort()
+        return "|".join(participants)
+
+    def _conversation_hidden_until(self, conversation_key: str) -> int:
+        if not self._device or not conversation_key:
+            return 0
+        return self._settings.conversation_hidden_until(self._device.id, conversation_key)
+
+    def _should_keep_conversation_hidden(self, conversation_key: str, message_date: int) -> bool:
+        hidden_until = self._conversation_hidden_until(conversation_key)
+        if not hidden_until:
+            return False
+        if int(message_date or 0) > hidden_until:
+            self._settings.unhide_conversation(self._device.id, conversation_key)
+            return False
+        return True
+
+    def _hide_conversation_locally(self, conv: Conversation):
+        if not self._device or conv.thread_id < 0:
+            return ""
+        conversation_key = self._conversation_identity(conv.addresses, conv.address)
+        if not conversation_key:
+            return ""
+        deleted_at = max(int(time.time() * 1000), int(conv.last_date or 0))
+        self._settings.hide_conversation(self._device.id, conversation_key, deleted_at)
+        return conversation_key
+
+    def _purge_loaded_conversations(self, conversation_key: str):
+        if not conversation_key:
+            return
+
+        removed_ids: set[int] = set()
+        for thread_id, conv in list(self._conversations.items()):
+            if self._conversation_identity(conv.addresses, conv.address) != conversation_key:
+                continue
+            self._conversations.pop(thread_id, None)
+            removed_ids.add(thread_id)
+
+        if not removed_ids:
+            return
+
+        self._read_thread_ids.difference_update(removed_ids)
+        self._thread_redirects = {
+            sec_tid: primary_tid
+            for sec_tid, primary_tid in self._thread_redirects.items()
+            if sec_tid not in removed_ids and primary_tid not in removed_ids
+        }
+        if self._active_thread_id in removed_ids:
+            self._thread.show_empty()
+            self._active_thread_id = None
+
+    def _is_hidden_conversation(self, conv: Conversation) -> bool:
+        conversation_key = self._conversation_identity(conv.addresses, conv.address)
+        if not conversation_key:
+            return False
+        message_date = conv.last_date or (conv.messages[-1].date if conv.messages else 0)
+        return self._should_keep_conversation_hidden(conversation_key, message_date)
 
     def _load_active_conversations(self, device_id):
         """Load cached conversations from the daemon via activeConversations()."""
@@ -795,8 +869,6 @@ class SmsPanel(Gtk.Box):
         SMS vs MMS threads, dual-SIM), we redirect the secondary thread
         into the primary conversation so the user sees a single entry.
         """
-        from phonelink.contacts import _normalize_phone
-
         # Follow any existing redirect
         primary_tid = self._thread_redirects.get(msg.thread_id, msg.thread_id)
         conv = self._conversations.get(primary_tid)
@@ -817,6 +889,10 @@ class SmsPanel(Gtk.Box):
                     all_addrs = filtered
                     # Update primary address to first non-self address
                     msg.address = all_addrs[0]
+
+            conversation_key = self._conversation_identity(all_addrs, msg.address)
+            if self._should_keep_conversation_hidden(conversation_key, msg.date):
+                return
 
             # Before creating a new conversation, check if one already exists
             # for this phone number under a different thread_id.
@@ -943,6 +1019,8 @@ class SmsPanel(Gtk.Box):
         groups = []
         by_address: dict[str, list[Conversation]] = {}
         for conv in self._conversations.values():
+            if self._is_hidden_conversation(conv):
+                continue
             if conv.is_group or conv.thread_id < 0:
                 groups.append(conv)
                 continue
@@ -982,6 +1060,9 @@ class SmsPanel(Gtk.Box):
     # ── UI event handlers ──────────────────────────────────────────
 
     def _on_conversation_selected(self, widget, thread_id):
+        if self._active_thread_id == thread_id:
+            return
+
         self._active_thread_id = thread_id
         conv = self._conversations.get(thread_id)
         if not conv:
@@ -992,8 +1073,8 @@ class SmsPanel(Gtk.Box):
         was_unread = not conv.is_read
         conv.is_read = True
 
-        # Rebuild the list immediately so the unread dot disappears
-        self._refresh_conversation_list(force_rebuild=True)
+        if was_unread:
+            self._conv_list.set_thread_read_state(thread_id, True)
 
         # Draft conversations (negative thread_id) don't exist on the phone
         if thread_id < 0:
@@ -1004,9 +1085,11 @@ class SmsPanel(Gtk.Box):
         if was_unread and self._device:
             self.client.mark_conversation_as_read(self._device.id, thread_id)
 
-        # If we have few messages, request more from the phone
+        # Show cached messages immediately, then request more in the background
+        # if this thread looks only partially loaded.
+        self._show_thread(thread_id)
+
         if self._device and len(conv.messages) < 20:
-            self._thread.show_loading(conv.display_name, conv.address)
             self.client.request_conversation(self._device.id, thread_id, 0, 50)
             # Also request messages from any secondary threads that were
             # redirected into this conversation (SMS/MMS split, etc.)
@@ -1015,10 +1098,6 @@ class SmsPanel(Gtk.Box):
                     self.client.request_conversation(
                         self._device.id, sec_tid, 0, 50
                     )
-            # Show what we have while waiting
-            GLib.timeout_add(300, lambda: self._show_thread(thread_id) or False)
-        else:
-            self._show_thread(thread_id)
 
     def _show_thread(self, thread_id):
         conv = self._conversations.get(thread_id)
@@ -1197,14 +1276,20 @@ class SmsPanel(Gtk.Box):
 
         def on_response(dlg, response):
             if response == "delete":
+                conversation_key = ""
+                if conv is not None:
+                    conversation_key = self._hide_conversation_locally(conv)
                 if can_delete_on_phone:
                     deleted = self.client.delete_conversation(self._device.id, thread_id)
                     if not deleted:
                         self._show_toast("Phone-side deletion failed; removing the conversation only from Phone Link")
                 elif thread_id >= 0:
                     self._show_toast("Removed from Phone Link only; phone-side deletion is not available on this KDE Connect version")
-                # Remove locally
-                self._remove_conversation(thread_id)
+                if conversation_key:
+                    self._purge_loaded_conversations(conversation_key)
+                    self._refresh_conversation_list(force_rebuild=True)
+                else:
+                    self._remove_conversation(thread_id)
 
         dialog.connect("response", on_response)
         dialog.present()

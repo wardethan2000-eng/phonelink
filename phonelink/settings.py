@@ -23,6 +23,7 @@ _DEFAULTS = {
     "google_account_label": "",
     "google_last_sync_ts": 0.0,
     "google_last_attempt_ts": 0.0,
+    "hidden_conversations": {},
 }
 
 
@@ -69,6 +70,22 @@ class Settings:
         self._data["google_last_attempt_ts"] = float(
             self._data.get("google_last_attempt_ts", 0.0) or 0.0
         )
+        raw_hidden = self._data.get("hidden_conversations", {}) or {}
+        normalized_hidden: dict[str, dict[str, dict[str, int]]] = {}
+        if isinstance(raw_hidden, dict):
+            for device_id, entries in raw_hidden.items():
+                if not isinstance(entries, dict):
+                    continue
+                normalized_entries: dict[str, dict[str, int]] = {}
+                for conversation_key, payload in entries.items():
+                    if not conversation_key or not isinstance(payload, dict):
+                        continue
+                    normalized_entries[str(conversation_key)] = {
+                        "deleted_at": int(payload.get("deleted_at", 0) or 0),
+                    }
+                if normalized_entries:
+                    normalized_hidden[str(device_id)] = normalized_entries
+        self._data["hidden_conversations"] = normalized_hidden
 
     def save(self):
         _DATA_DIR.mkdir(parents=True, exist_ok=True)
@@ -151,6 +168,38 @@ class Settings:
         self._data["google_last_sync_ts"] = 0.0
         self._data["google_last_attempt_ts"] = 0.0
         self.save()
+
+    def conversation_hidden_until(self, device_id: str, conversation_key: str) -> int:
+        if not device_id or not conversation_key:
+            return 0
+        hidden = self._data.get("hidden_conversations", {})
+        return int(
+            hidden.get(device_id, {}).get(conversation_key, {}).get("deleted_at", 0) or 0
+        )
+
+    def hide_conversation(self, device_id: str, conversation_key: str, deleted_at: int):
+        if not device_id or not conversation_key:
+            return
+        hidden = self._data.setdefault("hidden_conversations", {})
+        device_hidden = hidden.setdefault(device_id, {})
+        device_hidden[conversation_key] = {
+            "deleted_at": int(deleted_at or 0),
+        }
+        self.save()
+
+    def unhide_conversation(self, device_id: str, conversation_key: str) -> bool:
+        if not device_id or not conversation_key:
+            return False
+        hidden = self._data.get("hidden_conversations", {})
+        device_hidden = hidden.get(device_id)
+        if not device_hidden:
+            return False
+        removed = device_hidden.pop(conversation_key, None) is not None
+        if not device_hidden:
+            hidden.pop(device_id, None)
+        if removed:
+            self.save()
+        return removed
 
     def add_ignored_app(self, app_name: str):
         if app_name not in self._data["notifications_ignored_apps"]:

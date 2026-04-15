@@ -72,15 +72,13 @@ class ConversationRow(Gtk.ListBoxRow):
         else:
             display_text = conversation.display_name or conversation.address or "Unknown"
 
-        name_label = Gtk.Label(label=display_text)
-        name_label.set_xalign(0)
-        name_label.set_halign(Gtk.Align.START)
-        name_label.set_hexpand(True)
-        name_label.set_ellipsize(Pango.EllipsizeMode.END)
-        name_label.set_max_width_chars(20)
-        if not conversation.is_read:
-            name_label.add_css_class("conversation-name-unread")
-        top_row.append(name_label)
+        self._name_label = Gtk.Label(label=display_text)
+        self._name_label.set_xalign(0)
+        self._name_label.set_halign(Gtk.Align.START)
+        self._name_label.set_hexpand(True)
+        self._name_label.set_ellipsize(Pango.EllipsizeMode.END)
+        self._name_label.set_max_width_chars(20)
+        top_row.append(self._name_label)
 
         time_label = Gtk.Label(label=conversation.time_label)
         time_label.add_css_class("dim-label")
@@ -98,13 +96,22 @@ class ConversationRow(Gtk.ListBoxRow):
         text_col.append(preview_label)
 
         # Reserve trailing width so read/unread changes don't resize the row.
-        dot = Gtk.Label(label="●")
-        dot.add_css_class("unread-dot")
-        if conversation.is_read:
-            dot.add_css_class("unread-dot-hidden")
-        dot.set_xalign(0.5)
-        dot.set_valign(Gtk.Align.CENTER)
-        box.append(dot)
+        self._unread_dot = Gtk.Label(label="●")
+        self._unread_dot.add_css_class("unread-dot")
+        self._unread_dot.set_xalign(0.5)
+        self._unread_dot.set_valign(Gtk.Align.CENTER)
+        box.append(self._unread_dot)
+
+        self.set_read_state(conversation.is_read)
+
+    def set_read_state(self, is_read: bool):
+        self.conversation.is_read = bool(is_read)
+        if self.conversation.is_read:
+            self._name_label.remove_css_class("conversation-name-unread")
+            self._unread_dot.add_css_class("unread-dot-hidden")
+        else:
+            self._name_label.add_css_class("conversation-name-unread")
+            self._unread_dot.remove_css_class("unread-dot-hidden")
 
 
 class ContactSuggestionRow(Gtk.ListBoxRow):
@@ -233,8 +240,9 @@ class ConversationList(Gtk.Box):
         scroll_box.append(self._contacts_listbox)
 
         self._search_text = ""
-        self._last_selected_id = None
         self._rebuilding = False
+        self._suppress_selection_signal = False
+        self._last_emitted_thread_id: int | None = None
 
     def set_conversations(self, conversations, force_rebuild=False):
         """Update the conversation list, rebuilding only when the set changes."""
@@ -266,7 +274,6 @@ class ConversationList(Gtk.Box):
         if force_rebuild or new_rows != self._rendered_rows:
             self._rendered_rows = new_rows
             self._rebuilding = True
-            self._last_selected_id = None
             # Remove old rows
             while True:
                 row = self._listbox.get_row_at_index(0)
@@ -288,25 +295,50 @@ class ConversationList(Gtk.Box):
             if row is None:
                 break
             if row.conversation.thread_id == thread_id:
+                if self._listbox.get_selected_row() is row:
+                    break
+                self._suppress_selection_signal = True
                 self._listbox.select_row(row)
+                self._suppress_selection_signal = False
                 break
             idx += 1
 
+    def set_thread_read_state(self, thread_id: int, is_read: bool):
+        idx = 0
+        while True:
+            row = self._listbox.get_row_at_index(idx)
+            if row is None:
+                break
+            if row.conversation.thread_id == thread_id and hasattr(row, "set_read_state"):
+                row.set_read_state(is_read)
+                break
+            idx += 1
+
+        updated_rows = []
+        for rendered in self._rendered_rows:
+            if rendered[0] == thread_id:
+                updated_rows.append(rendered[:5] + (bool(is_read),) + rendered[6:])
+            else:
+                updated_rows.append(rendered)
+        self._rendered_rows = updated_rows
+
+    def _emit_conversation_selected(self, thread_id: int):
+        if self._suppress_selection_signal:
+            return
+        if self._last_emitted_thread_id == thread_id:
+            return
+        self._last_emitted_thread_id = thread_id
+        self.emit("conversation-selected", thread_id)
+
     def _on_row_activated(self, listbox, row):
         if row and hasattr(row, "conversation"):
-            self._last_selected_id = row.conversation.thread_id
-            self.emit("conversation-selected", row.conversation.thread_id)
+            self._emit_conversation_selected(row.conversation.thread_id)
 
     def _on_row_selected(self, listbox, row):
-        # Backup path: emit conversation-selected on selection change too,
-        # unless row-activated already handled this exact row.
         if self._rebuilding:
             return
         if row and hasattr(row, "conversation"):
-            tid = row.conversation.thread_id
-            if getattr(self, "_last_selected_id", None) != tid:
-                self._last_selected_id = tid
-                self.emit("conversation-selected", tid)
+            self._emit_conversation_selected(row.conversation.thread_id)
 
     def _on_search_changed(self, entry):
         self._search_text = entry.get_text().lower()
