@@ -19,7 +19,25 @@ _DEFAULTS = {
     "open_on_startup": False,
     "notifications_enabled": True,
     "notifications_ignored_apps": [],   # list of app_name strings to hide
+    "google_background_sync": True,
+    "google_account_label": "",
+    "google_last_sync_ts": 0.0,
+    "google_last_attempt_ts": 0.0,
 }
+
+
+def _desktop_entry_text() -> str:
+    return (
+        "[Desktop Entry]\n"
+        "Name=Phone Link\n"
+        "Comment=Connect your Android phone — SMS, notifications, and files\n"
+        f"Exec=/usr/bin/python3 {_RUN_PY}\n"
+        "Icon=phonelink\n"
+        "Terminal=false\n"
+        "Type=Application\n"
+        "Categories=Utility;Communication;\n"
+        "X-GNOME-Autostart-enabled=true\n"
+    )
 
 
 class Settings:
@@ -36,6 +54,21 @@ class Settings:
         except (FileNotFoundError, json.JSONDecodeError):
             stored = {}
         self._data = {**_DEFAULTS, **stored}
+        self._data["notifications_ignored_apps"] = list(
+            self._data.get("notifications_ignored_apps", []) or []
+        )
+        self._data["google_background_sync"] = bool(
+            self._data.get("google_background_sync", True)
+        )
+        self._data["google_account_label"] = str(
+            self._data.get("google_account_label", "") or ""
+        )
+        self._data["google_last_sync_ts"] = float(
+            self._data.get("google_last_sync_ts", 0.0) or 0.0
+        )
+        self._data["google_last_attempt_ts"] = float(
+            self._data.get("google_last_attempt_ts", 0.0) or 0.0
+        )
 
     def save(self):
         _DATA_DIR.mkdir(parents=True, exist_ok=True)
@@ -77,6 +110,48 @@ class Settings:
     def notifications_ignored_apps(self) -> list[str]:
         return list(self._data["notifications_ignored_apps"])
 
+    @property
+    def google_background_sync(self) -> bool:
+        return self._data["google_background_sync"]
+
+    @google_background_sync.setter
+    def google_background_sync(self, value: bool):
+        self._data["google_background_sync"] = bool(value)
+        self.save()
+
+    @property
+    def google_account_label(self) -> str:
+        return self._data["google_account_label"]
+
+    @google_account_label.setter
+    def google_account_label(self, value: str):
+        self._data["google_account_label"] = str(value or "")
+        self.save()
+
+    @property
+    def google_last_sync_ts(self) -> float:
+        return float(self._data["google_last_sync_ts"])
+
+    @google_last_sync_ts.setter
+    def google_last_sync_ts(self, value: float):
+        self._data["google_last_sync_ts"] = float(value or 0.0)
+        self.save()
+
+    @property
+    def google_last_attempt_ts(self) -> float:
+        return float(self._data["google_last_attempt_ts"])
+
+    @google_last_attempt_ts.setter
+    def google_last_attempt_ts(self, value: float):
+        self._data["google_last_attempt_ts"] = float(value or 0.0)
+        self.save()
+
+    def clear_google_account(self):
+        self._data["google_account_label"] = ""
+        self._data["google_last_sync_ts"] = 0.0
+        self._data["google_last_attempt_ts"] = 0.0
+        self.save()
+
     def add_ignored_app(self, app_name: str):
         if app_name not in self._data["notifications_ignored_apps"]:
             self._data["notifications_ignored_apps"].append(app_name)
@@ -97,19 +172,8 @@ class Settings:
     def _apply_autostart(self, enable: bool):
         if enable:
             _AUTOSTART_DIR.mkdir(parents=True, exist_ok=True)
-            desktop = (
-                "[Desktop Entry]\n"
-                "Name=Phone Link\n"
-                "Comment=Connect your Android phone — SMS, notifications, and files\n"
-                f"Exec=/usr/bin/python3 {_RUN_PY}\n"
-                "Icon=phonelink\n"
-                "Terminal=false\n"
-                "Type=Application\n"
-                "Categories=Utility;Communication;\n"
-                "X-GNOME-Autostart-enabled=true\n"
-            )
             with open(_AUTOSTART_FILE, "w") as f:
-                f.write(desktop)
+                f.write(_desktop_entry_text())
         else:
             try:
                 _AUTOSTART_FILE.unlink()
@@ -122,6 +186,15 @@ class Settings:
         if exists != self._data["open_on_startup"]:
             self._data["open_on_startup"] = exists
             self.save()
+        if exists:
+            try:
+                current = _AUTOSTART_FILE.read_text(encoding="utf-8")
+            except OSError:
+                current = ""
+            desired = _desktop_entry_text()
+            if current != desired:
+                _AUTOSTART_DIR.mkdir(parents=True, exist_ok=True)
+                _AUTOSTART_FILE.write_text(desired, encoding="utf-8")
 
 
 # Module-level singleton

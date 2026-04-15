@@ -1,5 +1,7 @@
 """Settings panel — split-view settings page embedded in the main window."""
 
+from datetime import datetime
+
 import gi
 
 gi.require_version("Gtk", "4.0")
@@ -12,10 +14,21 @@ from phonelink.settings import get_settings
 class SettingsPanel(Gtk.Box):
     """In-window settings panel: category list on the left, content on the right."""
 
-    def __init__(self, on_back):
+    def __init__(
+        self,
+        on_back,
+        google_status_provider=None,
+        on_google_connect=None,
+        on_google_refresh=None,
+        on_google_disconnect=None,
+    ):
         super().__init__(orientation=Gtk.Orientation.HORIZONTAL)
         self._settings = get_settings()
         self._on_back = on_back
+        self._google_status_provider = google_status_provider or (lambda: {})
+        self._on_google_connect = on_google_connect
+        self._on_google_refresh = on_google_refresh
+        self._on_google_disconnect = on_google_disconnect
         self._ignored_rows: list = []
         self._build()
 
@@ -56,6 +69,7 @@ class SettingsPanel(Gtk.Box):
 
         for icon_name, label, key in [
             ("emblem-system-symbolic", "General", "general"),
+            ("avatar-default-symbolic", "Google Contacts", "google"),
             ("display-brightness-symbolic", "Appearance", "appearance"),
             ("xsi-notifications-symbolic", "Notifications", "notifications"),
         ]:
@@ -86,6 +100,7 @@ class SettingsPanel(Gtk.Box):
         self.append(self._content_stack)
 
         self._content_stack.add_named(self._build_general_page(), "general")
+        self._content_stack.add_named(self._build_google_page(), "google")
         self._content_stack.add_named(self._build_appearance_page(), "appearance")
         self._content_stack.add_named(self._build_notifications_page(), "notifications")
 
@@ -137,6 +152,59 @@ class SettingsPanel(Gtk.Box):
 
         return page
 
+    def _build_google_page(self) -> Gtk.Widget:
+        page = Adw.PreferencesPage()
+
+        account_group = Adw.PreferencesGroup(title="Account")
+        page.add(account_group)
+
+        self._google_account_row = Adw.ActionRow(title="Google Contacts")
+
+        self._google_connect_btn = Gtk.Button(label="Connect")
+        self._google_connect_btn.add_css_class("suggested-action")
+        self._google_connect_btn.connect("clicked", self._on_google_connect_clicked)
+        self._google_account_row.add_suffix(self._google_connect_btn)
+
+        self._google_refresh_btn = Gtk.Button(label="Refresh Now")
+        self._google_refresh_btn.connect("clicked", self._on_google_refresh_clicked)
+        self._google_account_row.add_suffix(self._google_refresh_btn)
+
+        self._google_disconnect_btn = Gtk.Button(label="Disconnect")
+        self._google_disconnect_btn.add_css_class("destructive-action")
+        self._google_disconnect_btn.connect("clicked", self._on_google_disconnect_clicked)
+        self._google_account_row.add_suffix(self._google_disconnect_btn)
+
+        account_group.add(self._google_account_row)
+
+        self._google_background_row = Adw.SwitchRow(
+            title="Background Refresh",
+            subtitle="Refresh Google contacts at most once every 24 hours using the saved token.",
+        )
+        self._google_background_row.set_active(self._settings.google_background_sync)
+        self._google_background_row.connect(
+            "notify::active",
+            lambda r, _: setattr(self._settings, "google_background_sync", r.get_active()),
+        )
+        account_group.add(self._google_background_row)
+
+        info_group = Adw.PreferencesGroup(title="How It Works")
+        page.add(info_group)
+        info_group.add(
+            Adw.ActionRow(
+                title="Low-volume sync",
+                subtitle="Phone Link only runs automatic Google refresh when a saved account exists and the last attempt is older than one day.",
+            )
+        )
+        info_group.add(
+            Adw.ActionRow(
+                title="Contact photos",
+                subtitle="Google photos are cached locally for the contacts already visible in your current conversations.",
+            )
+        )
+
+        self.refresh_google_status()
+        return page
+
     def _build_notifications_page(self) -> Gtk.Widget:
         page = Adw.PreferencesPage()
 
@@ -181,6 +249,57 @@ class SettingsPanel(Gtk.Box):
             self._settings.add_ignored_app(name)
             entry_row.set_text("")
             self._rebuild_ignored_list()
+
+    def refresh_google_status(self):
+        status = self._google_status_provider() or {}
+        configured = bool(status.get("configured"))
+        connected = bool(status.get("connected"))
+        in_flight = bool(status.get("sync_in_flight"))
+        account_label = str(status.get("account_label") or "Google account")
+        last_sync_ts = float(status.get("last_sync_ts") or 0.0)
+        config_path = str(status.get("config_path") or "")
+
+        if in_flight:
+            subtitle = "Syncing Google Contacts now…"
+        elif connected:
+            subtitle = f"Connected as {account_label}."
+            if last_sync_ts > 0:
+                subtitle += f" Last synced {self._format_timestamp(last_sync_ts)}."
+        elif configured:
+            subtitle = "Not connected. Authorize Google Contacts to import names and photos."
+        else:
+            subtitle = f"Google OAuth client file not found at {config_path}."
+
+        self._google_account_row.set_subtitle(subtitle)
+        self._google_background_row.set_active(self._settings.google_background_sync)
+        self._google_connect_btn.set_visible(not connected)
+        self._google_refresh_btn.set_visible(connected)
+        self._google_disconnect_btn.set_visible(connected)
+        self._google_connect_btn.set_sensitive(not in_flight)
+        self._google_refresh_btn.set_sensitive(not in_flight)
+        self._google_disconnect_btn.set_sensitive(not in_flight)
+
+    def _format_timestamp(self, timestamp: float) -> str:
+        dt = datetime.fromtimestamp(timestamp)
+        now = datetime.now()
+        if dt.date() == now.date():
+            return dt.strftime("today at %I:%M %p").replace(" 0", " ")
+        return dt.strftime("%b %d at %I:%M %p").replace(" 0", " ")
+
+    def _on_google_connect_clicked(self, _btn):
+        if self._on_google_connect is not None:
+            self._on_google_connect()
+            self.refresh_google_status()
+
+    def _on_google_refresh_clicked(self, _btn):
+        if self._on_google_refresh is not None:
+            self._on_google_refresh()
+            self.refresh_google_status()
+
+    def _on_google_disconnect_clicked(self, _btn):
+        if self._on_google_disconnect is not None:
+            self._on_google_disconnect()
+            self.refresh_google_status()
 
     def _rebuild_ignored_list(self):
         for r in self._ignored_rows:

@@ -34,7 +34,6 @@ class MainWindow(Adw.ApplicationWindow):
         self.set_size_request(640, 420)
 
         self.connect("close-request", self._on_close)
-        self.connect("realize", self._on_realize)
 
         # Keyboard shortcuts
         key_ctrl = Gtk.EventControllerKey()
@@ -159,15 +158,9 @@ class MainWindow(Adw.ApplicationWindow):
 
         outer.append(header)
 
-        # ── Tab switcher bar (below header for full width) ──────────
-        switcher_bar = Gtk.Box(orientation=Gtk.Orientation.HORIZONTAL)
-        switcher_bar.set_halign(Gtk.Align.CENTER)
-        switcher_bar.set_margin_top(4)
-        switcher_bar.set_margin_bottom(4)
-        switcher = Adw.ViewSwitcher()
-        switcher.set_stack(self.stack)
-        switcher.set_policy(Adw.ViewSwitcherPolicy.WIDE)
-        switcher_bar.append(switcher)
+        switcher_bar = Adw.ViewSwitcherBar()
+        switcher_bar.set_stack(self.stack)
+        switcher_bar.set_reveal(True)
         outer.append(switcher_bar)
 
         # ── Main tab content ────────────────────────────────────────
@@ -226,7 +219,17 @@ class MainWindow(Adw.ApplicationWindow):
         self._body_stack.set_transition_type(Gtk.StackTransitionType.CROSSFADE)
         self._body_stack.add_named(self._split_view, "main")
 
-        self._settings_panel = SettingsPanel(on_back=self._show_main)
+        self._settings_panel = SettingsPanel(
+            on_back=self._show_main,
+            google_status_provider=self.sms_panel.get_google_status,
+            on_google_connect=self.sms_panel.connect_google_contacts,
+            on_google_refresh=self.sms_panel.refresh_google_contacts,
+            on_google_disconnect=self.sms_panel.disconnect_google_contacts,
+        )
+        self.sms_panel.connect(
+            "google-status-changed",
+            lambda *_args: self._settings_panel.refresh_google_status(),
+        )
         self._body_stack.add_named(self._settings_panel, "settings")
 
         self._toast_overlay = Adw.ToastOverlay()
@@ -242,6 +245,7 @@ class MainWindow(Adw.ApplicationWindow):
         self._notif_toggle.set_active(split_view.get_show_sidebar())
 
     def _on_open_settings(self, _btn):
+        self._settings_panel.refresh_google_status()
         self._body_stack.set_visible_child_name("settings")
 
     def _show_main(self):
@@ -525,39 +529,3 @@ class MainWindow(Adw.ApplicationWindow):
         # Otherwise, hide to system tray instead of quitting
         self.set_visible(False)
         return True  # True = prevent the close / destroy
-
-    def _on_realize(self, _widget):
-        """Set skip-taskbar hint so the window only appears in the system tray."""
-        GLib.timeout_add(500, self._set_skip_taskbar)
-
-    def _set_skip_taskbar(self):
-        # Skip on Wayland — the X11 hint doesn't apply and Xlib isn't available
-        import os
-        session_type = os.environ.get("XDG_SESSION_TYPE", "").lower()
-        if session_type == "wayland":
-            return GLib.SOURCE_REMOVE
-        try:
-            from Xlib import display, Xatom
-
-            surface = self.get_surface()
-            xid = surface.get_xid() if hasattr(surface, "get_xid") else None
-            if xid is None:
-                return GLib.SOURCE_REMOVE
-
-            d = display.Display()
-            NET_WM_STATE = d.intern_atom('_NET_WM_STATE')
-            SKIP_TASKBAR = d.intern_atom('_NET_WM_STATE_SKIP_TASKBAR')
-            SKIP_PAGER = d.intern_atom('_NET_WM_STATE_SKIP_PAGER')
-
-            wid = d.create_resource_object('window', xid)
-            wid.change_property(
-                NET_WM_STATE, Xatom.ATOM, 32,
-                [SKIP_TASKBAR, SKIP_PAGER],
-            )
-            d.flush()
-            d.close()
-        except ImportError:
-            pass  # Xlib not installed (e.g. pure Wayland system)
-        except Exception:
-            pass
-        return GLib.SOURCE_REMOVE

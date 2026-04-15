@@ -10,7 +10,7 @@ A desktop app that brings your Android phone's messages, notifications, and file
 ## Features
 
 - **SMS Conversations** — View all your text message conversations and send/receive SMS from your desktop
-- **Contact Names** — Automatically learns contact names from incoming notifications, with manual import from VCF or CSV files
+- **Contact Names** — Automatically learns names from notifications and calls, with full import from Google Contacts, VCF, or CSV
 - **Notifications** — Live phone notifications in a collapsible sidebar tray; click any row to expand and see the full body; dismiss or reply right from the desktop
 - **File Browser** — Browse your phone's entire file system over SFTP; navigate folders and open files
 - **Photo Grid** — View your most recent camera roll photos as square thumbnails; click to select, right-click to copy or save, double-click to open; supports Ctrl+C
@@ -44,7 +44,7 @@ A desktop app that brings your Android phone's messages, notifications, and file
 
 ## Installation
 
-This app has **no Python package dependencies** — everything is installed via your system package manager. Follow these steps in order.
+The core app runs with system packages only. Google Contacts import is optional and needs a few extra Python packages plus a Google OAuth desktop client configuration.
 
 ---
 
@@ -173,7 +173,65 @@ cd phonelink
 python3 run.py
 ```
 
-No `pip install`, no virtual environment, no build step. All dependencies are the system packages installed in Step 1.
+No `pip install`, no virtual environment, no build step is required for the core app. All core dependencies are the system packages installed in Step 1.
+
+### Optional — Enable native Google Contacts import
+
+If you want the in-app **Import Google Contacts** button to work, install the Google API packages.
+
+On Debian / Ubuntu / Linux Mint, prefer distro packages because the system Python is externally managed:
+
+```bash
+sudo apt install python3-googleapi python3-google-auth python3-google-auth-oauthlib python3-google-auth-httplib2
+```
+
+If you prefer a virtual environment, create one that can still see the system GTK bindings:
+
+```bash
+python3 -m venv --system-site-packages .venv
+. .venv/bin/activate
+pip install google-auth-oauthlib google-api-python-client google-auth-httplib2
+```
+
+Then run the app from that virtualenv:
+
+```bash
+.venv/bin/python run.py
+```
+
+If you are not on Debian-based Linux, you can use pip directly in a virtualenv, or install equivalent distro packages if your distro provides them.
+
+```bash
+python3 -m pip install google-auth-oauthlib google-api-python-client google-auth-httplib2
+```
+
+Then configure a Google OAuth desktop client for Phone Link.
+
+Option A: environment variables
+
+```bash
+export PHONELINK_GOOGLE_CLIENT_ID="your-google-oauth-client-id"
+export PHONELINK_GOOGLE_CLIENT_SECRET="your-google-oauth-client-secret"
+```
+
+Option B: config file at `~/.config/phonelink/google_oauth.json`
+
+```json
+{
+  "installed": {
+    "client_id": "your-google-oauth-client-id",
+    "client_secret": "your-google-oauth-client-secret",
+    "auth_uri": "https://accounts.google.com/o/oauth2/auth",
+    "token_uri": "https://oauth2.googleapis.com/token",
+    "redirect_uris": [
+      "http://127.0.0.1",
+      "http://localhost"
+    ]
+  }
+}
+```
+
+Once configured, the app opens your browser for Google sign-in on the first import and reuses the saved token on later imports.
 
 If the app starts and shows a **"KDE Connect Not Found"** error, the daemon is not running. Start it:
 ```bash
@@ -261,7 +319,24 @@ In the Messages tab, click the **contacts icon** next to the search bar → **Im
 - **VCF** — exported from any Android contacts app
 - **Google Contacts CSV** — go to [contacts.google.com](https://contacts.google.com), select all, **Export → Google CSV**
 
-### Option D: Set a name manually
+### Option D: Import Google Contacts directly
+
+In the Messages tab, click the **contacts icon** next to the search bar → **Import Google Contacts**.
+
+On first use:
+
+1. Phone Link opens your browser
+2. You sign in to Google
+3. You grant read-only contacts access
+4. Phone Link imports your contacts automatically
+
+After the first authorization, later imports can reuse the saved Google token and run with one click.
+
+You can also manage the connection from **Preferences → Google Contacts**. That page shows the connected account, lets you refresh or disconnect it, and controls a low-volume background refresh that runs at most once every 24 hours.
+
+When Google contact photos are available, Phone Link caches them locally and shows them for contacts that already appear in your active conversations.
+
+### Option E: Set a name manually
 
 Right-click any conversation → **Set contact name**.
 
@@ -275,6 +350,8 @@ Right-click any conversation → **Set contact name**.
   "13165559999": "Jane Doe"
 }
 ```
+
+For Google Contacts import, OAuth tokens are stored separately at `~/.local/share/phonelink/google_token.json`.
 
 ---
 
@@ -330,7 +407,8 @@ Right-click any conversation → **Set contact name**.
 ### Contact names not showing
 
 - See [Importing Contacts](#importing-contacts)
-- The fastest first-time fix is to share all contacts from the Contacts app via KDE Connect (Option B above)
+- If KDE Connect desktop contact sync is empty, the app now warns about it and suggests a fallback import path
+- The fastest first-time fix is to use **Import Google Contacts** or share all contacts from the Contacts app via KDE Connect (Option B above)
 
 ---
 

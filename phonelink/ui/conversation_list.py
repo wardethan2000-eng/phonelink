@@ -5,7 +5,34 @@ import re
 import gi
 
 gi.require_version("Gtk", "4.0")
+gi.require_version("Adw", "1")
 from gi.repository import Gtk, GObject, Pango
+
+from phonelink.contacts import contact_photo_path
+
+
+def _build_avatar(name: str, phone: str, *, is_group: bool, group_count: int) -> Gtk.Widget:
+    if not is_group:
+        photo_path = contact_photo_path(phone)
+        if photo_path:
+            picture = Gtk.Picture.new_for_filename(photo_path)
+            picture.set_size_request(40, 40)
+            picture.set_can_shrink(True)
+            picture.set_content_fit(Gtk.ContentFit.COVER)
+            picture.add_css_class("conversation-avatar-photo")
+            return picture
+
+    avatar_label = Gtk.Label()
+    avatar_label.set_size_request(40, 40)
+    if is_group:
+        avatar_label.set_label(str(group_count))
+        avatar_label.add_css_class("conversation-avatar-group")
+    else:
+        avatar_label.set_label((name or phone or "?")[0].upper())
+    avatar_label.add_css_class("conversation-avatar")
+    avatar_label.set_halign(Gtk.Align.CENTER)
+    avatar_label.set_valign(Gtk.Align.CENTER)
+    return avatar_label
 
 
 class ConversationRow(Gtk.ListBoxRow):
@@ -22,19 +49,14 @@ class ConversationRow(Gtk.ListBoxRow):
         box.set_margin_end(12)
         self.set_child(box)
 
-        # Contact avatar placeholder (initial letter circle)
-        avatar_label = Gtk.Label()
-        avatar_label.set_size_request(40, 40)
-        if conversation.is_group:
-            initial = str(len(conversation.addresses))
-            avatar_label.add_css_class("conversation-avatar-group")
-        else:
-            initial = (conversation.display_name or conversation.address or "?")[0].upper()
-        avatar_label.set_label(initial)
-        avatar_label.add_css_class("conversation-avatar")
-        avatar_label.set_halign(Gtk.Align.CENTER)
-        avatar_label.set_valign(Gtk.Align.CENTER)
-        box.append(avatar_label)
+        box.append(
+            _build_avatar(
+                conversation.display_name,
+                conversation.address,
+                is_group=conversation.is_group,
+                group_count=len(conversation.addresses),
+            )
+        )
 
         # Text column: name + preview
         text_col = Gtk.Box(orientation=Gtk.Orientation.VERTICAL, spacing=2)
@@ -100,14 +122,7 @@ class ContactSuggestionRow(Gtk.ListBoxRow):
         box.set_margin_end(12)
         self.set_child(box)
 
-        avatar_label = Gtk.Label()
-        avatar_label.set_size_request(40, 40)
-        initial = (name or phone or "?")[0].upper()
-        avatar_label.set_label(initial)
-        avatar_label.add_css_class("conversation-avatar")
-        avatar_label.set_halign(Gtk.Align.CENTER)
-        avatar_label.set_valign(Gtk.Align.CENTER)
-        box.append(avatar_label)
+        box.append(_build_avatar(name, phone, is_group=False, group_count=1))
 
         text_col = Gtk.Box(orientation=Gtk.Orientation.VERTICAL, spacing=2)
         text_col.set_hexpand(True)
@@ -148,7 +163,7 @@ class ConversationList(Gtk.Box):
         self.set_size_request(280, -1)
         self.set_hexpand(False)
         self._conversations = []
-        self._rendered_read_states: dict[int, bool] = {}  # thread_id → is_read at last render
+        self._rendered_rows: list[tuple] = []
         self._contact_map: dict[str, str] = {}  # normalized phone → display name
         self._conversation_phones: set[str] = set()  # normalized phones with conversations
 
@@ -225,13 +240,18 @@ class ConversationList(Gtk.Box):
         """Update the conversation list, rebuilding only when the set changes."""
         sorted_convs = sorted(conversations, key=lambda c: c.sort_key, reverse=True)
 
-        # Build a set of current thread IDs for comparison
-        new_ids = [c.thread_id for c in sorted_convs]
-        old_ids = [c.thread_id for c in self._conversations]
-
-        # Detect read-state changes (snapshot comparison, not object identity)
-        new_read_states = {c.thread_id: c.is_read for c in sorted_convs}
-        read_changed = new_read_states != self._rendered_read_states
+        new_rows = [
+            (
+                c.thread_id,
+                c.display_name,
+                c.address,
+                c.last_message,
+                c.last_date,
+                c.is_read,
+                tuple(c.addresses),
+            )
+            for c in sorted_convs
+        ]
 
         self._conversations = sorted_convs
 
@@ -242,9 +262,9 @@ class ConversationList(Gtk.Box):
             if norm:
                 self._conversation_phones.add(norm)
 
-        # Rebuild if the conversation set/order/read-state changed or forced
-        if force_rebuild or new_ids != old_ids or read_changed:
-            self._rendered_read_states = new_read_states
+        # Rebuild if any visible row content changed or forced
+        if force_rebuild or new_rows != self._rendered_rows:
+            self._rendered_rows = new_rows
             self._rebuilding = True
             self._last_selected_id = None
             # Remove old rows

@@ -9,5 +9,12 @@ dependencies = [
     "PyGObject>=3.42",
 ]
 
+[project.optional-dependencies]
+google-contacts = [
+    "google-api-python-client>=2.169.0",
+    "google-auth-httplib2>=0.2.0",
+    "google-auth-oauthlib>=1.2.0",
+]
+
 [project.scripts]
 phonelink = "run:main"

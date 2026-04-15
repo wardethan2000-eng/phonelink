@@ -6,6 +6,7 @@ errors gracefully so the UI never crashes on a D-Bus timeout.
 """
 
 import gi
+import xml.etree.ElementTree as ET
 
 gi.require_version("Gio", "2.0")
 gi.require_version("GLib", "2.0")
@@ -26,6 +27,7 @@ IFACE_SHARE = "org.kde.kdeconnect.device.share"
 IFACE_CLIPBOARD = "org.kde.kdeconnect.device.clipboard"
 IFACE_CONNECTIVITY = "org.kde.kdeconnect.device.connectivity_report"
 IFACE_FINDPHONE = "org.kde.kdeconnect.device.findmyphone"
+IFACE_TELEPHONY = "org.kde.kdeconnect.device.telephony"
 IFACE_PROPS = "org.freedesktop.DBus.Properties"
 
 CALL_TIMEOUT_MS = 5000
@@ -37,6 +39,7 @@ class KDEConnectClient:
     def __init__(self):
         self.bus: Gio.DBusConnection | None = None
         self._subscriptions: list[int] = []
+        self._method_support: dict[tuple[str, str, str], bool] = {}
 
     # ── Connection ─────────────────────────────────────────────────
 
@@ -110,6 +113,39 @@ class KDEConnectClient:
 
     def _device_path(self, device_id):
         return f"{DAEMON_PATH}/devices/{device_id}"
+
+    def _supports_method(self, path: str, iface: str, method: str) -> bool:
+        cache_key = (path, iface, method)
+        if cache_key in self._method_support:
+            return self._method_support[cache_key]
+
+        result = self._call(
+            path,
+            "org.freedesktop.DBus.Introspectable",
+            "Introspect",
+            reply_type="(s)",
+        )
+        if not result:
+            self._method_support[cache_key] = False
+            return False
+
+        xml_text = result.unpack()[0]
+        supported = False
+        try:
+            root = ET.fromstring(xml_text)
+            for interface in root.findall("interface"):
+                if interface.get("name") != iface:
+                    continue
+                for method_node in interface.findall("method"):
+                    if method_node.get("name") == method:
+                        supported = True
+                        break
+                break
+        except ET.ParseError:
+            supported = False
+
+        self._method_support[cache_key] = supported
+        return supported
 
     # ── Daemon ─────────────────────────────────────────────────────
 
@@ -267,6 +303,15 @@ class KDEConnectClient:
             GLib.Variant("(xii)", (thread_id, start, end)),
         )
 
+    def request_attachment_file(self, device_id, part_id: int, unique_identifier: str):
+        """Request that the phone send an attachment file to the desktop."""
+        return self._call(
+            self._device_path(device_id),
+            IFACE_CONVERSATIONS,
+            "requestAttachmentFile",
+            GLib.Variant("(xs)", (part_id, unique_identifier)),
+        ) is not None
+
     def mark_conversation_as_read(self, device_id, thread_id: int):
         """Inform the phone that a conversation has been read."""
         self._call(
@@ -297,11 +342,20 @@ class KDEConnectClient:
         This calls the deleteConversation method if the KDE Connect
         version supports it.  Older versions will silently fail.
         """
-        self._call(
+        if not self.supports_conversation_deletion(device_id):
+            return False
+        return self._call(
             self._device_path(device_id),
             IFACE_CONVERSATIONS,
             "deleteConversation",
             GLib.Variant("(x)", (thread_id,)),
+        ) is not None
+
+    def supports_conversation_deletion(self, device_id) -> bool:
+        return self._supports_method(
+            self._device_path(device_id),
+            IFACE_CONVERSATIONS,
+            "deleteConversation",
         )
 
     def send_sms(self, device_id, addresses: list[str], message: str,

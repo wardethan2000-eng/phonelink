@@ -100,7 +100,6 @@ class PhoneLinkApp(Adw.Application):
         elif win:
             win.set_visible(True)
             win.present()
-            GLib.timeout_add(200, win._set_skip_taskbar)
         else:
             self.do_activate()
         return GLib.SOURCE_CONTINUE

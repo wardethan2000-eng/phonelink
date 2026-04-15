@@ -1,7 +1,7 @@
 [Desktop Entry]
 Name=Phone Link
 Comment=Connect your Android phone — SMS, notifications, and files
-Exec=/usr/bin/python3 /home/ethan/phonelink/run.py
+Exec=/usr/bin/python3 __PHONELINK_RUNPY__
 Icon=phonelink
 Terminal=false
 Type=Application

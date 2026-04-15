@@ -5,6 +5,7 @@ import io
 import json
 import os
 import re
+import unicodedata
 from pathlib import Path
 
 # KDE Connect stores synced vCards here
@@ -13,11 +14,73 @@ VCARD_BASE = Path.home() / ".local" / "share" / "kpeoplevcard"
 # Our own local contacts store
 CONTACTS_DIR = Path.home() / ".local" / "share" / "phonelink"
 CONTACTS_FILE = CONTACTS_DIR / "contacts.json"
+CONTACT_PHOTOS_DIR = CONTACTS_DIR / "contact_photos"
 
 
 def _normalize_phone(number: str) -> str:
     """Strip a phone number to digits only for comparison."""
     return re.sub(r"[^\d]", "", number)
+
+
+def _clean_text(text: str) -> str:
+    """Strip surrounding whitespace and invisible formatting marks."""
+    if not text:
+        return ""
+    cleaned = "".join(ch for ch in str(text) if unicodedata.category(ch) != "Cf")
+    return cleaned.strip()
+
+
+def _phone_key(number: str) -> str:
+    norm = _normalize_phone(number)
+    return norm[-10:] if len(norm) >= 10 else norm
+
+
+def _photo_suffix(content_type: str | None) -> str:
+    content = (content_type or "").split(";", 1)[0].strip().lower()
+    return {
+        "image/jpeg": ".jpg",
+        "image/jpg": ".jpg",
+        "image/png": ".png",
+        "image/webp": ".webp",
+    }.get(content, ".jpg")
+
+
+def _looks_like_phone_number(text: str) -> bool:
+    """Return True when the text is effectively just a phone number."""
+    cleaned = _clean_text(text)
+    if not cleaned:
+        return False
+    candidate = cleaned.replace("+", "").replace("-", "").replace(" ", "")
+    return candidate.isdigit()
+
+
+def _is_messaging_app(app_name: str) -> bool:
+    """Best-effort detection for SMS / messaging notification sources."""
+    app = _clean_text(app_name).casefold()
+    if not app:
+        return False
+    keywords = (
+        "message",
+        "messages",
+        "messaging",
+        "google messages",
+        "samsung messages",
+        "sms",
+        "mms",
+    )
+    return any(keyword in app for keyword in keywords)
+
+
+def _notification_message_text(props: dict) -> str:
+    """Extract the user-visible message preview from a notification."""
+    ticker = _clean_text(props.get("ticker", ""))
+    text = _clean_text(props.get("text", ""))
+
+    if ": " in ticker:
+        return ticker.split(": ", 1)[1].strip()
+    if text:
+        return text.splitlines()[0].strip()
+    return ticker
 
 
 # ── Local JSON contacts store ──────────────────────────────────────
@@ -42,6 +105,86 @@ def _save_local_contacts(contacts: dict[str, str]):
         json.dumps(contacts, indent=2, ensure_ascii=False),
         encoding="utf-8",
     )
+
+
+def store_contact_photo(address: str, image_bytes: bytes, content_type: str | None = None) -> bool:
+    norm = _normalize_phone(address)
+    if not norm or not image_bytes:
+        return False
+
+    CONTACT_PHOTOS_DIR.mkdir(parents=True, exist_ok=True)
+    target = CONTACT_PHOTOS_DIR / f"{norm}{_photo_suffix(content_type)}"
+
+    try:
+        if target.is_file() and target.read_bytes() == image_bytes:
+            return False
+    except OSError:
+        pass
+
+    for existing in CONTACT_PHOTOS_DIR.glob(f"{norm}.*"):
+        if existing != target:
+            try:
+                existing.unlink()
+            except OSError:
+                pass
+
+    try:
+        target.write_bytes(image_bytes)
+    except OSError:
+        return False
+    return True
+
+
+def delete_contact_photo(address: str) -> bool:
+    norm = _normalize_phone(address)
+    if not norm or not CONTACT_PHOTOS_DIR.is_dir():
+        return False
+
+    removed = False
+    for existing in CONTACT_PHOTOS_DIR.glob(f"{norm}.*"):
+        try:
+            existing.unlink()
+            removed = True
+        except OSError:
+            continue
+    return removed
+
+
+def contact_photo_path(address: str) -> str | None:
+    norm = _normalize_phone(address)
+    if not norm or not CONTACT_PHOTOS_DIR.is_dir():
+        return None
+
+    for existing in CONTACT_PHOTOS_DIR.glob(f"{norm}.*"):
+        if existing.is_file():
+            return str(existing)
+
+    key = _phone_key(norm)
+    if not key:
+        return None
+
+    for existing in CONTACT_PHOTOS_DIR.iterdir():
+        if existing.is_file() and _phone_key(existing.stem) == key:
+            return str(existing)
+    return None
+
+
+def merge_contacts(contact_names: dict[str, str]) -> int:
+    """Merge a batch of contact mappings into the local store."""
+    contacts = _load_local_contacts()
+    changed = 0
+    for address, name in contact_names.items():
+        norm = _normalize_phone(address)
+        cleaned_name = _clean_text(name)
+        if not norm or not cleaned_name:
+            continue
+        if contacts.get(norm) == cleaned_name:
+            continue
+        contacts[norm] = cleaned_name
+        changed += 1
+    if changed:
+        _save_local_contacts(contacts)
+    return changed
 
 
 def save_contact(address: str, name: str):
@@ -199,6 +342,17 @@ def load_contact_map(device_id: str) -> dict[str, str]:
     return contact_map
 
 
+def synced_vcard_count(device_id: str) -> int:
+    """Return the number of KDE Connect vCards currently cached for a device."""
+    vcard_dir = VCARD_BASE / f"kdeconnect-{device_id}"
+    if not vcard_dir.is_dir():
+        return 0
+    return sum(
+        1 for entry in vcard_dir.iterdir()
+        if entry.is_file() and entry.suffix.lower() == ".vcf"
+    )
+
+
 def resolve_name(contact_map: dict[str, str], address: str) -> str:
     """Look up a display name for a phone number.
 
@@ -249,17 +403,15 @@ def harvest_contacts_from_notifications(client, device_id: str,
     for nid in notif_ids:
         try:
             props = client.get_notification_properties(device_id, nid)
-            app = props.get("appName", "")
-            title = props.get("title", "").strip()
-            ticker = props.get("ticker", "")
+            app = _clean_text(props.get("appName", ""))
+            title = _clean_text(props.get("title", ""))
 
-            if app != "Messages" or not title:
+            if not _is_messaging_app(app) or not title:
                 continue
-            # Skip if title looks like a raw phone number
-            if title.replace("+", "").replace("-", "").replace(" ", "").isdigit():
+            if title == "(No title)" or _looks_like_phone_number(title):
                 continue
 
-            msg_text = ticker.split(": ", 1)[1].strip() if ": " in ticker else ""
+            msg_text = _notification_message_text(props)
             if not msg_text:
                 continue
 
@@ -294,16 +446,15 @@ def harvest_contact_from_notification_signal(
     """
     try:
         props = client.get_notification_properties(device_id, notif_id)
-        app = props.get("appName", "")
-        title = props.get("title", "").strip()
-        ticker = props.get("ticker", "")
+        app = _clean_text(props.get("appName", ""))
+        title = _clean_text(props.get("title", ""))
 
-        if app != "Messages" or not title:
+        if not _is_messaging_app(app) or not title:
             return None
-        if title.replace("+", "").replace("-", "").replace(" ", "").isdigit():
+        if title == "(No title)" or _looks_like_phone_number(title):
             return None
 
-        msg_text = ticker.split(": ", 1)[1].strip() if ": " in ticker else ""
+        msg_text = _notification_message_text(props)
         if not msg_text:
             return None
 
@@ -325,3 +476,23 @@ def harvest_contact_from_notification_signal(
     except Exception:
         pass
     return None
+
+
+def harvest_contact_from_telephony_signal(
+    address: str, contact_name: str,
+) -> tuple[str, str] | None:
+    """Persist a contact learned from a telephony event.
+
+    KDE Connect exposes contact names for incoming and missed calls even when
+    the desktop contact cache is unavailable.
+    """
+    norm = _normalize_phone(address)
+    name = _clean_text(contact_name)
+    if not norm or not name:
+        return None
+    if _looks_like_phone_number(name):
+        return None
+    if name.casefold() in {"unknown number", "unknown", "private number"}:
+        return None
+    save_contact(address, name)
+    return (norm, name)

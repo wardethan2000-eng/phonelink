@@ -40,6 +40,13 @@ levelbar trough block {
     font-size: 16px;
 }
 
+.conversation-avatar-photo {
+    border-radius: 50%;
+    min-width: 40px;
+    min-height: 40px;
+    background-color: alpha(@accent_bg_color, 0.12);
+}
+
 .conversation-avatar-group {
     background-color: alpha(@accent_bg_color, 0.7);
     font-size: 14px;
@@ -65,17 +72,17 @@ levelbar trough block {
     background-color: @accent_bg_color;
     color: @accent_fg_color;
     border-radius: 16px 16px 4px 16px;
-    padding: 8px 14px;
+    padding: 6px 12px;
 }
 
 .message-bubble-received {
     background-color: alpha(@view_fg_color, 0.08);
     border-radius: 16px 16px 16px 4px;
-    padding: 8px 14px;
+    padding: 6px 12px;
 }
 
 .date-separator {
-    padding: 4px 12px;
+    padding: 3px 10px;
     border-radius: 12px;
     background-color: alpha(@view_fg_color, 0.05);
     font-size: 11px;
@@ -83,6 +90,38 @@ levelbar trough block {
 
 .thread-header {
     min-height: 40px;
+}
+
+.message-attachment-image {
+    border-radius: 12px;
+    background-color: alpha(@view_fg_color, 0.08);
+    margin-top: 3px;
+}
+
+.message-attachment-row {
+    margin-top: 2px;
+}
+
+.message-timestamp {
+    margin-top: 0;
+}
+
+.message-bubble-timestamp-visible {
+    margin-top: 0;
+}
+
+.compose-image-preview-card {
+    padding: 12px;
+    border-radius: 16px;
+    background-color: alpha(@accent_bg_color, 0.10);
+    border: 1px solid alpha(@accent_bg_color, 0.18);
+}
+
+.compose-image-preview {
+    border-radius: 16px;
+    background-color: alpha(@view_fg_color, 0.08);
+    min-width: 240px;
+    min-height: 240px;
 }
 
 /* ── Notification list ─────────────────────────────────────── */

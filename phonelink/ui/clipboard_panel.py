@@ -22,6 +22,9 @@ class ClipboardPanel(Gtk.Box):
         self._device = None
         self._signal_ids: list[int] = []
         self._history: list[dict] = []  # {text, source, timestamp}
+        self._poll_source: int | None = None
+        self._poll_pending = False
+        self._last_clipboard_text = ""
 
         # ── Outer stack: status vs content ─────────────────────────
         self._outer_stack = Gtk.Stack()
@@ -66,9 +69,9 @@ class ClipboardPanel(Gtk.Box):
         pull_btn.add_css_class("flat")
         pull_row = Gtk.Box(orientation=Gtk.Orientation.HORIZONTAL, spacing=6)
         pull_row.append(Gtk.Image.new_from_icon_name("go-down-symbolic"))
-        pull_row.append(Gtk.Label(label="Get from Phone"))
+        pull_row.append(Gtk.Label(label="Read Synced Clipboard"))
         pull_btn.set_child(pull_row)
-        pull_btn.set_tooltip_text("Fetch the phone's current clipboard content")
+        pull_btn.set_tooltip_text("Read the current desktop clipboard text, including content synced in from your phone")
         pull_btn.connect("clicked", self._on_pull_clipboard)
         toolbar.append(pull_btn)
 
@@ -112,15 +115,17 @@ class ClipboardPanel(Gtk.Box):
 
     def set_device(self, device):
         self._unsubscribe()
+        self._stop_polling()
         self._device = device
         if not device or not device.reachable:
             self._outer_stack.set_visible_child_name("status")
             return
         self._outer_stack.set_visible_child_name("content")
         self._subscribe(device.id)
+        self._start_polling()
 
     def _subscribe(self, device_id):
-        path = f"/modules/kdeconnect/devices/{device_id}"
+        path = f"/modules/kdeconnect/devices/{device_id}/clipboard"
         sid = self.client.subscribe_signal(
             path, IFACE_CLIPBOARD, "clipboardChanged",
             self._on_clipboard_changed,
@@ -134,12 +139,45 @@ class ClipboardPanel(Gtk.Box):
                 self.client.bus.signal_unsubscribe(sid)
         self._signal_ids.clear()
 
+    def _start_polling(self):
+        self._read_local_clipboard("synced")
+        self._poll_source = GLib.timeout_add_seconds(2, self._poll_local_clipboard)
+
+    def _stop_polling(self):
+        if self._poll_source is not None:
+            GLib.source_remove(self._poll_source)
+            self._poll_source = None
+        self._poll_pending = False
+
+    def _poll_local_clipboard(self):
+        self._read_local_clipboard("synced")
+        return GLib.SOURCE_CONTINUE
+
+    def _read_local_clipboard(self, source: str):
+        if self._poll_pending:
+            return
+        display = Gdk.Display.get_default()
+        if display is None:
+            return
+        self._poll_pending = True
+        clipboard = display.get_clipboard()
+        clipboard.read_text_async(None, self._on_polled_text_read, source)
+
+    def _on_polled_text_read(self, clipboard, result, source):
+        self._poll_pending = False
+        try:
+            text = clipboard.read_text_finish(result)
+        except GLib.Error:
+            return
+        if not text or text == self._last_clipboard_text:
+            return
+        self._last_clipboard_text = text
+        self._add_entry(text, source)
+
     # ── Signal handlers ────────────────────────────────────────────
 
     def _on_clipboard_changed(self, conn, sender, path, iface, signal, params):
-        text = params.unpack()[0]
-        if text:
-            GLib.idle_add(self._add_entry, text, "phone")
+        GLib.idle_add(self._read_local_clipboard, "phone")
 
     # ── Actions ────────────────────────────────────────────────────
 
@@ -156,17 +194,14 @@ class ClipboardPanel(Gtk.Box):
             return
         if not text or not self._device:
             return
+        self._last_clipboard_text = text
         self.client.send_clipboard(self._device.id, text)
         self._add_entry(text, "pc")
 
     def _on_pull_clipboard(self, _btn):
         if not self._device or not self._device.reachable:
             return
-        text = self.client.get_clipboard_content(self._device.id)
-        if text:
-            clipboard = Gdk.Display.get_default().get_clipboard()
-            clipboard.set(text)
-            self._add_entry(text, "phone")
+        self._read_local_clipboard("synced")
 
     def _on_clear_history(self, _btn):
         self._history.clear()
@@ -211,7 +246,8 @@ class ClipboardPanel(Gtk.Box):
         # Source icon
         icon_name = (
             "phone-symbolic" if entry["source"] == "phone"
-            else "computer-symbolic"
+            else "computer-symbolic" if entry["source"] == "pc"
+            else "edit-paste-symbolic"
         )
         icon = Gtk.Image.new_from_icon_name(icon_name)
         icon.set_pixel_size(16)
@@ -255,4 +291,5 @@ class ClipboardPanel(Gtk.Box):
 
     def _on_copy_entry(self, _btn, text):
         clipboard = Gdk.Display.get_default().get_clipboard()
+        self._last_clipboard_text = text
         clipboard.set(text)
