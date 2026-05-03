@@ -12,8 +12,12 @@ import sys
 
 import gi
 gi.require_version("Gtk", "3.0")
-gi.require_version("XApp", "1.0")
-from gi.repository import Gtk, GLib, XApp
+try:
+    gi.require_version("XApp", "1.0")
+    from gi.repository import XApp
+except (ValueError, ImportError):
+    XApp = None
+from gi.repository import Gtk, GLib
 
 
 def main():
@@ -23,6 +27,10 @@ def main():
 
     icon_path = sys.argv[1]
     parent_pid = int(sys.argv[2])
+
+    if XApp is None:
+        print("[phonelink] XApp not available — tray icon disabled. Install gir1.2-xapp-1.0")
+        sys.exit(0)
 
     # Exit if the parent process dies
     def check_parent():
@@ -36,7 +44,7 @@ def main():
     GLib.timeout_add_seconds(2, check_parent)
 
     icon = XApp.StatusIcon()
-    icon.set_icon_name(icon_path)
+    icon.set_icon_name("phonelink")
     icon.set_tooltip_text("Phone Link")
     icon.set_name("Phone Link")
 

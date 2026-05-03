@@ -24,7 +24,9 @@ sudo apt-get install -y \
     python3-gi \
     python3-gi-cairo \
     gir1.2-gtk-4.0 \
-    gir1.2-adw-1
+    gir1.2-adw-1 \
+    gir1.2-xapp-1.0 \
+    hicolor-icon-theme
 
 # ── 2. Verify KDE Connect daemon ─────────────────────────────────────
 if ! command -v kdeconnect-cli >/dev/null 2>&1; then

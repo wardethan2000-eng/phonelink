@@ -855,17 +855,26 @@ class FilesPanel(Gtk.Box):
             status_label.set_label(f"Cannot open: {e.message}")
 
     def _copy_paths(self, paths: list[str], status_label: Gtk.Label):
-        """Copy image data (single) or file URIs (multiple) to clipboard."""
         clipboard = self.get_clipboard()
         if len(paths) == 1 and _is_image(paths[0]):
             try:
-                pixbuf = GdkPixbuf.Pixbuf.new_from_file(paths[0])
-                clipboard.set_texture(Gdk.Texture.new_for_pixbuf(pixbuf))
+                import mimetypes
+                mime_type, _ = mimetypes.guess_type(paths[0])
+                if not mime_type or not mime_type.startswith("image/"):
+                    mime_type = "image/png"
+
+                with open(paths[0], "rb") as f:
+                    image_bytes = f.read()
+
+                content = Gdk.ContentProvider.new_for_bytes(
+                    mime_type, GLib.Bytes(image_bytes)
+                )
+                clipboard.set_content(content)
                 status_label.set_label(f"Copied {os.path.basename(paths[0])} to clipboard")
                 return
-            except GLib.Error:
+            except (OSError, GLib.Error):
                 pass
-        # Fall back to URI list (works for files, videos, etc.)
+        # Fall back to URI list
         content = Gdk.ContentProvider.new_for_value(
             GLib.Variant("as", [f"file://{p}" for p in paths])
         )

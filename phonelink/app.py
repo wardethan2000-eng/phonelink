@@ -21,7 +21,6 @@ class PhoneLinkApp(Adw.Application):
     def __init__(self):
         super().__init__(
             application_id="dev.phonelink.app",
-            flags=Gio.ApplicationFlags.NON_UNIQUE,
         )
         self.client = KDEConnectClient()
         self._tray_proc = None
@@ -37,6 +36,8 @@ class PhoneLinkApp(Adw.Application):
         win = self.props.active_window
         if not win:
             win = MainWindow(application=self, client=self.client)
+        elif not win.get_visible():
+            win.set_visible(True)
         win.present()
 
     def _load_css(self):
@@ -54,15 +55,18 @@ class PhoneLinkApp(Adw.Application):
             )
 
     def _set_icon(self):
-        icon_path = os.path.join(
-            os.path.dirname(os.path.dirname(__file__)), "data", "icons", "phonelink.svg"
+        icon_dir = os.path.join(
+            os.path.dirname(os.path.dirname(__file__)), "data", "icons"
         )
-        if os.path.exists(icon_path):
-            Gtk.Window.set_default_icon_name("phonelink")
-            # Add the icon directory to the theme search path
-            icon_theme = Gtk.IconTheme.get_for_display(Gdk.Display.get_default())
-            icon_dir = os.path.dirname(icon_path)
-            icon_theme.add_search_path(icon_dir)
+        icon_svg = os.path.join(icon_dir, "phonelink.svg")
+        if not os.path.exists(icon_svg):
+            return
+        display = Gdk.Display.get_default()
+        if display is None:
+            return
+        icon_theme = Gtk.IconTheme.get_for_display(display)
+        icon_theme.add_search_path(icon_dir)
+        Gtk.Window.set_default_icon_name("phonelink")
 
     def _setup_tray_icon(self):
         """Launch the tray icon as a separate subprocess (avoids GTK3/GTK4 conflict)."""

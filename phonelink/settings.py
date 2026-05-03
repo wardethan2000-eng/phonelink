@@ -37,6 +37,7 @@ def _desktop_entry_text() -> str:
         "Terminal=false\n"
         "Type=Application\n"
         "Categories=Utility;Communication;\n"
+        "StartupWMClass=dev.phonelink.app\n"
         "X-GNOME-Autostart-enabled=true\n"
     )
 

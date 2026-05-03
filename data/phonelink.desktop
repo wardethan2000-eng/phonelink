@@ -7,4 +7,4 @@ Terminal=false
 Type=Application
 Categories=Utility;Communication;
 Keywords=phone;sms;notifications;kdeconnect;android;
-StartupWMClass=com.github.phonelink
+StartupWMClass=dev.phonelink.app

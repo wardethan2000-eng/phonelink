@@ -9,14 +9,19 @@ def main():
 
         gi.require_version("Gtk", "4.0")
         gi.require_version("Adw", "1")
-    except ValueError as e:
+    except (ValueError, ImportError) as e:
         print(f"Missing dependency: {e}")
         print(
             "Install with: sudo apt install python3-gi gir1.2-gtk-4.0 gir1.2-adw-1"
         )
         sys.exit(1)
 
-    from phonelink.app import PhoneLinkApp
+    try:
+        from phonelink.app import PhoneLinkApp
+    except ImportError as e:
+        print(f"Failed to import Phone Link: {e}")
+        print("Run install.sh first to set up all dependencies.")
+        sys.exit(1)
 
     app = PhoneLinkApp()
     return app.run(sys.argv)
