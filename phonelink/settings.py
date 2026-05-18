@@ -1,18 +1,19 @@
 """App settings — persisted to ~/.local/share/phonelink/settings.json."""
 
 import json
-import os
-import shutil
 from pathlib import Path
+
+APPLICATION_ID = "dev.phonelink.app"
+DESKTOP_FILENAME = f"{APPLICATION_ID}.desktop"
 
 _DATA_DIR = Path.home() / ".local" / "share" / "phonelink"
 _SETTINGS_FILE = _DATA_DIR / "settings.json"
 
 _AUTOSTART_DIR = Path.home() / ".config" / "autostart"
-_AUTOSTART_FILE = _AUTOSTART_DIR / "phonelink.desktop"
+_AUTOSTART_FILE = _AUTOSTART_DIR / DESKTOP_FILENAME
+_LEGACY_AUTOSTART_FILE = _AUTOSTART_DIR / "phonelink.desktop"
 
-# Detect the run.py absolute path (stored once at import time)
-_RUN_PY = str(Path(__file__).parent.parent / "run.py")
+_RUN_PY = str((Path(__file__).resolve().parent.parent / "run.py").resolve())
 
 _DEFAULTS = {
     "color_scheme": "system",   # "system" | "light" | "dark"
@@ -27,17 +28,28 @@ _DEFAULTS = {
 }
 
 
+def _quote_desktop_exec_arg(value: str) -> str:
+    """Quote one desktop Exec argument according to the desktop-entry parser."""
+    escaped = value.replace("\\", "\\\\").replace('"', '\\"')
+    return f'"{escaped}"'
+
+
+def _desktop_exec() -> str:
+    return f"/usr/bin/python3 {_quote_desktop_exec_arg(_RUN_PY)}"
+
+
 def _desktop_entry_text() -> str:
     return (
         "[Desktop Entry]\n"
         "Name=Phone Link\n"
-        "Comment=Connect your Android phone — SMS, notifications, and files\n"
-        f"Exec=/usr/bin/python3 {_RUN_PY}\n"
+        "Comment=Connect your Android phone - SMS, notifications, and files\n"
+        f"Exec={_desktop_exec()}\n"
         "Icon=phonelink\n"
         "Terminal=false\n"
         "Type=Application\n"
         "Categories=Utility;Communication;\n"
-        "StartupWMClass=dev.phonelink.app\n"
+        "Keywords=phone;sms;notifications;kdeconnect;android;\n"
+        f"StartupWMClass={APPLICATION_ID}\n"
         "X-GNOME-Autostart-enabled=true\n"
     )
 
@@ -224,15 +236,20 @@ class Settings:
             _AUTOSTART_DIR.mkdir(parents=True, exist_ok=True)
             with open(_AUTOSTART_FILE, "w") as f:
                 f.write(_desktop_entry_text())
-        else:
             try:
-                _AUTOSTART_FILE.unlink()
+                _LEGACY_AUTOSTART_FILE.unlink()
             except FileNotFoundError:
                 pass
+        else:
+            for path in (_AUTOSTART_FILE, _LEGACY_AUTOSTART_FILE):
+                try:
+                    path.unlink()
+                except FileNotFoundError:
+                    pass
 
     def sync_autostart_state(self):
         """Sync the in-memory state with whether the autostart file exists."""
-        exists = _AUTOSTART_FILE.exists()
+        exists = _AUTOSTART_FILE.exists() or _LEGACY_AUTOSTART_FILE.exists()
         if exists != self._data["open_on_startup"]:
             self._data["open_on_startup"] = exists
             self.save()
@@ -245,6 +262,11 @@ class Settings:
             if current != desired:
                 _AUTOSTART_DIR.mkdir(parents=True, exist_ok=True)
                 _AUTOSTART_FILE.write_text(desired, encoding="utf-8")
+            if _LEGACY_AUTOSTART_FILE.exists():
+                try:
+                    _LEGACY_AUTOSTART_FILE.unlink()
+                except FileNotFoundError:
+                    pass
 
 
 # Module-level singleton

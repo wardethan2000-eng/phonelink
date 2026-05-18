@@ -1,9 +1,8 @@
 """Contact name resolution — local JSON store + KDE Connect vCard cache + CSV import."""
 
 import csv
-import io
 import json
-import os
+import quopri
 import re
 import unicodedata
 from pathlib import Path
@@ -241,24 +240,63 @@ def import_google_csv(csv_path: str) -> int:
 
 # ── vCard parsing (KDE Connect sync + VCF import) ─────────────────
 
-def _parse_vcard_name(path: Path) -> tuple[str, list[str]]:
-    """Extract display name and phone numbers from a vCard file."""
-    name = ""
-    phones = []
-    try:
-        text = path.read_text(encoding="utf-8", errors="replace")
-        for line in text.splitlines():
-            upper = line.upper()
-            if upper.startswith("FN:") or upper.startswith("FN;"):
-                name = line.split(":", 1)[1].strip()
-            elif upper.startswith("TEL") and ":" in line:
-                raw = line.split(":", 1)[1].strip()
-                norm = _normalize_phone(raw)
-                if norm:
-                    phones.append(norm)
-    except OSError:
-        pass
-    return name, phones
+def _unfold_vcard_lines(text: str) -> list[str]:
+    lines = text.replace("\r\n", "\n").replace("\r", "\n").split("\n")
+    unfolded: list[str] = []
+    for line in lines:
+        if line.startswith((" ", "\t")) and unfolded:
+            unfolded[-1] += line[1:]
+        else:
+            unfolded.append(line)
+    return unfolded
+
+
+def _parse_vcard_property(header: str) -> tuple[str, dict[str, list[str]]]:
+    parts = header.split(";")
+    prop_name = parts[0].strip().upper()
+    params: dict[str, list[str]] = {}
+    for raw_param in parts[1:]:
+        if not raw_param:
+            continue
+        if "=" not in raw_param:
+            params.setdefault("TYPE", []).append(raw_param.strip())
+            continue
+        key, value = raw_param.split("=", 1)
+        params[key.strip().upper()] = [
+            item.strip().strip('"') for item in value.split(",") if item.strip()
+        ]
+    return prop_name, params
+
+
+def _vcard_param_contains(params: dict[str, list[str]], key: str, value: str) -> bool:
+    expected = value.casefold()
+    return any(item.casefold() == expected for item in params.get(key.upper(), []))
+
+
+def _decode_vcard_value(value: str, params: dict[str, list[str]]) -> str:
+    if _vcard_param_contains(params, "ENCODING", "QUOTED-PRINTABLE"):
+        charset = (params.get("CHARSET") or ["utf-8"])[0] or "utf-8"
+        try:
+            value = quopri.decodestring(value).decode(charset, errors="replace")
+        except LookupError:
+            value = quopri.decodestring(value).decode("utf-8", errors="replace")
+
+    return (
+        value
+        .replace("\\n", "\n")
+        .replace("\\N", "\n")
+        .replace("\\,", ",")
+        .replace("\\;", ";")
+        .replace("\\\\", "\\")
+        .strip()
+    )
+
+
+def _name_from_structured_n(value: str) -> str:
+    parts = (value.split(";") + ["", "", "", "", ""])[:5]
+    family, given, additional, prefix, suffix = parts
+    ordered = [prefix, given, additional, family, suffix]
+    return " ".join(part.strip() for part in ordered if part.strip())
 
 
 def _parse_vcf_text(text: str) -> list[tuple[str, list[str]]]:
@@ -268,27 +306,56 @@ def _parse_vcf_text(text: str) -> list[tuple[str, list[str]]]:
     """
     results = []
     name = ""
-    phones = []
+    structured_name = ""
+    phones: list[str] = []
+    in_card = False
 
-    for line in text.splitlines():
+    for line in _unfold_vcard_lines(text):
+        if not line:
+            continue
         upper = line.upper().strip()
         if upper == "BEGIN:VCARD":
             name = ""
+            structured_name = ""
             phones = []
-        elif upper == "END:VCARD":
-            if name and phones:
-                results.append((name, phones))
+            in_card = True
+            continue
+        if upper == "END:VCARD":
+            display_name = name or _name_from_structured_n(structured_name)
+            if display_name and phones:
+                results.append((display_name, phones))
             name = ""
+            structured_name = ""
             phones = []
-        elif upper.startswith("FN:") or upper.startswith("FN;"):
-            name = line.split(":", 1)[1].strip()
-        elif upper.startswith("TEL") and ":" in line:
-            raw = line.split(":", 1)[1].strip()
-            norm = _normalize_phone(raw)
+            in_card = False
+            continue
+        if not in_card or ":" not in line:
+            continue
+
+        header, raw_value = line.split(":", 1)
+        prop_name, params = _parse_vcard_property(header)
+        value = _decode_vcard_value(raw_value, params)
+
+        if prop_name == "FN":
+            name = value
+        elif prop_name == "N" and not structured_name:
+            structured_name = value
+        elif prop_name == "TEL":
+            norm = _normalize_phone(value)
             if norm:
                 phones.append(norm)
 
     return results
+
+
+def _parse_vcard_name(path: Path) -> tuple[str, list[str]]:
+    """Extract display name and phone numbers from a vCard file."""
+    try:
+        text = path.read_text(encoding="utf-8", errors="replace")
+    except OSError:
+        return "", []
+    entries = _parse_vcf_text(text)
+    return entries[0] if entries else ("", [])
 
 
 def import_vcf_file(vcf_path: str) -> int:

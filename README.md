@@ -170,10 +170,11 @@ After pairing, open the paired device in the KDE Connect Android app, go to its 
 ```bash
 git clone https://github.com/wardethan2000-eng/phonelink.git
 cd phonelink
-python3 run.py
+./install.sh
+phonelink
 ```
 
-No `pip install`, no virtual environment, no build step is required for the core app. All core dependencies are the system packages installed in Step 1.
+The installer creates a local launcher, installs the desktop entry/icons, and refreshes desktop caches so Phone Link can appear in application search. You can still run a development checkout directly with `python3 run.py`.
 
 ### Optional — Enable native Google Contacts import
 

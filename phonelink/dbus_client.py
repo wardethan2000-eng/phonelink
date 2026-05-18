@@ -31,6 +31,14 @@ IFACE_TELEPHONY = "org.kde.kdeconnect.device.telephony"
 IFACE_PROPS = "org.freedesktop.DBus.Properties"
 
 CALL_TIMEOUT_MS = 5000
+MOUNT_TIMEOUT_MS = 30000
+
+
+def file_uri_for_path(path: str) -> str:
+    """Return a correctly escaped file URI for a local path."""
+    if path.startswith("file://"):
+        return path
+    return Gio.File.new_for_path(path).get_uri()
 
 
 class KDEConnectClient:
@@ -74,7 +82,10 @@ class KDEConnectClient:
 
     # ── Low-level helpers ──────────────────────────────────────────
 
-    def _call(self, path, iface, method, args=None, reply_type=None):
+    def _call(
+        self, path, iface, method, args=None, reply_type=None,
+        timeout_ms=CALL_TIMEOUT_MS,
+    ):
         """Synchronous D-Bus method call.  Returns GLib.Variant or None."""
         if not self.bus:
             return None
@@ -92,7 +103,7 @@ class KDEConnectClient:
                 args,
                 rtype,
                 Gio.DBusCallFlags.NONE,
-                CALL_TIMEOUT_MS,
+                timeout_ms,
                 None,
             )
         except GLib.Error as exc:
@@ -256,8 +267,12 @@ class KDEConnectClient:
             self._device_path(device_id) + "/share",
             IFACE_SHARE,
             "shareUrl",
-            GLib.Variant("(s)", (f"file://{path}",)),
+            GLib.Variant("(s)", (file_uri_for_path(path),)),
         )
+
+    def share_files(self, device_id, paths: list[str]):
+        """Send multiple local files to the device."""
+        self.share_urls(device_id, [file_uri_for_path(path) for path in paths])
 
     # ── SMS / Conversations ────────────────────────────────────────
 
@@ -401,6 +416,17 @@ class KDEConnectClient:
             IFACE_SFTP,
             "mountAndWait",
             reply_type="(b)",
+            timeout_ms=MOUNT_TIMEOUT_MS,
+        )
+        return result.unpack()[0] if result else False
+
+    def sftp_start_browsing(self, device_id) -> bool:
+        result = self._call(
+            self._device_path(device_id) + "/sftp",
+            IFACE_SFTP,
+            "startBrowsing",
+            reply_type="(b)",
+            timeout_ms=MOUNT_TIMEOUT_MS,
         )
         return result.unpack()[0] if result else False
 

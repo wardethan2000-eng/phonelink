@@ -5,6 +5,7 @@ import shutil
 import threading
 import time
 from pathlib import Path
+from urllib.parse import unquote, urlparse
 
 import gi
 
@@ -52,6 +53,36 @@ def _file_icon_name(name: str, is_dir: bool) -> str:
 
 def _is_image(name: str) -> bool:
     return Path(name).suffix.lower() in IMAGE_EXTS
+
+
+def _file_uri_lines(paths: list[str]) -> list[str]:
+    return [Gio.File.new_for_path(path).get_uri() for path in paths]
+
+
+def _file_uri_list_bytes(paths: list[str]) -> bytes:
+    return ("\r\n".join(_file_uri_lines(paths)) + "\r\n").encode("utf-8")
+
+
+def _directory_label(value) -> str:
+    if hasattr(value, "unpack"):
+        try:
+            value = value.unpack()
+        except Exception:
+            pass
+    return str(value or "")
+
+
+def _directory_sort_key(item: tuple[str, str]) -> tuple[int, str]:
+    path, label = item
+    label_text = label.casefold()
+    path_text = path.casefold()
+    if path_text.endswith("/storage/emulated/0") or "all files" in label_text:
+        return (0, label_text)
+    if "internal" in label_text or "storage" in label_text:
+        return (1, label_text)
+    if "camera" in label_text or "dcim" in path_text:
+        return (2, label_text)
+    return (3, label_text)
 
 
 # ── Photo tile widget ──────────────────────────────────────────────
@@ -184,6 +215,9 @@ class FilesPanel(Gtk.Box):
         self._photo_tiles: list[PhotoTile] = []
         self._thumb_threads: list[threading.Thread] = []
         self._loading_cancelled = False
+        self._mount_in_progress = False
+        self._mount_device_id: str | None = None
+        self._photo_scan_generation = 0
 
         # ── Main stack: status vs content ──────────────────────────
         self._outer_stack = Gtk.Stack()
@@ -450,7 +484,8 @@ class FilesPanel(Gtk.Box):
             if not old or old.id != device.id or not old.reachable:
                 self._subscribe_signals(device.id)
                 self._auto_mount_and_load(device.id)
-                self._build_shortcuts(device.id)
+            else:
+                self._reconcile_mount_state(device.id)
             self._outer_stack.set_visible_child_name("content")
         elif device:
             self._status.set_description(
@@ -471,6 +506,7 @@ class FilesPanel(Gtk.Box):
         self._signal_ids.clear()
 
         sftp_path = f"/modules/kdeconnect/devices/{device_id}"
+        share_path = f"{sftp_path}/share"
         for signal_name, handler in [
             ("mounted", self._on_sftp_mounted),
             ("unmounted", self._on_sftp_unmounted),
@@ -482,7 +518,7 @@ class FilesPanel(Gtk.Box):
                 self._signal_ids.append(sid)
 
         sid = self.client.subscribe_signal(
-            sftp_path, IFACE_SHARE, "shareReceived", self._on_file_received
+            share_path, IFACE_SHARE, "shareReceived", self._on_file_received
         )
         if sid is not None:
             self._signal_ids.append(sid)
@@ -495,7 +531,8 @@ class FilesPanel(Gtk.Box):
 
     def _on_file_received(self, conn, sender, path, iface, signal, params):
         url = params.unpack()[0]
-        file_name = os.path.basename(url)
+        parsed = urlparse(url)
+        file_name = os.path.basename(unquote(parsed.path if parsed.scheme else url))
         GLib.idle_add(self._status_bar.set_label, f"Received: {file_name}")
 
     # ── Mount management ───────────────────────────────────────────
@@ -506,64 +543,114 @@ class FilesPanel(Gtk.Box):
         self._mount_point = self.client.sftp_mount_point(device_id)
 
         if not self._is_mounted:
-            # Show mounting spinner while blocking mount call runs in background
-            self._outer_stack.set_visible_child_name("mounting")
-            self._mounting_spinner.start()
-
-            def do_mount():
-                ok = self.client.sftp_mount_and_wait(device_id)
-                GLib.idle_add(self._on_mount_finished, device_id, ok)
-
-            t = threading.Thread(target=do_mount, daemon=True)
-            t.start()
+            self._start_mount(device_id)
             return
 
         self._resolve_storage_base(device_id)
         self._update_mount_ui()
+        self._build_shortcuts(device_id)
         if self._is_mounted and self._mount_point:
             self._load_recent_photos()
 
+    def _reconcile_mount_state(self, device_id: str):
+        """Keep the UI in sync when KDE Connect mounts/unmounts outside signals."""
+        mounted = self.client.sftp_is_mounted(device_id)
+        mount_point = self.client.sftp_mount_point(device_id)
+        mount_changed = mounted != self._is_mounted or mount_point != self._mount_point
+        self._is_mounted = mounted
+        self._mount_point = mount_point
+
+        if not mounted or not mount_point:
+            self._update_mount_ui()
+            self._start_mount(device_id)
+            return
+
+        if mount_changed or not self._storage_base:
+            self._resolve_storage_base(device_id)
+            self._update_mount_ui()
+            self._build_shortcuts(device_id)
+
+        if self._view_stack.get_visible_child_name() == "photos" and not self._photo_tiles:
+            self._load_recent_photos()
+
+    def _start_mount(self, device_id: str):
+        if self._mount_in_progress and self._mount_device_id == device_id:
+            return
+        self._mount_in_progress = True
+        self._mount_device_id = device_id
+        self._outer_stack.set_visible_child_name("mounting")
+        self._mounting_spinner.start()
+
+        def do_mount():
+            ok = self.client.sftp_mount_and_wait(device_id)
+            if not ok:
+                ok = self.client.sftp_start_browsing(device_id)
+                if ok:
+                    for _attempt in range(10):
+                        if self.client.sftp_is_mounted(device_id):
+                            break
+                        time.sleep(0.5)
+                    ok = self.client.sftp_is_mounted(device_id)
+            GLib.idle_add(self._on_mount_finished, device_id, ok)
+
+        t = threading.Thread(target=do_mount, daemon=True)
+        t.start()
+
     def _on_mount_finished(self, device_id: str, ok: bool):
         """Called on main thread after background mount completes."""
+        if self._mount_device_id == device_id:
+            self._mount_in_progress = False
+            self._mount_device_id = None
+        if not self._device or self._device.id != device_id:
+            return GLib.SOURCE_REMOVE
+
         self._mounting_spinner.stop()
         if ok:
             self._is_mounted = True
             self._mount_point = self.client.sftp_mount_point(device_id)
         else:
+            self._is_mounted = False
+            self._mount_point = ""
             err = self.client.sftp_get_mount_error(device_id)
             self._photo_status.set_label(f"Mount failed: {err}")
             self._status_bar.set_label(f"Mount failed: {err}")
 
         self._resolve_storage_base(device_id)
         self._update_mount_ui()
+        self._build_shortcuts(device_id)
         self._outer_stack.set_visible_child_name("content")
         if self._is_mounted and self._mount_point:
             self._load_recent_photos()
+        return GLib.SOURCE_REMOVE
 
     def _refresh_mount_state(self):
         if not self._device:
-            return
+            return GLib.SOURCE_REMOVE
         self._is_mounted = self.client.sftp_is_mounted(self._device.id)
         self._mount_point = self.client.sftp_mount_point(self._device.id)
         if not self._is_mounted:
-            ok = self.client.sftp_mount_and_wait(self._device.id)
-            if ok:
-                self._is_mounted = True
-                self._mount_point = self.client.sftp_mount_point(self._device.id)
+            self._update_mount_ui()
+            self._build_shortcuts(self._device.id)
+            self._start_mount(self._device.id)
+            return GLib.SOURCE_REMOVE
         self._resolve_storage_base(self._device.id)
         self._update_mount_ui()
+        self._build_shortcuts(self._device.id)
         if self._is_mounted and self._mount_point:
             self._load_recent_photos()
+        return GLib.SOURCE_REMOVE
 
     def _resolve_storage_base(self, device_id: str):
         """Find the actual accessible base dir (e.g. .../storage/emulated/0)."""
         self._storage_base = ""
         if not self._mount_point:
             return
-        dirs = self.client.sftp_get_directories(device_id)
+        dirs = [
+            (path, _directory_label(label))
+            for path, label in self.client.sftp_get_directories(device_id).items()
+        ]
         if dirs:
-            # Use the first directory returned by the phone
-            self._storage_base = next(iter(dirs))
+            self._storage_base = sorted(dirs, key=_directory_sort_key)[0][0]
         else:
             # Fallback: try the mount point directly
             self._storage_base = self._mount_point
@@ -623,6 +710,7 @@ class FilesPanel(Gtk.Box):
 
     def _clear_photo_grid(self):
         self._loading_cancelled = True
+        self._photo_scan_generation += 1
         self._photo_tiles.clear()
         while True:
             child = self._photo_grid.get_child_at_index(0)
@@ -639,56 +727,75 @@ class FilesPanel(Gtk.Box):
         self._loading_cancelled = False
         self._photo_status.set_label("Scanning for photos…")
 
-        # Use the resolved storage base (e.g. .../storage/emulated/0)
         base = self._storage_base or self._mount_point
+        generation = self._photo_scan_generation
+
+        def worker():
+            image_files = self._collect_recent_photo_files(base)
+            GLib.idle_add(self._finish_recent_photo_scan, generation, image_files)
+
+        threading.Thread(target=worker, daemon=True).start()
+
+    def _collect_recent_photo_files(self, base: str) -> list[tuple[str, float]]:
+        # Use the resolved storage base (e.g. .../storage/emulated/0)
         search_dirs = [
             os.path.join(base, "DCIM", "Camera"),
             os.path.join(base, "DCIM"),
             os.path.join(base, "Pictures"),
             os.path.join(base, "Download"),
+            os.path.join(base, "Movies"),
         ]
 
-        # Collect image files with mtime
         image_files: list[tuple[str, float]] = []
-        seen = set()
+        seen: set[str] = set()
         for d in search_dirs:
             if not os.path.isdir(d):
                 continue
             try:
-                for name in os.listdir(d):
-                    full = os.path.join(d, name)
-                    if full in seen:
-                        continue
-                    seen.add(full)
-                    if os.path.isfile(full) and _is_image(name):
-                        try:
-                            mtime = os.path.getmtime(full)
-                            image_files.append((full, mtime))
-                        except OSError:
-                            pass
+                self._collect_images_in_dir(d, image_files, seen)
                 # Also check one level of subdirectories in DCIM
-                if "DCIM" in d:
+                if os.path.basename(d).casefold() in {"dcim", "pictures", "download", "movies"}:
                     for sub in os.listdir(d):
+                        if sub.startswith("."):
+                            continue
                         subdir = os.path.join(d, sub)
                         if not os.path.isdir(subdir):
                             continue
-                        try:
-                            for name in os.listdir(subdir):
-                                full = os.path.join(subdir, name)
-                                if full in seen:
-                                    continue
-                                seen.add(full)
-                                if os.path.isfile(full) and _is_image(name):
-                                    mtime = os.path.getmtime(full)
-                                    image_files.append((full, mtime))
-                        except OSError:
-                            pass
+                        self._collect_images_in_dir(subdir, image_files, seen)
             except OSError:
                 continue
 
-        # Sort newest first, limit to 200
         image_files.sort(key=lambda x: x[1], reverse=True)
-        image_files = image_files[:200]
+        return image_files[:200]
+
+    def _collect_images_in_dir(
+        self,
+        directory: str,
+        image_files: list[tuple[str, float]],
+        seen: set[str],
+    ):
+        try:
+            with os.scandir(directory) as entries:
+                for entry in entries:
+                    name = entry.name
+                    if name.startswith(".") or not _is_image(name):
+                        continue
+                    full = entry.path
+                    if full in seen:
+                        continue
+                    seen.add(full)
+                    try:
+                        if not entry.is_file():
+                            continue
+                        image_files.append((full, entry.stat().st_mtime))
+                    except OSError:
+                        continue
+        except OSError:
+            return
+
+    def _finish_recent_photo_scan(self, generation: int, image_files: list[tuple[str, float]]):
+        if generation != self._photo_scan_generation or self._loading_cancelled:
+            return GLib.SOURCE_REMOVE
 
         if not image_files:
             self._photo_empty.set_description(
@@ -727,6 +834,7 @@ class FilesPanel(Gtk.Box):
 
         # Load thumbnails in background
         self._load_thumbnails_async(image_files)
+        return GLib.SOURCE_REMOVE
 
     def _load_thumbnails_async(self, image_files: list[tuple[str, float]]):
         """Load thumbnails in a background thread, posting to main thread."""
@@ -856,28 +964,13 @@ class FilesPanel(Gtk.Box):
 
     def _copy_paths(self, paths: list[str], status_label: Gtk.Label):
         clipboard = self.get_clipboard()
-        if len(paths) == 1 and _is_image(paths[0]):
-            try:
-                import mimetypes
-                mime_type, _ = mimetypes.guess_type(paths[0])
-                if not mime_type or not mime_type.startswith("image/"):
-                    mime_type = "image/png"
-
-                with open(paths[0], "rb") as f:
-                    image_bytes = f.read()
-
-                content = Gdk.ContentProvider.new_for_bytes(
-                    mime_type, GLib.Bytes(image_bytes)
-                )
-                clipboard.set_content(content)
-                status_label.set_label(f"Copied {os.path.basename(paths[0])} to clipboard")
-                return
-            except (OSError, GLib.Error):
-                pass
-        # Fall back to URI list
-        content = Gdk.ContentProvider.new_for_value(
-            GLib.Variant("as", [f"file://{p}" for p in paths])
-        )
+        try:
+            content = Gdk.ContentProvider.new_for_bytes(
+                "text/uri-list",
+                GLib.Bytes(_file_uri_list_bytes(paths)),
+            )
+        except (TypeError, GLib.Error):
+            content = Gdk.ContentProvider.new_for_value("\n".join(_file_uri_lines(paths)))
         clipboard.set_content(content)
         status_label.set_label(
             f"Copied {os.path.basename(paths[0])} to clipboard"
@@ -952,8 +1045,11 @@ class FilesPanel(Gtk.Box):
         self._shortcuts_list.append(row)
 
         # Phone directories
-        dirs = self.client.sftp_get_directories(device_id)
-        for path, label in dirs.items():
+        dirs = [
+            (path, _directory_label(label))
+            for path, label in self.client.sftp_get_directories(device_id).items()
+        ]
+        for path, label in sorted(dirs, key=_directory_sort_key):
             row = Gtk.ListBoxRow()
             box = Gtk.Box(orientation=Gtk.Orientation.HORIZONTAL, spacing=8)
             box.set_margin_start(8)
@@ -1185,16 +1281,16 @@ class FilesPanel(Gtk.Box):
         if not files or not self._device:
             return
 
-        urls = []
+        paths = []
         for f in files:
             path = f.get_path()
             if path:
-                urls.append(f"file://{path}")
+                paths.append(path)
 
-        if len(urls) == 1:
-            self.client.share_file(self._device.id, urls[0].replace("file://", ""))
-        elif urls:
-            self.client.share_urls(self._device.id, urls)
+        if len(paths) == 1:
+            self.client.share_file(self._device.id, paths[0])
+        elif paths:
+            self.client.share_files(self._device.id, paths)
 
-        names = [os.path.basename(u) for u in urls]
+        names = [os.path.basename(path) for path in paths]
         self._status_bar.set_label(f"Sending: {', '.join(names)}")

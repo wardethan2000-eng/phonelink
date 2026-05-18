@@ -9,6 +9,7 @@ SCRIPT_DIR="$(cd "$(dirname "${BASH_SOURCE[0]}")" && pwd)"
 BIN_DIR="$HOME/.local/bin"
 APPS_DIR="$HOME/.local/share/applications"
 ICONS_DIR="$HOME/.local/share/icons/hicolor"
+DESKTOP_ID="dev.phonelink.app"
 
 GREEN='\033[0;32m'
 YELLOW='\033[1;33m'
@@ -55,8 +56,9 @@ fi
 info "Installing desktop entry and icons..."
 mkdir -p "$APPS_DIR" "$ICONS_DIR/scalable/apps"
 
-sed "s|Exec=.*|Exec=$BIN_DIR/phonelink|" \
-    "$SCRIPT_DIR/data/phonelink.desktop" > "$APPS_DIR/phonelink.desktop"
+sed "s|Exec=.*|Exec=\"${BIN_DIR}/phonelink\"|" \
+    "$SCRIPT_DIR/data/phonelink.desktop" > "$APPS_DIR/${DESKTOP_ID}.desktop"
+rm -f "$APPS_DIR/phonelink.desktop"
 
 cp "$SCRIPT_DIR/data/icons/phonelink.svg" "$ICONS_DIR/scalable/apps/phonelink.svg"
 

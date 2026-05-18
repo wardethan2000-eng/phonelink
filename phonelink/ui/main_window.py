@@ -472,7 +472,7 @@ class MainWindow(Adw.ApplicationWindow):
             self._share_signal_id = None
         if not self.active_device:
             return
-        path = f"/modules/kdeconnect/devices/{self.active_device.id}"
+        path = f"/modules/kdeconnect/devices/{self.active_device.id}/share"
         sid = self.client.subscribe_signal(
             path, IFACE_SHARE, "shareReceived",
             self._on_share_received,

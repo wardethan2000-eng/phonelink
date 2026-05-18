@@ -4,12 +4,16 @@ set -e
 
 SCRIPT_DIR="$(cd "$(dirname "$0")" && pwd)"
 APP_DIR="$(dirname "$SCRIPT_DIR")"
+DESKTOP_ID="dev.phonelink.app"
 
 echo "Installing Phone Link..."
 
 # Update Exec path in .desktop file
-sed "s|Exec=.*|Exec=/usr/bin/python3 ${APP_DIR}/run.py|" \
-    "$SCRIPT_DIR/phonelink.desktop" > ~/.local/share/applications/phonelink.desktop
+mkdir -p ~/.local/share/applications
+RUN_PY="${APP_DIR}/run.py"
+sed "s|Exec=.*|Exec=/usr/bin/python3 \"${RUN_PY}\"|" \
+    "$SCRIPT_DIR/phonelink.desktop" > ~/.local/share/applications/${DESKTOP_ID}.desktop
+rm -f ~/.local/share/applications/phonelink.desktop
 
 # Install icons
 mkdir -p ~/.local/share/icons/hicolor/scalable/apps
