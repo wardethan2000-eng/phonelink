@@ -612,15 +612,18 @@ class MessageThread(Gtk.Box):
 
     def _on_send(self, _widget):
         text = self._text_entry.get_text().strip()
+        if not text and not self._pending_image_path:
+            return
+
+        self._text_entry.set_text("")
+
         if self._pending_image_path and self._thread_id:
             image_path = self._pending_image_path
-            self.emit("send-message-with-attachment", self._thread_id, text, image_path)
-            self._text_entry.set_text("")
             self._clear_pending_image(delete_file=False)
             self._retain_temp_path(image_path)
+            self.emit("send-message-with-attachment", self._thread_id, text, image_path)
         elif text and self._thread_id:
             self.emit("send-message", self._thread_id, text)
-            self._text_entry.set_text("")
 
     def _on_key_pressed(self, controller, keyval, keycode, state):
         """Handle Ctrl+V to paste images from clipboard."""

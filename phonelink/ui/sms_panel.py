@@ -1319,10 +1319,9 @@ class SmsPanel(Gtk.Box):
                 existing_tid = self._find_thread_for_address(conv.address)
                 if existing_tid is not None:
                     # Use existing thread — avoids creating a duplicate on the phone
-                    if not self._reply_via_notification_if_available(existing_tid, text):
-                        self.client.reply_to_conversation(
-                            self._device.id, existing_tid, text
-                        )
+                    self.client.reply_to_conversation(
+                        self._device.id, existing_tid, text
+                    )
                     self._conversations.pop(thread_id, None)
                     self._active_thread_id = existing_tid
                     self._read_thread_ids.add(existing_tid)
@@ -1336,8 +1335,7 @@ class SmsPanel(Gtk.Box):
                     self._thread.show_empty()
                     self._refresh_conversation_list()
         else:
-            if not self._reply_via_notification_if_available(thread_id, text):
-                self.client.reply_to_conversation(self._device.id, thread_id, text)
+            self.client.reply_to_conversation(self._device.id, thread_id, text)
 
     def _on_send_message_with_attachment(self, widget, thread_id, text, image_path):
         """Handle send with an image attachment."""
