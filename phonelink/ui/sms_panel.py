@@ -1308,6 +1308,7 @@ class SmsPanel(Gtk.Box):
 
     def _on_send_message(self, widget, thread_id, text):
         """Handle send from the compose bar."""
+        print(f"[DEBUG] _on_send_message called: thread_id={thread_id}, text='{text}'", flush=True)
         if not self._device or not self._device.reachable:
             return
 
@@ -1319,8 +1320,8 @@ class SmsPanel(Gtk.Box):
                 existing_tid = self._find_thread_for_address(conv.address)
                 if existing_tid is not None:
                     # Use existing thread — avoids creating a duplicate on the phone
-                    self.client.reply_to_conversation(
-                        self._device.id, existing_tid, text
+                    self.client.send_sms(
+                        self._device.id, [conv.address], text
                     )
                     self._conversations.pop(thread_id, None)
                     self._active_thread_id = existing_tid
@@ -1335,7 +1336,11 @@ class SmsPanel(Gtk.Box):
                     self._thread.show_empty()
                     self._refresh_conversation_list()
         else:
-            self.client.reply_to_conversation(self._device.id, thread_id, text)
+            conv = self._conversations.get(thread_id)
+            if conv and conv.address:
+                self.client.send_sms(self._device.id, [conv.address], text)
+            else:
+                self.client.reply_to_conversation(self._device.id, thread_id, text)
 
     def _on_send_message_with_attachment(self, widget, thread_id, text, image_path):
         """Handle send with an image attachment."""
@@ -1347,8 +1352,8 @@ class SmsPanel(Gtk.Box):
             if conv:
                 existing_tid = self._find_thread_for_address(conv.address)
                 if existing_tid is not None:
-                    self.client.reply_to_conversation(
-                        self._device.id, existing_tid, text or "",
+                    self.client.send_sms(
+                        self._device.id, [conv.address], text or "",
                         attachments=[image_path],
                     )
                     self._conversations.pop(thread_id, None)
@@ -1366,10 +1371,17 @@ class SmsPanel(Gtk.Box):
                     self._thread.show_empty()
                     self._refresh_conversation_list()
         else:
-            self.client.reply_to_conversation(
-                self._device.id, thread_id, text or "",
-                attachments=[image_path],
-            )
+            conv = self._conversations.get(thread_id)
+            if conv and conv.address:
+                self.client.send_sms(
+                    self._device.id, [conv.address], text or "",
+                    attachments=[image_path],
+                )
+            else:
+                self.client.reply_to_conversation(
+                    self._device.id, thread_id, text or "",
+                    attachments=[image_path],
+                )
 
     def _on_download_attachment(self, widget, thread_id, part_id, unique_identifier, file_name):
         if not self._device or not self._device.reachable:

@@ -612,6 +612,7 @@ class MessageThread(Gtk.Box):
 
     def _on_send(self, _widget):
         text = self._text_entry.get_text().strip()
+        print(f"[DEBUG] _on_send called: widget={_widget}, text='{text}'", flush=True)
         if not text and not self._pending_image_path:
             return
 

@@ -374,6 +374,7 @@ class KDEConnectClient:
     def reply_to_conversation(self, device_id, thread_id: int,
                                message: str, attachments=None) -> bool:
         """Reply to an existing conversation thread."""
+        print(f"[DEBUG] DBusClient.reply_to_conversation called: thread_id={thread_id}, message='{message}'", flush=True)
         att_list = [GLib.Variant("s", a) for a in (attachments or [])]
         return self._call(
             self._device_path(device_id),
@@ -411,6 +412,7 @@ class KDEConnectClient:
     def send_sms(self, device_id, addresses: list[str], message: str,
                  attachments: list[str] | None = None):
         """Send a new SMS to one or more phone numbers."""
+        print(f"[DEBUG] DBusClient.send_sms called: addresses={addresses}, message='{message}'", flush=True)
         addr_variants = [GLib.Variant("s", a) for a in addresses]
         att_variants = [GLib.Variant("s", a) for a in (attachments or [])]
         self._call(
