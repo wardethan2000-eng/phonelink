@@ -3,7 +3,6 @@
 import base64
 import binascii
 import hashlib
-import html
 import os
 import re
 import shutil
@@ -92,36 +91,19 @@ def _attachment_local_path(att: dict) -> str | None:
     return str(target)
 
 
-def _message_markup(text: str) -> tuple[str, bool]:
-    """Return Pango markup with clickable URL anchors."""
-    parts: list[str] = []
-    last = 0
-    has_links = False
-
+def _message_links(text: str) -> list[tuple[str, str]]:
+    """Return (display_text, uri) pairs for URLs in message text."""
+    links: list[tuple[str, str]] = []
     for match in URL_RE.finditer(text or ""):
-        start, end = match.span()
         raw_url = match.group(0)
         while raw_url and raw_url[-1] in URL_TRAILING_PUNCTUATION:
             raw_url = raw_url[:-1]
-            end -= 1
         if not raw_url:
             continue
 
         uri = raw_url if raw_url.lower().startswith(("http://", "https://")) else f"https://{raw_url}"
-        parts.append(html.escape(text[last:start]))
-        parts.append(
-            f'<a href="{html.escape(uri, quote=True)}">'
-            f"{html.escape(raw_url)}"
-            "</a>"
-        )
-        last = end
-        has_links = True
-
-    if not has_links:
-        return html.escape(text or ""), False
-
-    parts.append(html.escape(text[last:]))
-    return "".join(parts), True
+        links.append((raw_url, uri))
+    return links
 
 
 class MessageBubble(Gtk.Box):
@@ -156,7 +138,8 @@ class MessageBubble(Gtk.Box):
         frame.add_css_class("message-bubble-sent" if sent else "message-bubble-received")
         self.append(frame)
 
-        body_markup, has_links = _message_markup(message.body or "")
+        links = _message_links(message.body or "")
+        has_links = bool(links)
         if not has_links:
             click = Gtk.GestureClick(button=1)
             click.connect("pressed", self._on_bubble_pressed)
@@ -169,12 +152,14 @@ class MessageBubble(Gtk.Box):
         body_label.set_max_width_chars(50)
         body_label.set_halign(Gtk.Align.START)
         body_label.set_selectable(not has_links)
-        if has_links:
-            body_label.set_markup(body_markup)
-            body_label.connect("activate-link", self._on_body_link_activated)
-        else:
-            body_label.set_text(message.body or "")
+        body_label.set_text(message.body or "")
         frame.append(body_label)
+
+        for display_text, uri in links:
+            link = Gtk.LinkButton.new_with_label(uri, display_text)
+            link.set_halign(Gtk.Align.START)
+            link.add_css_class("caption")
+            frame.append(link)
 
         # Attachment indicators
         if message.attachments:
@@ -316,13 +301,6 @@ class MessageBubble(Gtk.Box):
 
     def _on_bubble_pressed(self, *_args):
         self.set_default_timestamp_visible(not self._timestamp_visible)
-
-    def _on_body_link_activated(self, _label, uri: str):
-        try:
-            Gio.AppInfo.launch_default_for_uri(uri, None)
-        except GLib.Error:
-            pass
-        return True
 
 
 class DateSeparator(Gtk.Box):
