@@ -156,9 +156,11 @@ class MessageBubble(Gtk.Box):
         frame.add_css_class("message-bubble-sent" if sent else "message-bubble-received")
         self.append(frame)
 
-        click = Gtk.GestureClick(button=1)
-        click.connect("pressed", self._on_bubble_pressed)
-        frame.add_controller(click)
+        body_markup, has_links = _message_markup(message.body or "")
+        if not has_links:
+            click = Gtk.GestureClick(button=1)
+            click.connect("pressed", self._on_bubble_pressed)
+            frame.add_controller(click)
 
         # Message text
         body_label = Gtk.Label()
@@ -166,8 +168,7 @@ class MessageBubble(Gtk.Box):
         body_label.set_wrap_mode(Pango.WrapMode.WORD_CHAR)
         body_label.set_max_width_chars(50)
         body_label.set_halign(Gtk.Align.START)
-        body_label.set_selectable(True)
-        body_markup, has_links = _message_markup(message.body or "")
+        body_label.set_selectable(not has_links)
         if has_links:
             body_label.set_markup(body_markup)
             body_label.connect("activate-link", self._on_body_link_activated)
