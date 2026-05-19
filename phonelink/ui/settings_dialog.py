@@ -142,7 +142,7 @@ class SettingsPanel(Gtk.Box):
         group = Adw.PreferencesGroup(title="Theme")
         page.add(group)
 
-        combo = Adw.ComboRow(title="Colour Scheme")
+        combo = Adw.ComboRow(title="Color Scheme")
         combo.set_model(Gtk.StringList.new(["Follow system", "Light", "Dark"]))
         combo.set_selected(
             {"system": 0, "light": 1, "dark": 2}.get(self._settings.color_scheme, 0)

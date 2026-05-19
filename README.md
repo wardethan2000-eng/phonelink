@@ -144,8 +144,8 @@ Then relaunch the app.
 
 The header bar is always visible and shows:
 
-- **Left**: Phone icon, device name, and a coloured dot (green = connected, orange = paired but not reachable, grey = no device)
-- **Centre**: Tab switcher (Messages / Files)
+- **Left**: Phone icon, device name, and a colored dot (green = connected, orange = paired but not reachable, gray = no device)
+- **Center**: Tab switcher (Messages / Files)
 - **Right**: Battery icon and percentage, notification bell button, ring phone button
 
 ### Messages Tab
