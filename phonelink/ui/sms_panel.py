@@ -18,7 +18,7 @@ from phonelink.dbus_client import (
     IFACE_TELEPHONY,
 )
 from phonelink.contacts import (
-    _normalize_phone,
+    _clean_text, _is_messaging_app, _normalize_phone, _notification_message_text,
     load_contact_map, resolve_name, import_vcf_file,
     harvest_contacts_from_notifications,
     harvest_contact_from_notification_signal,
@@ -155,6 +155,11 @@ class SmsPanel(Gtk.Box):
         self._contact_sync_check_source: int | None = None
         self._contact_sync_warned: set[str] = set()
         self._google_sync_in_flight = False
+        self._all_conversations_refresh_source: int | None = None
+        self._conversation_refresh_source: int | None = None
+        self._pending_refresh_force = False
+        self._pending_show_thread_id: int | None = None
+        self._notification_reply_targets: dict[int, str] = {}
 
         # ── Stack: disconnected status vs content ──────────────────
         self._stack = Gtk.Stack()
@@ -210,6 +215,7 @@ class SmsPanel(Gtk.Box):
             self._conv_list.set_contact_map({})
             self._show_disconnected()
             self._unsubscribe_signals()
+            self._cancel_all_conversations_refresh()
             return
 
         if not device.reachable:
@@ -234,14 +240,18 @@ class SmsPanel(Gtk.Box):
             self._conversations.clear()
             self._thread_redirects.clear()
             self._read_thread_ids.clear()
+            self._notification_reply_targets.clear()
             self._conv_list.set_conversations([])
             self._thread.show_empty()
             self._active_thread_id = None
             self._load_contacts(device.id)
             self._subscribe_signals(device.id)
             self._request_contact_sync(device.id)
-            self._load_active_conversations(device.id)
-            self.client.request_all_conversations(device.id)
+            self._cancel_all_conversations_refresh()
+            active_count = self._load_active_conversations(device.id)
+            self._refresh_notification_reply_targets(device.id)
+            if active_count == 0:
+                self._schedule_all_conversations_refresh(device.id)
             self._run_startup_contact_backfill(device.id)
             self._maybe_refresh_google_contacts_in_background()
         elif not self._signal_ids or just_reconnected:
@@ -250,8 +260,11 @@ class SmsPanel(Gtk.Box):
                 self._subscribe_signals(device.id)
             self._load_contacts(device.id)
             self._request_contact_sync(device.id)
-            self._load_active_conversations(device.id)
-            self.client.request_all_conversations(device.id)
+            self._cancel_all_conversations_refresh()
+            active_count = self._load_active_conversations(device.id)
+            self._refresh_notification_reply_targets(device.id)
+            if active_count == 0:
+                self._schedule_all_conversations_refresh(device.id)
             self._run_startup_contact_backfill(device.id)
             self._maybe_refresh_google_contacts_in_background()
 
@@ -343,7 +356,7 @@ class SmsPanel(Gtk.Box):
         message_date = conv.last_date or (conv.messages[-1].date if conv.messages else 0)
         return self._should_keep_conversation_hidden(conversation_key, message_date)
 
-    def _load_active_conversations(self, device_id):
+    def _load_active_conversations(self, device_id) -> int:
         """Load cached conversations from the daemon via activeConversations()."""
         raw_list = self.client.get_active_conversations(device_id)
         # Detect user's own number before merging (appears in many multi-
@@ -357,6 +370,28 @@ class SmsPanel(Gtk.Box):
                 count += 1
         if count:
             self._refresh_conversation_list()
+        return count
+
+    def _schedule_all_conversations_refresh(self, device_id: str, delay_seconds: int = 10):
+        """Defer the expensive full-phone conversation sync until startup is interactive."""
+        self._cancel_all_conversations_refresh()
+        self._all_conversations_refresh_source = GLib.timeout_add_seconds(
+            delay_seconds,
+            self._run_all_conversations_refresh,
+            device_id,
+        )
+
+    def _cancel_all_conversations_refresh(self):
+        if self._all_conversations_refresh_source:
+            GLib.source_remove(self._all_conversations_refresh_source)
+            self._all_conversations_refresh_source = None
+
+    def _run_all_conversations_refresh(self, device_id: str):
+        self._all_conversations_refresh_source = None
+        if not self._device or self._device.id != device_id or not self._device.reachable:
+            return GLib.SOURCE_REMOVE
+        self.client.request_all_conversations(device_id)
+        return GLib.SOURCE_REMOVE
 
     def _detect_self_number(self, raw_list):
         """Detect the user's own phone number from conversation data.
@@ -551,6 +586,9 @@ class SmsPanel(Gtk.Box):
         """Check a new notification for SMS contact name info."""
         if not self._device:
             return
+        props = self.client.get_notification_properties(self._device.id, notif_id)
+        if props:
+            self._remember_notification_reply_target(notif_id, props)
         result = harvest_contact_from_notification_signal(
             self.client, self._device.id, notif_id,
             self._conversations, self._contact_map
@@ -564,6 +602,74 @@ class SmsPanel(Gtk.Box):
                 if _normalize_phone(conv.address) == norm_phone:
                     conv.display_name = name
             self._refresh_conversation_list()
+
+    def _refresh_notification_reply_targets(self, device_id: str):
+        """Map active messaging notification replies to their conversations."""
+        notif_ids = self.client.get_active_notification_ids(device_id)
+        if not notif_ids:
+            return
+
+        for notif_id in notif_ids:
+            try:
+                props = self.client.get_notification_properties(device_id, notif_id)
+            except Exception:
+                continue
+            self._remember_notification_reply_target(notif_id, props)
+
+    def _remember_notification_reply_target(self, notif_id: str, props: dict):
+        if not notif_id or not props or not props.get("replyId"):
+            return
+        app_name = _clean_text(props.get("appName", ""))
+        if not _is_messaging_app(app_name):
+            return
+
+        for conv in self._deduplicated_conversations():
+            if self._conversation_matches_notification(conv, props):
+                self._notification_reply_targets[conv.thread_id] = notif_id
+                for sec_tid, primary_tid in self._thread_redirects.items():
+                    if primary_tid == conv.thread_id:
+                        self._notification_reply_targets[sec_tid] = notif_id
+                return
+
+    def _conversation_matches_notification(self, conv: Conversation, props: dict) -> bool:
+        msg_text = _notification_message_text(props)
+        if msg_text:
+            msg_text = msg_text.strip()
+            if conv.last_message and self._message_text_matches(conv.last_message, msg_text):
+                return True
+            for msg in conv.messages:
+                if msg.msg_type == 1 and msg.body and self._message_text_matches(msg.body, msg_text):
+                    return True
+
+        title = _clean_text(props.get("title", ""))
+        if title and conv.display_name:
+            return title.casefold() == conv.display_name.casefold()
+        return False
+
+    def _message_text_matches(self, local_text: str, notification_text: str) -> bool:
+        local = (local_text or "").strip()
+        remote = (notification_text or "").strip()
+        if not local or not remote:
+            return False
+        return local == remote or local.startswith(remote) or remote.startswith(local[:30])
+
+    def _reply_via_notification_if_available(self, thread_id: int, text: str) -> bool:
+        if not self._device:
+            return False
+
+        self._refresh_notification_reply_targets(self._device.id)
+        notif_id = self._notification_reply_targets.get(thread_id)
+        if not notif_id:
+            primary_tid = self._thread_redirects.get(thread_id)
+            if primary_tid is not None:
+                notif_id = self._notification_reply_targets.get(primary_tid)
+        if not notif_id:
+            return False
+
+        sent = self.client.reply_to_notification(self._device.id, notif_id, text)
+        if not sent:
+            self._notification_reply_targets.pop(thread_id, None)
+        return sent
 
     def _handle_telephony_contact(self, event: str, number: str, contact_name: str):
         """Persist a contact name emitted by the telephony plugin."""
@@ -854,11 +960,39 @@ class SmsPanel(Gtk.Box):
             msg = _parse_message_tuple(unpacked)
             if msg:
                 self._merge_message(msg)
-                self._refresh_conversation_list()
-                if self._active_thread_id == msg.thread_id:
-                    self._show_thread(msg.thread_id)
+                self._schedule_conversation_refresh(
+                    show_thread_id=msg.thread_id if self._active_thread_id == msg.thread_id else None
+                )
         except (TypeError, ValueError, IndexError) as e:
             print(f"[phonelink] SMS signal parse error: {type(e).__name__}: {e}")
+
+    def _schedule_conversation_refresh(self, *, force_rebuild: bool = False,
+                                       show_thread_id: int | None = None):
+        self._pending_refresh_force = self._pending_refresh_force or bool(force_rebuild)
+        if show_thread_id is not None:
+            self._pending_show_thread_id = show_thread_id
+        if self._conversation_refresh_source:
+            return
+        self._conversation_refresh_source = GLib.timeout_add(
+            100,
+            self._flush_conversation_refresh,
+        )
+
+    def _flush_conversation_refresh(self):
+        self._conversation_refresh_source = None
+        force_rebuild = self._pending_refresh_force
+        show_thread_id = self._pending_show_thread_id
+        self._pending_refresh_force = False
+        self._pending_show_thread_id = None
+
+        self._refresh_conversation_list(force_rebuild=force_rebuild)
+        if (
+            show_thread_id is not None
+            and self._active_thread_id == show_thread_id
+            and show_thread_id in self._conversations
+        ):
+            self._show_thread(show_thread_id)
+        return GLib.SOURCE_REMOVE
 
     # ── Message ingestion ──────────────────────────────────────────
 
@@ -1185,9 +1319,10 @@ class SmsPanel(Gtk.Box):
                 existing_tid = self._find_thread_for_address(conv.address)
                 if existing_tid is not None:
                     # Use existing thread — avoids creating a duplicate on the phone
-                    self.client.reply_to_conversation(
-                        self._device.id, existing_tid, text
-                    )
+                    if not self._reply_via_notification_if_available(existing_tid, text):
+                        self.client.reply_to_conversation(
+                            self._device.id, existing_tid, text
+                        )
                     self._conversations.pop(thread_id, None)
                     self._active_thread_id = existing_tid
                     self._read_thread_ids.add(existing_tid)
@@ -1201,7 +1336,8 @@ class SmsPanel(Gtk.Box):
                     self._thread.show_empty()
                     self._refresh_conversation_list()
         else:
-            self.client.reply_to_conversation(self._device.id, thread_id, text)
+            if not self._reply_via_notification_if_available(thread_id, text):
+                self.client.reply_to_conversation(self._device.id, thread_id, text)
 
     def _on_send_message_with_attachment(self, widget, thread_id, text, image_path):
         """Handle send with an image attachment."""

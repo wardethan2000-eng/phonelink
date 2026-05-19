@@ -337,10 +337,10 @@ class KDEConnectClient:
         )
 
     def reply_to_conversation(self, device_id, thread_id: int,
-                               message: str, attachments=None):
+                               message: str, attachments=None) -> bool:
         """Reply to an existing conversation thread."""
         att_list = [GLib.Variant("s", a) for a in (attachments or [])]
-        self._call(
+        return self._call(
             self._device_path(device_id),
             IFACE_CONVERSATIONS,
             "replyToConversation",
@@ -349,7 +349,7 @@ class KDEConnectClient:
                 GLib.Variant("s", message),
                 GLib.Variant("av", att_list),
             ),
-        )
+        ) is not None
 
     def delete_conversation(self, device_id, thread_id: int):
         """Try to delete a conversation on the phone.
@@ -509,23 +509,23 @@ class KDEConnectClient:
             "dismiss",
         )
 
-    def reply_to_notification(self, device_id, notif_id: str, message: str):
+    def reply_to_notification(self, device_id, notif_id: str, message: str) -> bool:
         """Reply to a notification via its sendReply method."""
-        self._call(
+        return self._call(
             self._device_path(device_id) + f"/notifications/{notif_id}",
             "org.kde.kdeconnect.device.notifications.notification",
             "sendReply",
             GLib.Variant("(s)", (message,)),
-        )
+        ) is not None
 
-    def send_notification_reply_by_id(self, device_id, reply_id: str, message: str):
+    def send_notification_reply_by_id(self, device_id, reply_id: str, message: str) -> bool:
         """Reply to a notification using the replyId via the notifications interface."""
-        self._call(
+        return self._call(
             self._device_path(device_id) + "/notifications",
             IFACE_NOTIFICATIONS,
             "sendReply",
             GLib.Variant("(ss)", (reply_id, message)),
-        )
+        ) is not None
 
     # ── Signals ────────────────────────────────────────────────────
 

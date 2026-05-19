@@ -3,7 +3,9 @@
 import base64
 import binascii
 import hashlib
+import html
 import os
+import re
 import shutil
 import tempfile
 from pathlib import Path
@@ -29,6 +31,8 @@ IMAGE_CLIPBOARD_MIME_TYPES = (
     "image/heif",
 )
 IMAGE_FILE_EXTS = {".png", ".jpg", ".jpeg", ".webp", ".gif", ".bmp", ".tiff", ".tif", ".heic", ".heif"}
+URL_RE = re.compile(r"\b(?:https?://|www\.)[^\s<>()]+", re.IGNORECASE)
+URL_TRAILING_PUNCTUATION = ".,!?;:)]}"
 
 
 def _attachment_ext(mime_type: str) -> str:
@@ -88,6 +92,38 @@ def _attachment_local_path(att: dict) -> str | None:
     return str(target)
 
 
+def _message_markup(text: str) -> tuple[str, bool]:
+    """Return Pango markup with clickable URL anchors."""
+    parts: list[str] = []
+    last = 0
+    has_links = False
+
+    for match in URL_RE.finditer(text or ""):
+        start, end = match.span()
+        raw_url = match.group(0)
+        while raw_url and raw_url[-1] in URL_TRAILING_PUNCTUATION:
+            raw_url = raw_url[:-1]
+            end -= 1
+        if not raw_url:
+            continue
+
+        uri = raw_url if raw_url.lower().startswith(("http://", "https://")) else f"https://{raw_url}"
+        parts.append(html.escape(text[last:start]))
+        parts.append(
+            f'<a href="{html.escape(uri, quote=True)}">'
+            f"{html.escape(raw_url)}"
+            "</a>"
+        )
+        last = end
+        has_links = True
+
+    if not has_links:
+        return html.escape(text or ""), False
+
+    parts.append(html.escape(text[last:]))
+    return "".join(parts), True
+
+
 class MessageBubble(Gtk.Box):
     """A single chat bubble."""
 
@@ -125,12 +161,18 @@ class MessageBubble(Gtk.Box):
         frame.add_controller(click)
 
         # Message text
-        body_label = Gtk.Label(label=message.body or "")
+        body_label = Gtk.Label()
         body_label.set_wrap(True)
         body_label.set_wrap_mode(Pango.WrapMode.WORD_CHAR)
         body_label.set_max_width_chars(50)
         body_label.set_halign(Gtk.Align.START)
         body_label.set_selectable(True)
+        body_markup, has_links = _message_markup(message.body or "")
+        if has_links:
+            body_label.set_markup(body_markup)
+            body_label.connect("activate-link", self._on_body_link_activated)
+        else:
+            body_label.set_text(message.body or "")
         frame.append(body_label)
 
         # Attachment indicators
@@ -273,6 +315,13 @@ class MessageBubble(Gtk.Box):
 
     def _on_bubble_pressed(self, *_args):
         self.set_default_timestamp_visible(not self._timestamp_visible)
+
+    def _on_body_link_activated(self, _label, uri: str):
+        try:
+            Gio.AppInfo.launch_default_for_uri(uri, None)
+        except GLib.Error:
+            pass
+        return True
 
 
 class DateSeparator(Gtk.Box):
