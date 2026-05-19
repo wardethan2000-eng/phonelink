@@ -25,6 +25,7 @@ _DEFAULTS = {
     "google_last_sync_ts": 0.0,
     "google_last_attempt_ts": 0.0,
     "hidden_conversations": {},
+    "font_scale": 1.0,
 }
 
 
@@ -83,6 +84,9 @@ class Settings:
         self._data["google_last_attempt_ts"] = float(
             self._data.get("google_last_attempt_ts", 0.0) or 0.0
         )
+        self._data["font_scale"] = float(
+            self._data.get("font_scale", 1.0) or 1.0
+        )
         raw_hidden = self._data.get("hidden_conversations", {}) or {}
         normalized_hidden: dict[str, dict[str, dict[str, int]]] = {}
         if isinstance(raw_hidden, dict):
@@ -126,6 +130,15 @@ class Settings:
         self._data["open_on_startup"] = bool(value)
         self.save()
         self._apply_autostart(bool(value))
+
+    @property
+    def font_scale(self) -> float:
+        return float(self._data.get("font_scale", 1.0))
+
+    @font_scale.setter
+    def font_scale(self, value: float):
+        self._data["font_scale"] = float(value)
+        self.save()
 
     @property
     def notifications_enabled(self) -> bool:

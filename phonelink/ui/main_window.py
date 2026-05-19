@@ -35,6 +35,29 @@ class MainWindow(Adw.ApplicationWindow):
 
         self.connect("close-request", self._on_close)
 
+        # ── Font size scaling and Zoom Gesture ───────────────────────
+        from phonelink.settings import get_settings
+        self.settings = get_settings()
+        self.current_font_scale = self.settings.font_scale
+        self.start_font_scale = 1.0
+
+        self.css_provider = Gtk.CssProvider()
+        display = Gdk.Display.get_default()
+        if display:
+            Gtk.StyleContext.add_provider_for_display(
+                display,
+                self.css_provider,
+                Gtk.STYLE_PROVIDER_PRIORITY_APPLICATION + 10,
+            )
+        self._update_font_size()
+
+        # Trackpad zoom gesture
+        self.zoom_gesture = Gtk.GestureZoom()
+        self.zoom_gesture.connect("begin", self._on_zoom_begin)
+        self.zoom_gesture.connect("scale-changed", self._on_zoom_scale_changed)
+        self.zoom_gesture.connect("end", self._on_zoom_end)
+        self.add_controller(self.zoom_gesture)
+
         # Keyboard shortcuts
         key_ctrl = Gtk.EventControllerKey()
         key_ctrl.connect("key-pressed", self._on_key_pressed)
@@ -498,10 +521,45 @@ class MainWindow(Adw.ApplicationWindow):
     def _on_key_pressed(self, controller, keyval, keycode, state):
         """Handle global keyboard shortcuts."""
         ctrl = state & Gdk.ModifierType.CONTROL_MASK
-        if ctrl and keyval == Gdk.KEY_n:
-            self._notif_toggle.set_active(not self._notif_toggle.get_active())
-            return True
+        if ctrl:
+            if keyval == Gdk.KEY_n:
+                self._notif_toggle.set_active(not self._notif_toggle.get_active())
+                return True
+            elif keyval in (Gdk.KEY_plus, Gdk.KEY_equal, Gdk.KEY_KP_Add):
+                self.current_font_scale = min(2.5, self.current_font_scale + 0.1)
+                self._update_font_size()
+                self.settings.font_scale = self.current_font_scale
+                self._show_toast(f"Zoom: {int(self.current_font_scale * 100)}%")
+                return True
+            elif keyval in (Gdk.KEY_minus, Gdk.KEY_underscore, Gdk.KEY_KP_Subtract):
+                self.current_font_scale = max(0.6, self.current_font_scale - 0.1)
+                self._update_font_size()
+                self.settings.font_scale = self.current_font_scale
+                self._show_toast(f"Zoom: {int(self.current_font_scale * 100)}%")
+                return True
+            elif keyval in (Gdk.KEY_0, Gdk.KEY_KP_0):
+                self.current_font_scale = 1.0
+                self._update_font_size()
+                self.settings.font_scale = self.current_font_scale
+                self._show_toast("Zoom: 100% (Reset)")
+                return True
         return False
+
+    def _update_font_size(self):
+        size = int(11 * self.current_font_scale)
+        css = f"window {{ font-size: {size}pt; }}"
+        self.css_provider.load_from_data(css)
+
+    def _on_zoom_begin(self, gesture, sequence):
+        self.start_font_scale = self.current_font_scale
+
+    def _on_zoom_scale_changed(self, gesture, scale):
+        self.current_font_scale = max(0.6, min(2.5, self.start_font_scale * scale))
+        self._update_font_size()
+
+    def _on_zoom_end(self, gesture, sequence):
+        self.settings.font_scale = self.current_font_scale
+        self._show_toast(f"Zoom: {int(self.current_font_scale * 100)}%")
 
     def _on_ring_phone(self, _btn):
         if not self.active_device:
