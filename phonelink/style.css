@@ -160,3 +160,18 @@ levelbar trough block {
     padding: 2px 6px;
     border-radius: 0 0 8px 8px;
 }
+
+/* ── Media Controls ────────────────────────────────────────── */
+
+.media-art-container {
+    background-color: alpha(@accent_bg_color, 0.1);
+    border-radius: 12px;
+    padding: 16px;
+    margin-bottom: 4px;
+    border: 1px solid alpha(@accent_bg_color, 0.15);
+}
+
+.media-art-icon {
+    color: @accent_bg_color;
+}
+

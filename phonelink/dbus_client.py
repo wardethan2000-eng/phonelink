@@ -252,6 +252,41 @@ class KDEConnectClient:
         )
         return result.unpack()[0] if result else ""
 
+    def send_mpris_action(self, device_id, action: str):
+        """Send a playback action (play, pause, next, previous, etc.) to the phone."""
+        self._call(
+            self._device_path(device_id) + "/mprisremote",
+            "org.kde.kdeconnect.device.mprisremote",
+            "sendAction",
+            GLib.Variant("(s)", (action,)),
+        )
+
+    def get_mpris_properties(self, device_id) -> dict:
+        """Read all MPRIS remote control properties."""
+        path = self._device_path(device_id) + "/mprisremote"
+        result = self._call(
+            path, IFACE_PROPS, "GetAll",
+            GLib.Variant("(s)", (
+                "org.kde.kdeconnect.device.mprisremote",
+            )),
+        )
+        if result:
+            return result.unpack()[0]
+        return {}
+
+    def set_mpris_volume(self, device_id, volume: int):
+        """Set phone media volume (0-100)."""
+        self._call(
+            self._device_path(device_id) + "/mprisremote",
+            IFACE_PROPS,
+            "Set",
+            GLib.Variant("(ssv)", (
+                "org.kde.kdeconnect.device.mprisremote",
+                "volume",
+                GLib.Variant("i", volume)
+            ))
+        )
+
     def share_url(self, device_id, url: str):
         """Send a URL to the device."""
         self._call(

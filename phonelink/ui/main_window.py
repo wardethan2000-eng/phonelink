@@ -164,6 +164,65 @@ class MainWindow(Adw.ApplicationWindow):
 
         header.pack_end(right_box)
 
+        # Media player quick controls popover
+        from phonelink.ui.media_controls import MediaControlsWidget
+        self._media_btn = Gtk.MenuButton()
+        self._media_btn.set_icon_name("applications-multimedia-symbolic")
+        self._media_btn.set_tooltip_text("Media Playback")
+        self._media_widget = MediaControlsWidget(client=self.client)
+        self._media_widget.connect("media-state-changed", self._on_media_state_changed)
+        
+        media_popover = Gtk.Popover()
+        media_popover.set_child(self._media_widget)
+        self._media_btn.set_popover(media_popover)
+        self._media_btn.set_visible(False)
+        header.pack_end(self._media_btn)
+
+        # Clipboard quick actions popover
+        self._clipboard_quick_btn = Gtk.MenuButton()
+        self._clipboard_quick_btn.set_icon_name("edit-paste-symbolic")
+        self._clipboard_quick_btn.set_tooltip_text("Clipboard Quick Actions")
+        
+        clip_popover = Gtk.Popover()
+        clip_box = Gtk.Box(orientation=Gtk.Orientation.VERTICAL, spacing=4)
+        clip_box.set_margin_top(6)
+        clip_box.set_margin_bottom(6)
+        clip_box.set_margin_start(6)
+        clip_box.set_margin_end(6)
+        clip_popover.set_child(clip_box)
+        
+        push_clip_btn = Gtk.Button()
+        push_clip_btn.add_css_class("flat")
+        push_clip_row = Gtk.Box(orientation=Gtk.Orientation.HORIZONTAL, spacing=8)
+        push_clip_row.append(Gtk.Image.new_from_icon_name("go-up-symbolic"))
+        push_clip_row.append(Gtk.Label(label="Push Clipboard to Phone"))
+        push_clip_btn.set_child(push_clip_row)
+        push_clip_btn.connect("clicked", self._on_push_clipboard_quick)
+        clip_box.append(push_clip_btn)
+        
+        pull_clip_btn = Gtk.Button()
+        pull_clip_btn.add_css_class("flat")
+        pull_clip_row = Gtk.Box(orientation=Gtk.Orientation.HORIZONTAL, spacing=8)
+        pull_clip_row.append(Gtk.Image.new_from_icon_name("go-down-symbolic"))
+        pull_clip_row.append(Gtk.Label(label="Pull Clipboard from Phone"))
+        pull_clip_btn.set_child(pull_clip_row)
+        pull_clip_btn.connect("clicked", self._on_pull_clipboard_quick)
+        clip_box.append(pull_clip_btn)
+        
+        clip_box.append(Gtk.Separator(orientation=Gtk.Orientation.HORIZONTAL))
+        
+        open_history_btn = Gtk.Button()
+        open_history_btn.add_css_class("flat")
+        open_history_row = Gtk.Box(orientation=Gtk.Orientation.HORIZONTAL, spacing=8)
+        open_history_row.append(Gtk.Image.new_from_icon_name("document-open-recent-symbolic"))
+        open_history_row.append(Gtk.Label(label="Open Clipboard History"))
+        open_history_btn.set_child(open_history_row)
+        open_history_btn.connect("clicked", self._on_open_clipboard_history)
+        clip_box.append(open_history_btn)
+        
+        self._clipboard_quick_btn.set_popover(clip_popover)
+        header.pack_end(self._clipboard_quick_btn)
+
         find_btn = Gtk.Button(icon_name="find-location-symbolic")
         find_btn.set_tooltip_text("Find Phone — makes your phone ring via KDE Connect")
         find_btn.connect("clicked", self._on_ring_phone)
@@ -323,7 +382,7 @@ class MainWindow(Adw.ApplicationWindow):
 
         # Update panels with active device
         for panel in (self.sms_panel, self.notif_panel, self.files_panel,
-                      self.clipboard_panel):
+                      self.clipboard_panel, self._media_widget):
             panel.set_device(self.active_device)
 
     def _update_device_header(self):
@@ -398,7 +457,7 @@ class MainWindow(Adw.ApplicationWindow):
             self.active_device = None
             if self._ui_built:
                 for panel in (self.sms_panel, self.notif_panel, self.files_panel,
-                              self.clipboard_panel):
+                              self.clipboard_panel, self._media_widget):
                     panel.set_device(None)
                 self._update_device_header()
 
@@ -468,7 +527,7 @@ class MainWindow(Adw.ApplicationWindow):
             self._update_device_popover()
             self._subscribe_share_signal()
             for panel in (self.sms_panel, self.notif_panel, self.files_panel,
-                          self.clipboard_panel):
+                          self.clipboard_panel, self._media_widget):
                 panel.set_device(self.active_device)
 
     # ── Drag-and-drop file transfer ───────────────────────────────
@@ -567,6 +626,53 @@ class MainWindow(Adw.ApplicationWindow):
             return
         self.client.ring_device(self.active_device.id)
         self._show_toast("Finding your phone…")
+
+    def _on_media_state_changed(self, widget, active: bool):
+        self._media_btn.set_visible(active)
+
+    def _on_push_clipboard_quick(self, _btn):
+        self._clipboard_quick_btn.get_popover().popdown()
+        if not self.active_device or not self.active_device.reachable:
+            self._show_toast("No connected device")
+            return
+        clipboard = Gdk.Display.get_default().get_clipboard()
+        
+        def on_text_read(clip, result):
+            try:
+                text = clip.read_text_finish(result)
+                if text:
+                    self.client.send_clipboard(self.active_device.id, text)
+                    self._show_toast("Pushed clipboard to phone")
+                    if hasattr(self.clipboard_panel, "_add_entry"):
+                        self.clipboard_panel._add_entry(text, "pc")
+                else:
+                    self._show_toast("No text found in clipboard")
+            except Exception as e:
+                self._show_toast(f"Failed to read clipboard: {e}")
+
+        clipboard.read_text_async(None, on_text_read)
+
+    def _on_pull_clipboard_quick(self, _btn):
+        self._clipboard_quick_btn.get_popover().popdown()
+        if not self.active_device or not self.active_device.reachable:
+            self._show_toast("No connected device")
+            return
+        try:
+            text = self.client.get_clipboard_content(self.active_device.id)
+            if text:
+                clipboard = Gdk.Display.get_default().get_clipboard()
+                clipboard.set_text(text)
+                self._show_toast("Pulled clipboard from phone")
+                if hasattr(self.clipboard_panel, "_add_entry"):
+                    self.clipboard_panel._add_entry(text, "phone")
+            else:
+                self._show_toast("Phone clipboard is empty")
+        except Exception as e:
+            self._show_toast(f"Failed to pull clipboard: {e}")
+
+    def _on_open_clipboard_history(self, _btn):
+        self._clipboard_quick_btn.get_popover().popdown()
+        self.stack.set_visible_child_name("clipboard")
 
     def _show_toast(self, message: str):
         toast = Adw.Toast.new(message)
