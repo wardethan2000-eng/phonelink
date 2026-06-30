@@ -442,20 +442,13 @@ def resolve_name(contact_map: dict[str, str], address: str) -> str:
 
 # ── Notification-based contact harvesting ──────────────────────────
 
-def harvest_contacts_from_notifications(client, device_id: str,
-                                         conversations: dict) -> int:
-    """Scan active notifications for SMS contact names and save them.
+def build_body_to_address_map(conversations: dict) -> dict[str, str]:
+    """Reverse lookup of received-message body -> conversation address.
 
-    Matches "Messages" app notifications to conversations by message body
-    to learn the mapping of phone number -> contact name.
-
-    Returns number of new contacts discovered.
+    Built on the main thread from in-memory conversations so the (slow)
+    notification harvest can run on a worker thread without touching the
+    shared conversation store.
     """
-    notif_ids = client.get_active_notification_ids(device_id)
-    if not notif_ids:
-        return 0
-
-    # Build a reverse lookup: message body -> address (from received msgs only)
     body_to_addr: dict[str, str] = {}
     for conv in conversations.values():
         for msg in conv.messages:
@@ -463,6 +456,23 @@ def harvest_contacts_from_notifications(client, device_id: str,
                 body_to_addr[msg.body.strip()] = conv.address
         if conv.last_message:
             body_to_addr[conv.last_message.strip()] = conv.address
+    return body_to_addr
+
+
+def harvest_contacts_from_notifications(client, device_id: str,
+                                         body_to_addr: dict) -> int:
+    """Scan active notifications for SMS contact names and save them.
+
+    Matches "Messages" app notifications to conversations by message body
+    (using a pre-built ``body_to_addr`` map) to learn the mapping of phone
+    number -> contact name.  Only touches D-Bus and the local JSON store, so
+    it is safe to run on a worker thread.
+
+    Returns number of new contacts discovered.
+    """
+    notif_ids = client.get_active_notification_ids(device_id)
+    if not notif_ids:
+        return 0
 
     existing = _load_local_contacts()
     new_count = 0
@@ -513,6 +523,49 @@ def harvest_contact_from_notification_signal(
     """
     try:
         props = client.get_notification_properties(device_id, notif_id)
+        app = _clean_text(props.get("appName", ""))
+        title = _clean_text(props.get("title", ""))
+
+        if not _is_messaging_app(app) or not title:
+            return None
+        if title == "(No title)" or _looks_like_phone_number(title):
+            return None
+
+        msg_text = _notification_message_text(props)
+        if not msg_text:
+            return None
+
+        for conv in conversations.values():
+            if conv.last_message and (
+                conv.last_message.strip() == msg_text
+                or msg_text.startswith(conv.last_message.strip()[:30])
+            ):
+                norm = _normalize_phone(conv.address)
+                if norm and contact_map.get(norm) != title:
+                    save_contact(conv.address, title)
+                    return (norm, title)
+            for msg in conv.messages:
+                if msg.msg_type == 1 and msg.body and msg.body.strip() == msg_text:
+                    norm = _normalize_phone(conv.address)
+                    if norm and contact_map.get(norm) != title:
+                        save_contact(conv.address, title)
+                        return (norm, title)
+    except Exception:
+        pass
+    return None
+
+
+def match_contact_from_notification_props(
+    props: dict, conversations: dict, contact_map: dict[str, str]
+) -> tuple[str, str] | None:
+    """Pure variant of the notification harvest for already-fetched props.
+
+    Takes a notification's properties (fetched off-thread) and matches them
+    against the in-memory conversations.  Runs on the main thread, so it may
+    read the live conversation store directly.  Returns
+    ``(normalized_phone, contact_name)`` if a new mapping was found.
+    """
+    try:
         app = _clean_text(props.get("appName", ""))
         title = _clean_text(props.get("title", ""))
 

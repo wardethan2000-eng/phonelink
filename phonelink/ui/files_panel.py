@@ -218,6 +218,8 @@ class FilesPanel(Gtk.Box):
         self._mount_in_progress = False
         self._mount_device_id: str | None = None
         self._photo_scan_generation = 0
+        self._sftp_directories: dict[str, str] = {}  # cached SFTP dirs (from worker)
+        self._dir_scan_generation = 0  # guards async directory listings
 
         # ── Main stack: status vs content ──────────────────────────
         self._outer_stack = Gtk.Stack()
@@ -538,27 +540,38 @@ class FilesPanel(Gtk.Box):
     # ── Mount management ───────────────────────────────────────────
 
     def _auto_mount_and_load(self, device_id: str):
-        """Auto-mount the phone if needed and load photos."""
-        self._is_mounted = self.client.sftp_is_mounted(device_id)
-        self._mount_point = self.client.sftp_mount_point(device_id)
-
-        if not self._is_mounted:
-            self._start_mount(device_id)
-            return
-
-        self._resolve_storage_base(device_id)
-        self._update_mount_ui()
-        self._build_shortcuts(device_id)
-        if self._is_mounted and self._mount_point:
-            self._load_recent_photos()
+        """Auto-mount the phone if needed and load photos (off the main thread)."""
+        self.client.submit(
+            self.client.fetch_sftp_state,
+            device_id,
+            on_result=lambda state: self._apply_sftp_state(
+                device_id, state, load_photos=True
+            ),
+        )
 
     def _reconcile_mount_state(self, device_id: str):
         """Keep the UI in sync when KDE Connect mounts/unmounts outside signals."""
-        mounted = self.client.sftp_is_mounted(device_id)
-        mount_point = self.client.sftp_mount_point(device_id)
+        self.client.submit(
+            self.client.fetch_sftp_state,
+            device_id,
+            on_result=lambda state: self._apply_sftp_state(
+                device_id, state, load_photos_if_photo_view=True
+            ),
+        )
+
+    def _apply_sftp_state(self, device_id: str, state: dict, *,
+                          load_photos: bool = False,
+                          load_photos_if_photo_view: bool = False):
+        """Apply a worker-fetched SFTP state snapshot on the main thread."""
+        if not self._device or self._device.id != device_id:
+            return
+
+        mounted = bool(state.get("mounted"))
+        mount_point = state.get("mount_point") or ""
         mount_changed = mounted != self._is_mounted or mount_point != self._mount_point
         self._is_mounted = mounted
         self._mount_point = mount_point
+        self._sftp_directories = state.get("directories") or {}
 
         if not mounted or not mount_point:
             self._update_mount_ui()
@@ -569,8 +582,14 @@ class FilesPanel(Gtk.Box):
             self._resolve_storage_base(device_id)
             self._update_mount_ui()
             self._build_shortcuts(device_id)
+        self._outer_stack.set_visible_child_name("content")
 
-        if self._view_stack.get_visible_child_name() == "photos" and not self._photo_tiles:
+        if load_photos:
+            self._load_recent_photos()
+        elif load_photos_if_photo_view and (
+            self._view_stack.get_visible_child_name() == "photos"
+            and not self._photo_tiles
+        ):
             self._load_recent_photos()
 
     def _start_mount(self, device_id: str):
@@ -581,37 +600,48 @@ class FilesPanel(Gtk.Box):
         self._outer_stack.set_visible_child_name("mounting")
         self._mounting_spinner.start()
 
-        def do_mount():
-            ok = self.client.sftp_mount_and_wait(device_id)
-            if not ok:
-                ok = self.client.sftp_start_browsing(device_id)
-                if ok:
-                    for _attempt in range(10):
-                        if self.client.sftp_is_mounted(device_id):
-                            break
-                        time.sleep(0.5)
-                    ok = self.client.sftp_is_mounted(device_id)
-            GLib.idle_add(self._on_mount_finished, device_id, ok)
+        self.client.submit(
+            self._mount_worker,
+            device_id,
+            on_result=lambda result: self._on_mount_finished(device_id, result),
+        )
 
-        t = threading.Thread(target=do_mount, daemon=True)
-        t.start()
+    def _mount_worker(self, device_id: str) -> dict:
+        """Worker thread: perform the (blocking) mount and gather final state."""
+        ok = self.client.sftp_mount_and_wait(device_id)
+        if not ok:
+            ok = self.client.sftp_start_browsing(device_id)
+            if ok:
+                for _attempt in range(10):
+                    if self.client.sftp_is_mounted(device_id):
+                        break
+                    time.sleep(0.5)
+                ok = self.client.sftp_is_mounted(device_id)
+        result = {"ok": ok}
+        if ok:
+            result.update(self.client.fetch_sftp_state(device_id))
+        else:
+            result["error"] = self.client.sftp_get_mount_error(device_id)
+        return result
 
-    def _on_mount_finished(self, device_id: str, ok: bool):
-        """Called on main thread after background mount completes."""
+    def _on_mount_finished(self, device_id: str, result: dict):
+        """Called on main thread after the background mount completes."""
         if self._mount_device_id == device_id:
             self._mount_in_progress = False
             self._mount_device_id = None
         if not self._device or self._device.id != device_id:
-            return GLib.SOURCE_REMOVE
+            return
 
         self._mounting_spinner.stop()
-        if ok:
+        if result.get("ok"):
             self._is_mounted = True
-            self._mount_point = self.client.sftp_mount_point(device_id)
+            self._mount_point = result.get("mount_point") or ""
+            self._sftp_directories = result.get("directories") or {}
         else:
             self._is_mounted = False
             self._mount_point = ""
-            err = self.client.sftp_get_mount_error(device_id)
+            self._sftp_directories = {}
+            err = result.get("error") or ""
             self._photo_status.set_label(f"Mount failed: {err}")
             self._status_bar.set_label(f"Mount failed: {err}")
 
@@ -621,33 +651,31 @@ class FilesPanel(Gtk.Box):
         self._outer_stack.set_visible_child_name("content")
         if self._is_mounted and self._mount_point:
             self._load_recent_photos()
-        return GLib.SOURCE_REMOVE
 
     def _refresh_mount_state(self):
         if not self._device:
             return GLib.SOURCE_REMOVE
-        self._is_mounted = self.client.sftp_is_mounted(self._device.id)
-        self._mount_point = self.client.sftp_mount_point(self._device.id)
-        if not self._is_mounted:
-            self._update_mount_ui()
-            self._build_shortcuts(self._device.id)
-            self._start_mount(self._device.id)
-            return GLib.SOURCE_REMOVE
-        self._resolve_storage_base(self._device.id)
-        self._update_mount_ui()
-        self._build_shortcuts(self._device.id)
-        if self._is_mounted and self._mount_point:
-            self._load_recent_photos()
+        device_id = self._device.id
+        self.client.submit(
+            self.client.fetch_sftp_state,
+            device_id,
+            on_result=lambda state: self._apply_sftp_state(
+                device_id, state, load_photos=bool(state.get("mounted"))
+            ),
+        )
         return GLib.SOURCE_REMOVE
 
     def _resolve_storage_base(self, device_id: str):
-        """Find the actual accessible base dir (e.g. .../storage/emulated/0)."""
+        """Find the actual accessible base dir (e.g. .../storage/emulated/0).
+
+        Uses the directory list cached by the worker so it never blocks.
+        """
         self._storage_base = ""
         if not self._mount_point:
             return
         dirs = [
             (path, _directory_label(label))
-            for path, label in self.client.sftp_get_directories(device_id).items()
+            for path, label in self._sftp_directories.items()
         ]
         if dirs:
             self._storage_base = sorted(dirs, key=_directory_sort_key)[0][0]
@@ -679,32 +707,16 @@ class FilesPanel(Gtk.Box):
         if not self._device:
             return
         if self._is_mounted:
-            self.client.sftp_unmount(self._device.id)
+            device_id = self._device.id
+            self.client.submit(self.client.sftp_unmount, device_id)
             self._is_mounted = False
             self._current_path = ""
             self._update_mount_ui()
         else:
             self._status_bar.set_label("Mounting…")
             self._photo_status.set_label("Mounting…")
-            ok = self.client.sftp_mount_and_wait(self._device.id)
-            if ok:
-                self._refresh_mount_state()
-                self._status_bar.set_label("Mounted successfully")
-            else:
-                err = self.client.sftp_get_mount_error(self._device.id)
-                self._status_bar.set_label(f"Mount failed: {err}")
-                self._photo_status.set_label(f"Mount failed: {err}")
-                self._file_empty.set_description(
-                    f"Mount failed: {err}\n\n"
-                    "Grant \"Files and media\" permission to KDE Connect\n"
-                    "in your phone's Settings → Apps → KDE Connect → Permissions.\n\n"
-                    "You can still send files using the \"Send File to Phone\" button."
-                )
-                self._photo_empty.set_description(
-                    f"Mount failed: {err}\n\n"
-                    "Grant \"Files and media\" permission to KDE Connect\n"
-                    "on your phone to see photos."
-                )
+            # Reuse the async mount path so the 30 s mount never blocks the UI.
+            self._start_mount(self._device.id)
 
     # ── Photo grid ─────────────────────────────────────────────────
 
@@ -997,6 +1009,17 @@ class FilesPanel(Gtk.Box):
         dest_dir = folder.get_path()
         if not dest_dir:
             return
+        status_label.set_label("Saving…")
+        # Copying pulls bytes over the SFTP mount — do it off the main thread.
+        self.client.submit(
+            self._copy_files_worker,
+            list(paths),
+            dest_dir,
+            on_result=lambda res: self._on_files_saved(res, dest_dir, status_label),
+        )
+
+    @staticmethod
+    def _copy_files_worker(paths: list[str], dest_dir: str) -> dict:
         saved = 0
         for src in paths:
             name = os.path.basename(src)
@@ -1010,12 +1033,18 @@ class FilesPanel(Gtk.Box):
             try:
                 shutil.copy2(src, dest)
                 saved += 1
-            except OSError as e:
-                status_label.set_label(f"Error saving {name}: {e}")
-                return
+            except OSError as exc:
+                return {"saved": saved, "error": f"Error saving {name}: {exc}"}
+        return {"saved": saved}
+
+    def _on_files_saved(self, result: dict, dest_dir: str, status_label: Gtk.Label):
+        if result.get("error"):
+            status_label.set_label(result["error"])
+            return
         for t in self._photo_tiles:
             t.set_selected(False)
         self._update_selection_buttons()
+        saved = result.get("saved", 0)
         status_label.set_label(f"Saved {saved} file{'s' if saved != 1 else ''} to {dest_dir}")
 
     # ── Shortcuts sidebar ──────────────────────────────────────────
@@ -1044,10 +1073,10 @@ class FilesPanel(Gtk.Box):
         row._shortcut_path = "__photos__"
         self._shortcuts_list.append(row)
 
-        # Phone directories
+        # Phone directories (from the worker-cached list — no blocking call)
         dirs = [
             (path, _directory_label(label))
-            for path, label in self.client.sftp_get_directories(device_id).items()
+            for path, label in self._sftp_directories.items()
         ]
         for path, label in sorted(dirs, key=_directory_sort_key):
             row = Gtk.ListBoxRow()
@@ -1133,19 +1162,30 @@ class FilesPanel(Gtk.Box):
 
     def _load_directory(self, path: str):
         self._clear_file_list()
+        self._dir_scan_generation += 1
+        generation = self._dir_scan_generation
+        self._status_bar.set_label("Loading…")
+        # Listing a phone directory hits the SFTP FUSE mount, which can stall.
+        # Do it on a worker thread and render the rows when it returns.
+        self.client.submit(
+            self._scan_directory_worker,
+            path,
+            on_result=lambda result: self._apply_directory_listing(
+                path, generation, result
+            ),
+        )
 
+    @staticmethod
+    def _scan_directory_worker(path: str) -> dict:
+        """Worker thread: list a directory (over SFTP) into plain data."""
         if not os.path.isdir(path):
-            self._status_bar.set_label(f"Cannot access: {path}")
-            return
-
+            return {"error": f"Cannot access: {path}"}
         try:
             entries = sorted(os.listdir(path))
         except PermissionError:
-            self._status_bar.set_label("Permission denied")
-            return
-        except OSError as e:
-            self._status_bar.set_label(f"Error: {e}")
-            return
+            return {"error": "Permission denied"}
+        except OSError as exc:
+            return {"error": f"Error: {exc}"}
 
         dirs = []
         files = []
@@ -1162,7 +1202,20 @@ class FilesPanel(Gtk.Box):
                 dirs.append((name, full, True, 0))
             else:
                 files.append((name, full, False, size))
+        return {"dirs": dirs, "files": files}
 
+    def _apply_directory_listing(self, path: str, generation: int, result: dict):
+        # Ignore stale results from a directory the user has navigated away from.
+        if generation != self._dir_scan_generation or self._current_path != path:
+            return
+
+        error = result.get("error")
+        if error:
+            self._status_bar.set_label(error)
+            return
+
+        dirs = result.get("dirs", [])
+        files = result.get("files", [])
         for name, full, is_dir, size in dirs + files:
             row_widget = FileRow(name, full, is_dir, size)
             row = Gtk.ListBoxRow()
@@ -1288,9 +1341,9 @@ class FilesPanel(Gtk.Box):
                 paths.append(path)
 
         if len(paths) == 1:
-            self.client.share_file(self._device.id, paths[0])
+            self.client.submit(self.client.share_file, self._device.id, paths[0])
         elif paths:
-            self.client.share_files(self._device.id, paths)
+            self.client.submit(self.client.share_files, self._device.id, paths)
 
         names = [os.path.basename(path) for path in paths]
         self._status_bar.set_label(f"Sending: {', '.join(names)}")

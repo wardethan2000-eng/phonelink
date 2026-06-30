@@ -290,12 +290,19 @@ class NotificationsPanel(Gtk.Box):
                 self._signal_ids.append(sid)
 
     def _load_notifications(self, device_id: str):
+        # Fetch active notifications (1 + N D-Bus calls) on a worker thread.
+        self.client.submit(
+            self.client.fetch_active_notifications,
+            device_id,
+            on_result=lambda entries: self._apply_notifications(device_id, entries),
+        )
+
+    def _apply_notifications(self, device_id: str, entries: list):
+        if not self._device or self._device.id != device_id:
+            return
         self._notifications.clear()
-        ids = self.client.get_active_notification_ids(device_id)
-        for nid in ids:
-            props = self.client.get_notification_properties(device_id, nid)
-            if props:
-                self._notifications[nid] = Notification.from_properties(nid, props)
+        for nid, props in entries:
+            self._notifications[nid] = Notification.from_properties(nid, props)
         self._rebuild_list()
 
     def _on_notif_posted(self, conn, sender, path, iface, signal, params):
@@ -316,7 +323,17 @@ class NotificationsPanel(Gtk.Box):
     def _add_or_update(self, public_id: str):
         if not self._device:
             return
-        props = self.client.get_notification_properties(self._device.id, public_id)
+        device_id = self._device.id
+        self.client.submit(
+            self.client.get_notification_properties,
+            device_id,
+            public_id,
+            on_result=lambda props: self._apply_one(device_id, public_id, props),
+        )
+
+    def _apply_one(self, device_id: str, public_id: str, props: dict):
+        if not self._device or self._device.id != device_id:
+            return
         if props:
             self._notifications[public_id] = Notification.from_properties(public_id, props)
             self._rebuild_list()
@@ -379,7 +396,9 @@ class NotificationsPanel(Gtk.Box):
 
     def _on_dismiss_clicked(self, _btn, public_id: str):
         if self._device:
-            self.client.dismiss_notification(self._device.id, public_id)
+            self.client.submit(
+                self.client.dismiss_notification, self._device.id, public_id
+            )
         self._remove_one(public_id)
 
     def _on_reply_clicked(self, _btn, public_id: str, entry: Gtk.Entry):
@@ -394,7 +413,9 @@ class NotificationsPanel(Gtk.Box):
             return
         notif = self._notifications.get(public_id)
         if notif and notif.reply_id:
-            self.client.reply_to_notification(self._device.id, public_id, text)
+            self.client.submit(
+                self.client.reply_to_notification, self._device.id, public_id, text
+            )
         entry.set_text("")
 
     def _on_refresh(self, _btn):
@@ -404,8 +425,17 @@ class NotificationsPanel(Gtk.Box):
     def _on_dismiss_all(self, _btn):
         if not self._device:
             return
-        for nid in list(self._notifications.keys()):
-            notif = self._notifications.get(nid)
-            if notif and notif.dismissable:
-                self.client.dismiss_notification(self._device.id, nid)
+        device_id = self._device.id
+        dismissable_ids = [
+            nid for nid, notif in self._notifications.items()
+            if notif and notif.dismissable
+        ]
+        if dismissable_ids:
+            self.client.submit(
+                self._dismiss_many, device_id, dismissable_ids
+            )
         self._clear_all()
+
+    def _dismiss_many(self, device_id: str, ids: list):
+        for nid in ids:
+            self.client.dismiss_notification(device_id, nid)

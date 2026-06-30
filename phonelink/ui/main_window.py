@@ -28,6 +28,8 @@ class MainWindow(Adw.ApplicationWindow):
         self._ui_built = False
         self._daemon_was_available = False
         self._share_signal_id = None
+        self._devices_refresh_inflight = False
+        self._devices_refresh_pending = False
 
         self.set_title("Phone Link")
         self.set_default_size(960, 640)
@@ -254,20 +256,30 @@ class MainWindow(Adw.ApplicationWindow):
     # ── Data refresh ───────────────────────────────────────────────
 
     def _refresh_devices(self):
-        device_ids = self.client.get_device_ids()
-        devices = []
-        for did in device_ids:
-            dev = Device(
-                id=did,
-                name=self.client.get_device_name(did),
-                type=self.client.get_device_type(did),
-                reachable=self.client.is_device_reachable(did),
-                paired=self.client.is_device_paired(did),
-                battery_charge=self.client.get_battery_charge(did),
-                battery_charging=self.client.is_battery_charging(did),
-            )
-            devices.append(dev)
+        """Refresh device state off the main thread; apply on the UI thread.
 
+        Coalesces overlapping refreshes so a burst of signals/polls results in
+        at most one in-flight worker job plus one queued follow-up.
+        """
+        if self._devices_refresh_inflight:
+            self._devices_refresh_pending = True
+            return
+        self._devices_refresh_inflight = True
+        self.client.submit(
+            self.client.fetch_devices,
+            on_result=self._apply_devices,
+            on_error=self._on_devices_error,
+        )
+
+    def _on_devices_error(self, exc):
+        self._devices_refresh_inflight = False
+        print(f"[phonelink] device refresh failed: {exc}")
+        if self._devices_refresh_pending:
+            self._devices_refresh_pending = False
+            self._refresh_devices()
+
+    def _apply_devices(self, devices):
+        self._devices_refresh_inflight = False
         self._all_devices = devices
 
         # Pick the best device to display (keep current if still valid)
@@ -302,6 +314,10 @@ class MainWindow(Adw.ApplicationWindow):
         for panel in (self.sms_panel, self.notif_panel, self.files_panel,
                       self.clipboard_panel):
             panel.set_device(self.active_device)
+
+        if self._devices_refresh_pending:
+            self._devices_refresh_pending = False
+            self._refresh_devices()
 
     def _update_device_header(self):
         dev = self.active_device
@@ -355,12 +371,18 @@ class MainWindow(Adw.ApplicationWindow):
         GLib.idle_add(self._refresh_devices)
 
     def _on_poll(self):
-        # Check if daemon is (still) available
+        # Check daemon availability off the main thread so the poll never
+        # freezes the UI (the D-Bus calls can block for seconds).
+        self.client.submit(self._poll_check_daemon, on_result=self._apply_poll)
+        return GLib.SOURCE_CONTINUE
+
+    def _poll_check_daemon(self) -> bool:
+        """Worker-thread daemon liveness probe (reconnects the bus if needed)."""
         if not self.client.bus:
             self.client.connect()
+        return self.client.is_daemon_available() if self.client.bus else False
 
-        daemon_ok = self.client.is_daemon_available() if self.client.bus else False
-
+    def _apply_poll(self, daemon_ok: bool):
         if daemon_ok and not self._daemon_was_available:
             # Daemon just appeared — build the UI if needed
             self._daemon_was_available = True
@@ -378,8 +400,6 @@ class MainWindow(Adw.ApplicationWindow):
                               self.clipboard_panel):
                     panel.set_device(None)
                 self._update_device_header()
-
-        return GLib.SOURCE_CONTINUE
 
     # ── Device switcher popover ──────────────────────────────────
 

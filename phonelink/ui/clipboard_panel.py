@@ -195,7 +195,7 @@ class ClipboardPanel(Gtk.Box):
         if not text or not self._device:
             return
         self._last_clipboard_text = text
-        self.client.send_clipboard(self._device.id, text)
+        self.client.submit(self.client.send_clipboard, self._device.id, text)
         self._add_entry(text, "pc")
 
     def _on_pull_clipboard(self, _btn):

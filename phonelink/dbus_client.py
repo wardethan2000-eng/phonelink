@@ -12,6 +12,8 @@ gi.require_version("Gio", "2.0")
 gi.require_version("GLib", "2.0")
 from gi.repository import Gio, GLib
 
+from phonelink.async_bridge import AsyncBridge
+
 # ── D-Bus constants ────────────────────────────────────────────────
 BUS_NAME = "org.kde.kdeconnect"
 DAEMON_PATH = "/modules/kdeconnect"
@@ -48,6 +50,19 @@ class KDEConnectClient:
         self.bus: Gio.DBusConnection | None = None
         self._subscriptions: list[int] = []
         self._method_support: dict[tuple[str, str, str], bool] = {}
+        self.bridge = AsyncBridge()
+
+    # ── Async dispatch ─────────────────────────────────────────────
+
+    def submit(self, func, *args, on_result=None, on_error=None, **kwargs):
+        """Run a (usually blocking) client call on a worker thread.
+
+        ``on_result`` / ``on_error`` are invoked on the GTK main thread.  See
+        :class:`phonelink.async_bridge.AsyncBridge` for the full contract.
+        """
+        self.bridge.submit(
+            func, *args, on_result=on_result, on_error=on_error, **kwargs
+        )
 
     # ── Connection ─────────────────────────────────────────────────
 
@@ -177,6 +192,30 @@ class KDEConnectClient:
             "(as)",
         )
         return list(result.unpack()[0]) if result else []
+
+    def fetch_devices(self) -> list:
+        """Gather full state for every known device (worker-thread friendly).
+
+        Performs all the per-device property reads in one call so the whole
+        refresh can run on a worker thread and the UI only touches the
+        resulting :class:`~phonelink.models.Device` list on the main thread.
+        """
+        from phonelink.models import Device
+
+        devices = []
+        for did in self.get_device_ids():
+            devices.append(
+                Device(
+                    id=did,
+                    name=self.get_device_name(did),
+                    type=self.get_device_type(did),
+                    reachable=self.is_device_reachable(did),
+                    paired=self.is_device_paired(did),
+                    battery_charge=self.get_battery_charge(did),
+                    battery_charging=self.is_battery_charging(did),
+                )
+            )
+        return devices
 
     # ── Device properties ──────────────────────────────────────────
 
@@ -455,6 +494,21 @@ class KDEConnectClient:
         )
         return result.unpack()[0] if result else ""
 
+    def fetch_sftp_state(self, device_id) -> dict:
+        """Gather mount status, mount point, and exposed directories at once.
+
+        Designed to run on a worker thread so the Files panel never blocks the
+        UI on these SFTP D-Bus reads.
+        """
+        mounted = self.sftp_is_mounted(device_id)
+        mount_point = self.sftp_mount_point(device_id)
+        directories = self.sftp_get_directories(device_id) if mounted else {}
+        return {
+            "mounted": mounted,
+            "mount_point": mount_point,
+            "directories": directories,
+        }
+
     def sftp_get_directories(self, device_id) -> dict[str, str]:
         result = self._call(
             self._device_path(device_id) + "/sftp",
@@ -487,6 +541,19 @@ class KDEConnectClient:
         if result:
             return list(result.unpack()[0])
         return []
+
+    def fetch_active_notifications(self, device_id) -> list:
+        """Return ``[(notif_id, properties), …]`` for all active notifications.
+
+        Bundles the ``activeNotifications`` call plus the per-notification
+        ``GetAll`` reads so the whole load runs in one worker job.
+        """
+        result = []
+        for nid in self.get_active_notification_ids(device_id):
+            props = self.get_notification_properties(device_id, nid)
+            if props:
+                result.append((nid, props))
+        return result
 
     def get_notification_properties(self, device_id, notif_id: str) -> dict:
         """Read all properties of a notification object."""
@@ -546,8 +613,9 @@ class KDEConnectClient:
         return sid
 
     def cleanup(self):
-        """Unsubscribe from all signals."""
+        """Unsubscribe from all signals and stop the worker pool."""
         if self.bus:
             for sid in self._subscriptions:
                 self.bus.signal_unsubscribe(sid)
         self._subscriptions.clear()
+        self.bridge.shutdown()
