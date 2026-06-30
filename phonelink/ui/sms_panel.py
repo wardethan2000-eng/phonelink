@@ -28,6 +28,7 @@ from phonelink.contacts import (
 )
 from phonelink.models import Conversation, SmsMessage
 from phonelink.settings import get_settings
+from phonelink.store import get_message_store
 from phonelink.ui.conversation_list import ConversationList
 from phonelink.ui.message_thread import MessageThread
 
@@ -144,6 +145,7 @@ class SmsPanel(Gtk.Box):
         super().__init__(orientation=Gtk.Orientation.VERTICAL)
         self.client = client
         self._settings = get_settings()
+        self._store = get_message_store()
         self._device = None
         self._conversations: dict[int, Conversation] = {}  # thread_id → Conversation
         self._thread_redirects: dict[int, int] = {}  # secondary thread_id → primary thread_id
@@ -246,6 +248,7 @@ class SmsPanel(Gtk.Box):
             self._thread.show_empty()
             self._active_thread_id = None
             self._load_contacts(device.id)
+            self._load_cached_conversations(device.id)
             self._subscribe_signals(device.id)
             self._request_contact_sync(device.id)
             self._cancel_all_conversations_refresh()
@@ -269,6 +272,26 @@ class SmsPanel(Gtk.Box):
         """Refresh the saved contact map for the active device."""
         self._contact_map = load_contact_map(device_id)
         self._conv_list.set_contact_map(self._contact_map)
+
+    def _load_cached_conversations(self, device_id: str):
+        """Show persisted history immediately, before the daemon responds."""
+        try:
+            cached = self._store.load_conversations(device_id)
+        except Exception as exc:  # noqa: BLE001 — never block startup on the cache
+            print(f"[phonelink] failed to load cached conversations: {exc}")
+            return
+        if not cached:
+            return
+        self._conversations = cached
+        # Refine persisted display names against the current contact map.
+        for conv in self._conversations.values():
+            if conv.is_group:
+                conv.display_name = ", ".join(
+                    resolve_name(self._contact_map, a) for a in conv.addresses
+                )
+            else:
+                conv.display_name = resolve_name(self._contact_map, conv.address)
+        self._refresh_conversation_list(force_rebuild=True)
 
     def _request_contact_sync(self, device_id: str):
         """Kick off KDE Connect contact sync so names can populate automatically."""
@@ -332,6 +355,8 @@ class SmsPanel(Gtk.Box):
                 continue
             self._conversations.pop(thread_id, None)
             removed_ids.add(thread_id)
+            if self._device:
+                self._store.delete_conversation(self._device.id, thread_id)
 
         if not removed_ids:
             return
@@ -1118,6 +1143,8 @@ class SmsPanel(Gtk.Box):
         existing_uids = {m.uid for m in conv.messages}
         if msg.uid and msg.uid not in existing_uids:
             conv.messages.append(msg)
+            if self._device:
+                self._store.upsert_message(self._device.id, conv.thread_id, msg)
 
         # Update conversation metadata if this is the newest message
         if msg.date >= conv.last_date:
@@ -1137,8 +1164,14 @@ class SmsPanel(Gtk.Box):
                 conv.is_read = False
                 self._read_thread_ids.discard(msg.thread_id)
 
+        # Persist the (possibly updated) conversation metadata.
+        if self._device:
+            self._store.upsert_conversation(self._device.id, conv)
+
     def _remove_conversation(self, thread_id):
         self._conversations.pop(thread_id, None)
+        if self._device:
+            self._store.delete_conversation(self._device.id, thread_id)
         if self._active_thread_id == thread_id:
             self._thread.show_empty()
             self._active_thread_id = None
@@ -1162,6 +1195,9 @@ class SmsPanel(Gtk.Box):
             else:
                 new_name = resolve_name(self._contact_map, conv.address)
                 conv.display_name = new_name
+        self._store.upsert_conversations(
+            self._device.id, list(self._conversations.values())
+        )
         self._refresh_conversation_list(force_rebuild=True)
         if self._active_thread_id is not None:
             self._show_thread(self._active_thread_id)
@@ -1258,6 +1294,8 @@ class SmsPanel(Gtk.Box):
 
         if was_unread:
             self._conv_list.set_thread_read_state(thread_id, True)
+            if self._device:
+                self._store.upsert_conversation(self._device.id, conv)
 
         # Draft conversations (negative thread_id) don't exist on the phone
         if thread_id < 0:
