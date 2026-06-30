@@ -184,6 +184,27 @@ M1 alone will make the app feel like a different program. M3 + M5 are what make 
 
 ---
 
+## 6. Implementation progress
+
+Status as of the latest commit on `claude/codebase-review-architecture-7lj1b3`.
+
+| Milestone | Status | Notes |
+|---|---|---|
+| M1 — Async D-Bus core | ✅ Done | `phonelink/async_bridge.py` (`AsyncBridge`, daemon worker threads). `client.submit(...)` + aggregate helpers (`fetch_devices`, `fetch_sftp_state`, `fetch_active_notifications`). Every UI phone call routed off the main thread. |
+| M2 — Event-driven status | ✅ Done | `Gio.bus_watch_name` for daemon up/down; per-device `reachableChanged` + battery `refreshed` signals; 30 s poll replaced by a 120 s safety-net watchdog. |
+| M3 — SQLite store | ✅ Done | `phonelink/store.py` (`MessageStore`, gi-free, WAL). Loads cached history on connect (instant startup); persists messages/conversations on merge/read/rename; deletes on removal. `tests/test_store.py` (6 tests). **Contacts NOT migrated** — still `contacts.json` (fine for now). |
+| M4 — Incremental UI | ✅ Done (scoped) | `MessageThread.sync()` appends only new bubbles; `ConversationList` updates rows in place via a `thread_id→row` map + sort-func. **Did NOT do the full `Gtk.ListView`/`Gio.ListModel` widget swap** — kept the existing `ListBox`/`Box` widgets to avoid an untested large rewrite; captures the perf win with far lower regression risk. True virtualization can be a later, device-tested milestone. |
+| M5 — Simplify reconciliation | ⬜ Not started | Replace render-time `_detect_self_number` / `_thread_redirects` / `_deduplicated_conversations` with a canonical participant-set identity computed on ingest (now anchorable on the SQLite store). Most behavior-sensitive change; **runtime-test after**. |
+| M6 — Hardening | ⬜ Not started | Atomic writes (temp + `os.replace`) for `contacts.json` / `settings.json` / Google token; debounce settings writes; batch store commits during bulk sync; harden or drop the tray subprocess; add CI + more tests. |
+
+### Verification caveat (applies to all milestones so far)
+This environment has no `gi`/GTK, no display, and no `kdeconnectd`, so **the GTK code paths have not been run** — they are verified by `py_compile` + code review only. The gi-free unit tests (`tests/test_store.py`, `tests/test_contacts.py`, `tests/test_settings.py`) do run and pass. Before relying on M1–M4, smoke-test on a real machine: instant startup from cache, no UI freeze on SFTP mount / send, live battery+connection updates, and a long thread appending (not rebuilding) on a new message.
+
+### Next up
+**M5**, then **M6**. M5 is the one that most directly fixes the "inconsistent" feeling (thread split/merge flicker, duplicate drafts) and should be runtime-tested before building further on it.
+
+---
+
 ## 5. If you genuinely want a clean-slate rewrite
 
 Only worth it if you want to change goals, not just quality. Options, with my verdict:
