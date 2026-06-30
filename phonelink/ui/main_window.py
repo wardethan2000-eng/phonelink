@@ -10,7 +10,13 @@ gi.require_version("Adw", "1")
 from gi.repository import Gtk, Gdk, Adw, GLib, Gio
 
 from phonelink.models import Device
-from phonelink.dbus_client import IFACE_DAEMON, IFACE_SHARE
+from phonelink.dbus_client import (
+    BUS_NAME,
+    IFACE_DAEMON,
+    IFACE_DEVICE,
+    IFACE_BATTERY,
+    IFACE_SHARE,
+)
 from phonelink.ui.sms_panel import SmsPanel
 from phonelink.ui.notifications_panel import NotificationsPanel
 from phonelink.ui.files_panel import FilesPanel
@@ -30,6 +36,8 @@ class MainWindow(Adw.ApplicationWindow):
         self._share_signal_id = None
         self._devices_refresh_inflight = False
         self._devices_refresh_pending = False
+        self._daemon_watch_id = None
+        self._device_status_signal_ids: list[int] = []
 
         self.set_title("Phone Link")
         self.set_default_size(960, 640)
@@ -309,6 +317,7 @@ class MainWindow(Adw.ApplicationWindow):
         self._update_device_header()
         self._update_device_popover()
         self._subscribe_share_signal()
+        self._subscribe_device_status_signals()
 
         # Update panels with active device
         for panel in (self.sms_panel, self.notif_panel, self.files_panel,
@@ -359,47 +368,53 @@ class MainWindow(Adw.ApplicationWindow):
     # ── Live updates ───────────────────────────────────────────────
 
     def _start_live_updates(self):
+        # React the moment the KDE Connect daemon starts or stops, instead of
+        # polling for it on a timer.
+        self._daemon_watch_id = Gio.bus_watch_name(
+            Gio.BusType.SESSION,
+            BUS_NAME,
+            Gio.BusNameWatcherFlags.NONE,
+            self._on_daemon_appeared,
+            self._on_daemon_vanished,
+        )
+        # Device added / removed / pairing changes.
         self.client.subscribe_signal(
             "/modules/kdeconnect",
             IFACE_DAEMON,
             "deviceListChanged",
             self._on_device_list_changed,
         )
-        self._poll_source = GLib.timeout_add_seconds(30, self._on_poll)
+        # Slow safety-net refresh in case a property-change signal is ever
+        # missed (e.g. a plugin that doesn't emit one). Events do the real work.
+        self._poll_source = GLib.timeout_add_seconds(120, self._on_watchdog)
+
+    def _on_daemon_appeared(self, connection, name, name_owner):
+        self._daemon_was_available = True
+        if not self.client.bus:
+            self.client.connect()
+        if not self._ui_built:
+            self._build_ui()
+        self._refresh_devices()
+
+    def _on_daemon_vanished(self, connection, name):
+        self._daemon_was_available = False
+        self.active_device = None
+        self._subscribe_device_status_signals()  # drops the old device's subs
+        if self._ui_built:
+            for panel in (self.sms_panel, self.notif_panel, self.files_panel,
+                          self.clipboard_panel):
+                panel.set_device(None)
+            self._update_device_header()
 
     def _on_device_list_changed(self, conn, sender, path, iface, signal, params):
         GLib.idle_add(self._refresh_devices)
 
-    def _on_poll(self):
-        # Check daemon availability off the main thread so the poll never
-        # freezes the UI (the D-Bus calls can block for seconds).
-        self.client.submit(self._poll_check_daemon, on_result=self._apply_poll)
-        return GLib.SOURCE_CONTINUE
-
-    def _poll_check_daemon(self) -> bool:
-        """Worker-thread daemon liveness probe (reconnects the bus if needed)."""
+    def _on_watchdog(self):
         if not self.client.bus:
             self.client.connect()
-        return self.client.is_daemon_available() if self.client.bus else False
-
-    def _apply_poll(self, daemon_ok: bool):
-        if daemon_ok and not self._daemon_was_available:
-            # Daemon just appeared — build the UI if needed
-            self._daemon_was_available = True
-            if not self._ui_built:
-                self._build_ui()
+        if self._daemon_was_available:
             self._refresh_devices()
-        elif daemon_ok:
-            self._refresh_devices()
-        elif not daemon_ok and self._daemon_was_available:
-            # Daemon disappeared mid-session
-            self._daemon_was_available = False
-            self.active_device = None
-            if self._ui_built:
-                for panel in (self.sms_panel, self.notif_panel, self.files_panel,
-                              self.clipboard_panel):
-                    panel.set_device(None)
-                self._update_device_header()
+        return GLib.SOURCE_CONTINUE
 
     # ── Device switcher popover ──────────────────────────────────
 
@@ -464,6 +479,7 @@ class MainWindow(Adw.ApplicationWindow):
             self._update_device_header()
             self._update_device_popover()
             self._subscribe_share_signal()
+            self._subscribe_device_status_signals()
             for panel in (self.sms_panel, self.notif_panel, self.files_panel,
                           self.clipboard_panel):
                 panel.set_device(self.active_device)
@@ -498,6 +514,51 @@ class MainWindow(Adw.ApplicationWindow):
             self._on_share_received,
         )
         self._share_signal_id = sid
+
+    def _subscribe_device_status_signals(self):
+        """(Re)subscribe to the active device's reachable + battery signals.
+
+        Lets the header reflect connection and battery changes the instant the
+        phone reports them, with no polling.
+        """
+        if self.client.bus:
+            for sid in self._device_status_signal_ids:
+                self.client.bus.signal_unsubscribe(sid)
+        self._device_status_signal_ids.clear()
+
+        if not self.active_device or not self.client.bus:
+            return
+
+        base = f"/modules/kdeconnect/devices/{self.active_device.id}"
+        self._device_status_signal_ids.append(
+            self.client.bus.signal_subscribe(
+                BUS_NAME, IFACE_DEVICE, "reachableChanged", base, None,
+                Gio.DBusSignalFlags.NONE, self._on_reachable_changed,
+            )
+        )
+        self._device_status_signal_ids.append(
+            self.client.bus.signal_subscribe(
+                BUS_NAME, IFACE_BATTERY, "refreshed", base + "/battery", None,
+                Gio.DBusSignalFlags.NONE, self._on_battery_refreshed,
+            )
+        )
+
+    def _on_reachable_changed(self, conn, sender, path, iface, signal, params):
+        GLib.idle_add(self._refresh_devices)
+
+    def _on_battery_refreshed(self, conn, sender, path, iface, signal, params):
+        try:
+            is_charging, charge = params.unpack()
+        except (TypeError, ValueError):
+            return
+        GLib.idle_add(self._apply_battery, int(charge), bool(is_charging))
+
+    def _apply_battery(self, charge: int, is_charging: bool):
+        if self.active_device:
+            self.active_device.battery_charge = charge
+            self.active_device.battery_charging = is_charging
+            self._update_device_header()
+        return GLib.SOURCE_REMOVE
 
     def _on_share_received(self, conn, sender, path, iface, signal, params):
         url = params.unpack()[0]
@@ -543,6 +604,13 @@ class MainWindow(Adw.ApplicationWindow):
             if self._poll_source:
                 GLib.source_remove(self._poll_source)
                 self._poll_source = None
+            if self._daemon_watch_id is not None:
+                Gio.bus_unwatch_name(self._daemon_watch_id)
+                self._daemon_watch_id = None
+            if self.client.bus:
+                for sid in self._device_status_signal_ids:
+                    self.client.bus.signal_unsubscribe(sid)
+            self._device_status_signal_ids.clear()
             self.client.cleanup()
             return False  # allow close
 
