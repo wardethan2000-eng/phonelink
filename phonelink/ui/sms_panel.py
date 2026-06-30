@@ -1065,7 +1065,7 @@ class SmsPanel(Gtk.Box):
             and self._active_thread_id == show_thread_id
             and show_thread_id in self._conversations
         ):
-            self._show_thread(show_thread_id)
+            self._sync_thread(show_thread_id)
         return GLib.SOURCE_REMOVE
 
     # ── Message ingestion ──────────────────────────────────────────
@@ -1330,6 +1330,18 @@ class SmsPanel(Gtk.Box):
         if not conv:
             return
         self._thread.set_messages(
+            conv.messages,
+            contact_name=conv.display_name,
+            address=conv.address,
+            thread_id=thread_id,
+        )
+
+    def _sync_thread(self, thread_id):
+        """Incrementally reflect new messages in the active thread."""
+        conv = self._conversations.get(thread_id)
+        if not conv:
+            return
+        self._thread.sync(
             conv.messages,
             contact_name=conv.display_name,
             address=conv.address,

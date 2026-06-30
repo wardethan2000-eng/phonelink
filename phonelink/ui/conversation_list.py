@@ -80,20 +80,20 @@ class ConversationRow(Gtk.ListBoxRow):
         self._name_label.set_max_width_chars(20)
         top_row.append(self._name_label)
 
-        time_label = Gtk.Label(label=conversation.time_label)
-        time_label.add_css_class("dim-label")
-        time_label.add_css_class("caption")
-        top_row.append(time_label)
+        self._time_label = Gtk.Label(label=conversation.time_label)
+        self._time_label.add_css_class("dim-label")
+        self._time_label.add_css_class("caption")
+        top_row.append(self._time_label)
 
         # Preview line
-        preview_label = Gtk.Label(label=conversation.preview)
-        preview_label.set_xalign(0)
-        preview_label.set_halign(Gtk.Align.START)
-        preview_label.set_ellipsize(Pango.EllipsizeMode.END)
-        preview_label.set_max_width_chars(30)
-        preview_label.add_css_class("dim-label")
-        preview_label.add_css_class("caption")
-        text_col.append(preview_label)
+        self._preview_label = Gtk.Label(label=conversation.preview)
+        self._preview_label.set_xalign(0)
+        self._preview_label.set_halign(Gtk.Align.START)
+        self._preview_label.set_ellipsize(Pango.EllipsizeMode.END)
+        self._preview_label.set_max_width_chars(30)
+        self._preview_label.add_css_class("dim-label")
+        self._preview_label.add_css_class("caption")
+        text_col.append(self._preview_label)
 
         # Reserve trailing width so read/unread changes don't resize the row.
         self._unread_dot = Gtk.Label(label="●")
@@ -112,6 +112,31 @@ class ConversationRow(Gtk.ListBoxRow):
         else:
             self._name_label.add_css_class("conversation-name-unread")
             self._unread_dot.remove_css_class("unread-dot-hidden")
+
+    @staticmethod
+    def _avatar_key(conv) -> tuple:
+        """Identity of the avatar so we know when it must be rebuilt."""
+        letter = (conv.display_name or conv.address or "?")[:1].upper()
+        return (conv.is_group, len(conv.addresses), letter)
+
+    def update(self, conversation) -> bool:
+        """Refresh this row in place. Returns False if the avatar must change
+        (in which case the caller should recreate the whole row)."""
+        if self._avatar_key(conversation) != self._avatar_key(self.conversation):
+            return False
+
+        self.conversation = conversation
+        if conversation.is_group:
+            display_text = conversation.display_name or "Group"
+        else:
+            display_text = (
+                conversation.display_name or conversation.address or "Unknown"
+            )
+        self._name_label.set_label(display_text)
+        self._time_label.set_label(conversation.time_label)
+        self._preview_label.set_label(conversation.preview)
+        self.set_read_state(conversation.is_read)
+        return True
 
 
 class ContactSuggestionRow(Gtk.ListBoxRow):
@@ -170,7 +195,7 @@ class ConversationList(Gtk.Box):
         self.set_size_request(280, -1)
         self.set_hexpand(False)
         self._conversations = []
-        self._rendered_rows: list[tuple] = []
+        self._rows_by_id: dict[int, ConversationRow] = {}  # thread_id → row
         self._contact_map: dict[str, str] = {}  # normalized phone → display name
         self._conversation_phones: set[str] = set()  # normalized phones with conversations
 
@@ -215,6 +240,7 @@ class ConversationList(Gtk.Box):
         self._listbox.connect("row-activated", self._on_row_activated)
         self._listbox.connect("row-selected", self._on_row_selected)
         self._listbox.set_filter_func(self._filter_func)
+        self._listbox.set_sort_func(self._sort_func)
         scroll_box.append(self._listbox)
 
         # Right-click menu for rename
@@ -244,83 +270,87 @@ class ConversationList(Gtk.Box):
         self._suppress_selection_signal = False
         self._last_emitted_thread_id: int | None = None
 
+    def _sort_func(self, row_a, row_b) -> int:
+        """Most-recent conversation first."""
+        a = row_a.conversation.sort_key
+        b = row_b.conversation.sort_key
+        if a == b:
+            return 0
+        return -1 if a > b else 1
+
     def set_conversations(self, conversations, force_rebuild=False):
-        """Update the conversation list, rebuilding only when the set changes."""
-        sorted_convs = sorted(conversations, key=lambda c: c.sort_key, reverse=True)
+        """Update the list in place — no full teardown on every new message.
 
-        new_rows = [
-            (
-                c.thread_id,
-                c.display_name,
-                c.address,
-                c.last_message,
-                c.last_date,
-                c.is_read,
-                tuple(c.addresses),
-            )
-            for c in sorted_convs
-        ]
-
-        self._conversations = sorted_convs
+        Rows are added/removed/updated individually and re-ordered by the sort
+        function, so an incoming message only touches the affected row instead
+        of rebuilding (and flickering) the entire list.  ``force_rebuild``
+        recreates every row (used after a contact-name/photo refresh so avatars
+        update).
+        """
+        self._conversations = sorted(
+            conversations, key=lambda c: c.sort_key, reverse=True
+        )
 
         # Track which phone numbers have existing conversations
         self._conversation_phones = set()
-        for c in sorted_convs:
+        for c in self._conversations:
             norm = re.sub(r"[^\d]", "", c.address)
             if norm:
                 self._conversation_phones.add(norm)
 
-        # Rebuild if any visible row content changed or forced
-        if force_rebuild or new_rows != self._rendered_rows:
-            self._rendered_rows = new_rows
-            self._rebuilding = True
-            # Remove old rows
-            while True:
-                row = self._listbox.get_row_at_index(0)
-                if row is None:
-                    break
-                self._listbox.remove(row)
-            # Add sorted rows
-            for conv in sorted_convs:
-                self._listbox.append(ConversationRow(conv))
+        self._rebuilding = True
+        try:
+            if force_rebuild:
+                while True:
+                    row = self._listbox.get_row_at_index(0)
+                    if row is None:
+                        break
+                    self._listbox.remove(row)
+                self._rows_by_id.clear()
+                for conv in self._conversations:
+                    row = ConversationRow(conv)
+                    self._rows_by_id[conv.thread_id] = row
+                    self._listbox.append(row)
+            else:
+                desired = {c.thread_id for c in conversations}
+                for thread_id in list(self._rows_by_id):
+                    if thread_id not in desired:
+                        self._listbox.remove(self._rows_by_id.pop(thread_id))
+                for conv in self._conversations:
+                    row = self._rows_by_id.get(conv.thread_id)
+                    if row is None:
+                        row = ConversationRow(conv)
+                        self._rows_by_id[conv.thread_id] = row
+                        self._listbox.append(row)
+                    elif not row.update(conv):
+                        # Avatar changed — recreate this row.
+                        self._listbox.remove(row)
+                        row = ConversationRow(conv)
+                        self._rows_by_id[conv.thread_id] = row
+                        self._listbox.append(row)
+                self._listbox.invalidate_sort()
+        finally:
             self._rebuilding = False
+
+        # Re-evaluate the search filter for updated rows while a query is active.
+        if self._search_text:
+            self._listbox.invalidate_filter()
 
         self._update_contact_suggestions()
 
     def select_thread(self, thread_id: int):
         """Programmatically select a conversation row by thread ID."""
-        idx = 0
-        while True:
-            row = self._listbox.get_row_at_index(idx)
-            if row is None:
-                break
-            if row.conversation.thread_id == thread_id:
-                if self._listbox.get_selected_row() is row:
-                    break
-                self._suppress_selection_signal = True
-                self._listbox.select_row(row)
-                self._suppress_selection_signal = False
-                break
-            idx += 1
+        row = self._rows_by_id.get(thread_id)
+        if row is None or self._listbox.get_selected_row() is row:
+            return
+        self._suppress_selection_signal = True
+        self._listbox.select_row(row)
+        self._suppress_selection_signal = False
 
     def set_thread_read_state(self, thread_id: int, is_read: bool):
-        idx = 0
-        while True:
-            row = self._listbox.get_row_at_index(idx)
-            if row is None:
-                break
-            if row.conversation.thread_id == thread_id and hasattr(row, "set_read_state"):
-                row.set_read_state(is_read)
-                break
-            idx += 1
-
-        updated_rows = []
-        for rendered in self._rendered_rows:
-            if rendered[0] == thread_id:
-                updated_rows.append(rendered[:5] + (bool(is_read),) + rendered[6:])
-            else:
-                updated_rows.append(rendered)
-        self._rendered_rows = updated_rows
+        row = self._rows_by_id.get(thread_id)
+        if row is not None:
+            row.set_read_state(is_read)
 
     def _emit_conversation_selected(self, thread_id: int):
         if self._suppress_selection_signal:

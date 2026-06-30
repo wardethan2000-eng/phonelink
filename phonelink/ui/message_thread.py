@@ -362,6 +362,8 @@ class MessageThread(Gtk.Box):
         self._pending_image_path = None  # path to pasted image awaiting send
         self._retained_temp_paths: set[str] = set()
         self._last_message = None  # track last message for smart timestamps
+        self._rendered_uids: set[int] = set()  # uids currently shown as bubbles
+        self._last_rendered_date = 0  # date of the newest rendered message
         self.set_hexpand(True)
         self.set_vexpand(True)
 
@@ -560,10 +562,40 @@ class MessageThread(Gtk.Box):
             )
 
         self._last_message = sorted_msgs[-1] if sorted_msgs else None
+        self._rendered_uids = {m.uid for m in sorted_msgs if m.uid}
+        self._last_rendered_date = sorted_msgs[-1].date if sorted_msgs else 0
         self._stack.set_visible_child_name("thread")
 
         # Scroll to bottom after layout
         GLib.idle_add(self._scroll_to_bottom)
+
+    def sync(self, messages, contact_name: str, address: str, thread_id: int):
+        """Reflect the latest messages with minimal work.
+
+        Appends only genuinely-new (newest) messages instead of rebuilding the
+        whole thread.  Falls back to a full rebuild when the thread changes, a
+        message was removed, or older messages arrived out of order (history
+        backfill).  The header is always refreshed so contact-name changes show.
+        """
+        self._contact_label.set_label(contact_name or address or "Unknown")
+        self._address_label.set_label(address if contact_name else "")
+
+        if (thread_id != self._thread_id
+                or self._stack.get_visible_child_name() != "thread"):
+            self.set_messages(messages, contact_name, address, thread_id)
+            return
+
+        current_uids = {m.uid for m in messages if m.uid}
+        new_msgs = [m for m in messages if m.uid and m.uid not in self._rendered_uids]
+        removed = self._rendered_uids - current_uids
+        out_of_order = any(m.date < self._last_rendered_date for m in new_msgs)
+
+        if removed or out_of_order:
+            self.set_messages(messages, contact_name, address, thread_id)
+            return
+
+        for msg in sorted(new_msgs, key=lambda m: m.date):
+            self.append_message(msg)
 
     def append_message(self, message):
         """Add a single new message and scroll down."""
@@ -575,6 +607,13 @@ class MessageThread(Gtk.Box):
         ):
             previous_bubble.set_default_timestamp_visible(False)
 
+        # Insert a date header when the day changes (or for the first bubble).
+        if (self._last_message is None
+                or self._last_message.timestamp.date() != message.timestamp.date()):
+            self._messages_box.append(
+                DateSeparator(message.timestamp.strftime("%A, %B %d, %Y"))
+            )
+
         self._messages_box.append(
             MessageBubble(
                 message,
@@ -583,6 +622,10 @@ class MessageThread(Gtk.Box):
             )
         )
         self._last_message = message
+        if message.uid:
+            self._rendered_uids.add(message.uid)
+        if message.date > self._last_rendered_date:
+            self._last_rendered_date = message.date
         GLib.idle_add(self._scroll_to_bottom)
 
     def _clear_messages(self):
