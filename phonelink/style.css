@@ -1,5 +1,15 @@
 /* Phone Link for Linux — custom styles */
 
+/* ── Brand accent ──────────────────────────────────────────────
+ * One restrained signature colour so Phone Link reads as its own
+ * product rather than a generic Adwaita shell. A calm iris/indigo —
+ * distinct from stock system blue, legible in both light and dark,
+ * and applied consistently to buttons, the view switcher, selected
+ * rows, and sent message bubbles. */
+@define-color accent_bg_color #5b5bd6;
+@define-color accent_fg_color #ffffff;
+@define-color accent_color #6a6af0;
+
 /* Sidebar background — subtle contrast with the main content */
 .sidebar-pane {
     background-color: alpha(@window_bg_color, 0.97);
@@ -98,6 +108,11 @@ levelbar trough block {
     margin-top: 3px;
 }
 
+/* Thumbnail shown briefly while the full-resolution image is fetched. */
+.message-attachment-loading {
+    opacity: 0.7;
+}
+
 .message-attachment-row {
     margin-top: 2px;
 }
@@ -160,3 +175,22 @@ levelbar trough block {
     padding: 2px 6px;
     border-radius: 0 0 8px 8px;
 }
+
+/* ── Avatar tints ──────────────────────────────────────────────
+ * Photoless avatars get a stable per-contact colour (hashed from the
+ * name) so a list of initials is scannable instead of a wall of one
+ * accent. White text keeps every tile legible. Defined last so these
+ * win over the base .conversation-avatar background. */
+.conversation-avatar {
+    color: white;
+}
+.avatar-hue-0 { background-color: #5b5bd6; }
+.avatar-hue-1 { background-color: #2f6fed; }
+.avatar-hue-2 { background-color: #0d9488; }
+.avatar-hue-3 { background-color: #16a34a; }
+.avatar-hue-4 { background-color: #b45309; }
+.avatar-hue-5 { background-color: #ea580c; }
+.avatar-hue-6 { background-color: #dc2626; }
+.avatar-hue-7 { background-color: #db2777; }
+.avatar-hue-8 { background-color: #9333ea; }
+.avatar-hue-9 { background-color: #0891b2; }

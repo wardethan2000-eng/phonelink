@@ -44,8 +44,8 @@ class ClipboardPanel(Gtk.Box):
         status.set_icon_name("edit-paste-symbolic")
         status.set_title("Clipboard Sync")
         status.set_description(
-            "No device connected.\n"
-            "Pair a phone to sync clipboard content."
+            "No phone linked yet.\n"
+            "Pair your phone to share clipboard between devices."
         )
         self._outer_stack.add_named(status, "status")
 

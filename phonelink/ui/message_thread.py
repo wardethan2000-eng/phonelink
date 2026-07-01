@@ -16,10 +16,76 @@ import gi
 
 gi.require_version("Gtk", "4.0")
 gi.require_version("Gdk", "4.0")
-from gi.repository import Gtk, Gdk, GObject, Pango, GLib, Gio
+gi.require_version("GdkPixbuf", "2.0")
+from gi.repository import Gtk, Gdk, GObject, Pango, GLib, Gio, GdkPixbuf
 
 
 ATTACHMENT_CACHE_DIR = Path(tempfile.gettempdir()) / "phonelink" / "message_attachments"
+
+# Persistent cache for full-resolution attachment files the phone sends on
+# request. Kept out of /tmp so upgraded images survive a restart.
+FULL_ATTACHMENT_CACHE_DIR = Path(GLib.get_user_cache_dir()) / "phonelink" / "attachments_full"
+
+# Full images render large and crisp within this box (scaled down to fit,
+# never up). KDE Connect's inline previews are only ~100px, so until the full
+# file arrives a thumbnail is shown as a placeholder, scaled up to a tidy floor
+# (with a cap so it doesn't get too soft). Aspect ratio is always preserved.
+FULL_IMAGE_MAX_W = 380
+FULL_IMAGE_MAX_H = 500
+THUMB_IMAGE_MAX_W = 300
+THUMB_IMAGE_MAX_H = 360
+THUMB_IMAGE_MIN_LONG = 220        # placeholder floor for the longer side
+THUMB_IMAGE_UPSCALE_CAP = 2.2     # don't blow tiny thumbnails up past this
+ATTACHMENT_THUMBNAIL_MAX = 256    # at/under this the image is a preview, not full
+
+
+def full_attachment_cache_path(att: dict) -> Path | None:
+    """Stable on-disk location for an attachment's full-resolution file."""
+    uid = str(att.get("uniqueIdentifier") or att.get("partId") or "").strip()
+    if not uid:
+        return None
+    ext = _attachment_ext(str(att.get("mimeType") or ""))
+    return FULL_ATTACHMENT_CACHE_DIR / f"{_sanitize_name(uid)}{ext}"
+
+
+def existing_full_attachment(att: dict) -> str | None:
+    """Return the full-resolution file for an attachment if we already have it."""
+    recorded = att.get("fullPath")
+    if recorded and os.path.isfile(recorded):
+        return recorded
+    cached = full_attachment_cache_path(att)
+    if cached and cached.is_file():
+        return str(cached)
+    return None
+
+
+def _measure_image(path: str) -> tuple[int, int] | None:
+    """Return (width, height) from the image header, or None if unreadable."""
+    try:
+        _fmt, width, height = GdkPixbuf.Pixbuf.get_file_info(path)
+    except Exception:  # noqa: BLE001 — corrupt/unsupported header
+        return None
+    if not width or not height or width <= 0 or height <= 0:
+        return None
+    return width, height
+
+
+def _scaled_image_size(width: int, height: int, *, full: bool) -> tuple[int, int]:
+    """Aspect-preserved on-screen size for an image of the given dimensions."""
+    if full:
+        max_w, max_h, min_long, cap = FULL_IMAGE_MAX_W, FULL_IMAGE_MAX_H, 0, 1.0
+    else:
+        max_w, max_h = THUMB_IMAGE_MAX_W, THUMB_IMAGE_MAX_H
+        min_long, cap = THUMB_IMAGE_MIN_LONG, THUMB_IMAGE_UPSCALE_CAP
+    fit = min(max_w / width, max_h / height)
+    if fit < 1.0:
+        scale = fit  # larger than the box → scale down to fit
+    elif min_long:
+        longer = max(width, height)
+        scale = max(1.0, min(min_long / longer, cap, fit))
+    else:
+        scale = 1.0  # already-crisp full image smaller than the box → keep natural
+    return max(1, round(width * scale)), max(1, round(height * scale))
 IMAGE_CLIPBOARD_MIME_TYPES = (
     "image/png",
     "image/jpeg",
@@ -209,12 +275,56 @@ class MessageBubble(Gtk.Box):
         file_name = _attachment_name(attachment)
         local_path = _attachment_local_path(attachment)
 
-        if mime.startswith("image") and local_path:
-            picture = Gtk.Picture.new_for_filename(local_path)
+        part_id = int(attachment.get("partId") or 0)
+        unique_identifier = str(attachment.get("uniqueIdentifier") or "")
+        can_fetch_full = bool(part_id and self._on_download_attachment is not None)
+
+        # Prefer the full-resolution file if we have it; the inline thumbnail is
+        # only a placeholder shown until the full image arrives. Copy/Open/Save
+        # below act on this too, so they never hand back the tiny thumbnail.
+        full_path = existing_full_attachment(attachment) if mime.startswith("image") else None
+        best_path = full_path or local_path
+
+        if mime.startswith("image") and best_path:
+            display_path = best_path
+            measured = _measure_image(display_path)
+            width, height = measured or (FULL_IMAGE_MAX_W, FULL_IMAGE_MAX_H)
+            # "Full" = an image already larger than a thumbnail (fetched full
+            # file, or a high-res image we sent). Thumbnails stay placeholders.
+            is_full = measured is not None and max(width, height) > ATTACHMENT_THUMBNAIL_MAX
+            awaiting_full = not is_full and can_fetch_full
+            disp_w, disp_h = _scaled_image_size(width, height, full=is_full)
+
+            picture = Gtk.Picture.new_for_filename(display_path)
             picture.set_can_shrink(True)
-            picture.set_content_fit(Gtk.ContentFit.SCALE_DOWN)
-            picture.set_size_request(240, 180)
+            picture.set_content_fit(Gtk.ContentFit.CONTAIN)
+            # Size the widget to the image's real aspect ratio and pin it to the
+            # start edge so it never stretches to fill a wide bubble.
+            picture.set_size_request(disp_w, disp_h)
+            picture.set_halign(Gtk.Align.START)
+            picture.set_hexpand(False)
             picture.add_css_class("message-attachment-image")
+            picture.set_cursor(Gdk.Cursor.new_from_name("pointer", None))
+            if awaiting_full:
+                picture.add_css_class("message-attachment-loading")
+                picture.set_tooltip_text("Loading full image…")
+
+            click = Gtk.GestureClick(button=1)
+            if awaiting_full:
+                # Manual retry if the automatic fetch hasn't landed yet.
+                click.connect(
+                    "released",
+                    lambda *_a: self._on_download_attachment(
+                        part_id, unique_identifier, file_name
+                    ),
+                )
+            else:
+                picture.set_tooltip_text("Click to open image")
+                click.connect(
+                    "released",
+                    lambda *_a, p=display_path: self._on_open_attachment(None, p),
+                )
+            picture.add_controller(click)
             frame.append(picture)
 
         att_row = Gtk.Box(orientation=Gtk.Orientation.HORIZONTAL, spacing=6)
@@ -233,21 +343,21 @@ class MessageBubble(Gtk.Box):
         att_label.set_ellipsize(Pango.EllipsizeMode.END)
         att_row.append(att_label)
 
-        if local_path:
+        if best_path:
             if mime.startswith("image"):
                 copy_btn = Gtk.Button(label="Copy")
                 copy_btn.add_css_class("flat")
-                copy_btn.connect("clicked", self._on_copy_image, local_path)
+                copy_btn.connect("clicked", self._on_copy_image, best_path)
                 att_row.append(copy_btn)
 
             open_btn = Gtk.Button(label="Open")
             open_btn.add_css_class("flat")
-            open_btn.connect("clicked", self._on_open_attachment, local_path)
+            open_btn.connect("clicked", self._on_open_attachment, best_path)
             att_row.append(open_btn)
 
             save_btn = Gtk.Button(label="Save")
             save_btn.add_css_class("flat")
-            save_btn.connect("clicked", self._on_save_attachment, local_path, file_name)
+            save_btn.connect("clicked", self._on_save_attachment, best_path, file_name)
             att_row.append(save_btn)
         elif self._on_download_attachment is not None:
             download_btn = Gtk.Button(label="Download")
@@ -364,6 +474,7 @@ class MessageThread(Gtk.Box):
         self._last_message = None  # track last message for smart timestamps
         self._rendered_uids: set[int] = set()  # uids currently shown as bubbles
         self._last_rendered_date = 0  # date of the newest rendered message
+        self._auto_fetched: set[str] = set()  # attachments we've asked full-res for
         self.set_hexpand(True)
         self.set_vexpand(True)
 
@@ -566,6 +677,8 @@ class MessageThread(Gtk.Box):
         self._last_rendered_date = sorted_msgs[-1].date if sorted_msgs else 0
         self._stack.set_visible_child_name("thread")
 
+        self._auto_fetch_full_images(sorted_msgs)
+
         # Scroll to bottom after layout
         GLib.idle_add(self._scroll_to_bottom)
 
@@ -626,7 +739,30 @@ class MessageThread(Gtk.Box):
             self._rendered_uids.add(message.uid)
         if message.date > self._last_rendered_date:
             self._last_rendered_date = message.date
+        self._auto_fetch_full_images([message])
         GLib.idle_add(self._scroll_to_bottom)
+
+    def _auto_fetch_full_images(self, messages):
+        """Ask the phone for the full-resolution file of any inline image we
+        only have a thumbnail for, so the chat shows the real image, not a
+        blurry preview. Each attachment is requested at most once per session."""
+        if self._on_download_attachment is None or not self._thread_id:
+            return
+        for msg in messages:
+            for att in (msg.attachments or []):
+                if not str(att.get("mimeType") or "").startswith("image"):
+                    continue
+                part_id = int(att.get("partId") or 0)
+                if not part_id or existing_full_attachment(att):
+                    continue
+                unique_identifier = str(att.get("uniqueIdentifier") or "")
+                key = unique_identifier or str(part_id)
+                if key in self._auto_fetched:
+                    continue
+                self._auto_fetched.add(key)
+                self._on_download_attachment(
+                    part_id, unique_identifier, _attachment_name(att)
+                )
 
     def _clear_messages(self):
         while True:

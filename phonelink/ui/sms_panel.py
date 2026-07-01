@@ -1,7 +1,9 @@
 """SMS panel — conversation list + message thread, backed by D-Bus signals."""
 
 import mimetypes
+import os
 import re
+import shutil
 import threading
 import time
 
@@ -32,7 +34,7 @@ from phonelink.reconcile import ConversationIndex
 from phonelink.settings import get_settings
 from phonelink.store import get_message_store
 from phonelink.ui.conversation_list import ConversationList
-from phonelink.ui.message_thread import MessageThread
+from phonelink.ui.message_thread import MessageThread, full_attachment_cache_path
 
 # KDE Connect conversation tuple indices
 # (event, body, addresses, date, type, read, threadID, uID, subID, attachments)
@@ -176,7 +178,9 @@ class SmsPanel(Gtk.Box):
         self._status = Adw.StatusPage()
         self._status.set_icon_name("mail-unread-symbolic")
         self._status.set_title("Messages")
-        self._status.set_description("No device connected.\nPair a phone to view messages.")
+        self._status.set_description(
+            "No phone linked yet.\nPair your phone in KDE Connect to see your texts here."
+        )
         self._stack.add_named(self._status, "status")
 
         # Message UI: fixed-width conversation pane + flexible thread pane
@@ -447,12 +451,12 @@ class SmsPanel(Gtk.Box):
     def _show_disconnected(self):
         if self._device:
             self._status.set_description(
-                f"{self._device.name} is disconnected.\n"
-                "Connect your phone to view messages."
+                f"{self._device.name} is offline.\n"
+                "Reconnect your phone to see your texts."
             )
         else:
             self._status.set_description(
-                "No device connected.\nPair a phone to view messages."
+                "No phone linked yet.\nPair your phone in KDE Connect to see your texts here."
             )
         self._stack.set_visible_child_name("status")
 
@@ -919,10 +923,52 @@ class SmsPanel(Gtk.Box):
             GLib.idle_add(self._handle_attachment_received, str(file_path), str(file_name))
 
     def _handle_attachment_received(self, file_path: str, file_name: str):
-        if self._active_thread_id is not None:
-            self._show_thread(self._active_thread_id)
-        self._show_toast(f"Downloaded {file_name} to {file_path}")
+        # The phone sent a full-resolution attachment we asked for. If it maps to
+        # an inline image, cache it and upgrade that bubble in place so the chat
+        # shows the real image instead of the blurry thumbnail.
+        upgraded_thread = self._store_full_attachment(file_path, file_name)
+        if upgraded_thread is not None:
+            if (
+                self._active_thread_id is not None
+                and self._index.primary_for(upgraded_thread) == self._active_thread_id
+            ):
+                self._show_thread(self._active_thread_id)
+            return GLib.SOURCE_REMOVE
+
+        # Didn't map to an inline image (e.g. a non-image attachment the user
+        # downloaded). Just report where it landed — never auto-open, so an
+        # unmatched arrival can't spawn a viewer for every image in a thread.
+        self._show_toast(f"Saved {file_name} to {file_path}")
         return GLib.SOURCE_REMOVE
+
+    def _store_full_attachment(self, file_path: str, file_name: str) -> int | None:
+        """Match an arrived full-res file to an inline image attachment, cache it
+        persistently, record it on the message, and persist. Returns the message's
+        thread_id on success, else None."""
+        if not file_path or not os.path.isfile(file_path):
+            return None
+        for thread_id, conv in self._conversations.items():
+            for msg in conv.messages:
+                for att in (msg.attachments or []):
+                    if not str(att.get("mimeType") or "").startswith("image"):
+                        continue
+                    uid = str(att.get("uniqueIdentifier") or "")
+                    if file_name not in (uid, str(att.get("fileName") or "")):
+                        continue
+                    dest = full_attachment_cache_path(att)
+                    if dest is None:
+                        return None
+                    try:
+                        dest.parent.mkdir(parents=True, exist_ok=True)
+                        shutil.copyfile(file_path, dest)
+                    except OSError as exc:
+                        print(f"[phonelink] cache full attachment failed: {exc}")
+                        return None
+                    att["fullPath"] = str(dest)
+                    if self._device:
+                        self._store.upsert_message(self._device.id, thread_id, msg)
+                    return thread_id
+        return None
 
     def _handle_signal_variant(self, params):
         """Parse a signal variant containing a message tuple."""

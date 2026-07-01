@@ -54,9 +54,10 @@ class MainWindow(Adw.ApplicationWindow):
         if not self.client.connect():
             self._show_status(
                 "dialog-error-symbolic",
-                "D-Bus Error",
-                "Cannot connect to the session bus.\n"
-                "Make sure you are running a desktop session.",
+                "Can't reach your desktop session",
+                "Phone Link couldn't connect to the service that links your "
+                "phone.\nSign in to a normal desktop session, then reopen "
+                "Phone Link.",
             )
             # Still start polling so we can recover if the bus appears later
             self._start_live_updates()
@@ -65,12 +66,13 @@ class MainWindow(Adw.ApplicationWindow):
         if not self.client.is_daemon_available():
             self._show_status(
                 "dialog-warning-symbolic",
-                "KDE Connect Not Found",
-                "The KDE Connect daemon is not running.\n\n"
+                "Finish setting up your phone",
+                "Phone Link uses KDE Connect to talk to your phone, and it "
+                "isn't running yet.\n\n"
                 "Install it:\n"
                 "  sudo apt install kdeconnect\n\n"
-                "Then launch the KDE Connect indicator or run:\n"
-                "  kdeconnectd &",
+                "Then open KDE Connect and pair your phone — Phone Link picks "
+                "it up automatically.",
             )
             self._start_live_updates()
             return
@@ -101,19 +103,34 @@ class MainWindow(Adw.ApplicationWindow):
         self._device_btn = Gtk.MenuButton()
         self._device_btn.add_css_class("flat")
 
-        self._device_box = Gtk.Box(orientation=Gtk.Orientation.HORIZONTAL, spacing=8)
+        self._device_box = Gtk.Box(orientation=Gtk.Orientation.HORIZONTAL, spacing=10)
 
         self._device_icon = Gtk.Image()
-        self._device_icon.set_pixel_size(20)
+        self._device_icon.set_pixel_size(24)
         self._device_box.append(self._device_icon)
+
+        # Two-line identity: device name over a live connection status.
+        device_text = Gtk.Box(orientation=Gtk.Orientation.VERTICAL, spacing=0)
+        device_text.set_valign(Gtk.Align.CENTER)
 
         self._device_name = Gtk.Label()
         self._device_name.add_css_class("heading")
-        self._device_box.append(self._device_name)
+        self._device_name.set_xalign(0)
+        device_text.append(self._device_name)
 
+        status_row = Gtk.Box(orientation=Gtk.Orientation.HORIZONTAL, spacing=5)
         self._status_dot = Gtk.Label()
         self._status_dot.set_use_markup(True)
-        self._device_box.append(self._status_dot)
+        status_row.append(self._status_dot)
+
+        self._device_status_text = Gtk.Label()
+        self._device_status_text.set_xalign(0)
+        self._device_status_text.add_css_class("caption")
+        self._device_status_text.add_css_class("dim-label")
+        status_row.append(self._device_status_text)
+        device_text.append(status_row)
+
+        self._device_box.append(device_text)
 
         # Down arrow indicator for multi-device
         self._device_arrow = Gtk.Image.new_from_icon_name("pan-down-symbolic")
@@ -134,9 +151,13 @@ class MainWindow(Adw.ApplicationWindow):
 
         header.pack_start(self._device_btn)
 
-        # Center title
+        # Center title — a wide, labeled view switcher (bigger, clearer targets
+        # than the mobile-style bottom switcher bar this replaces).
         self.stack = Adw.ViewStack()
-        header.set_title_widget(Gtk.Label(label="Phone Link"))
+        view_switcher = Adw.ViewSwitcher()
+        view_switcher.set_stack(self.stack)
+        view_switcher.set_policy(Adw.ViewSwitcherPolicy.WIDE)
+        header.set_title_widget(view_switcher)
 
         # Right side: battery + notifications toggle + ring button
         right_box = Gtk.Box(orientation=Gtk.Orientation.HORIZONTAL, spacing=6)
@@ -167,11 +188,6 @@ class MainWindow(Adw.ApplicationWindow):
         header.pack_end(settings_btn)
 
         outer.append(header)
-
-        switcher_bar = Adw.ViewSwitcherBar()
-        switcher_bar.set_stack(self.stack)
-        switcher_bar.set_reveal(True)
-        outer.append(switcher_bar)
 
         # ── Main tab content ────────────────────────────────────────
         self.sms_panel = SmsPanel(client=self.client)
@@ -332,10 +348,9 @@ class MainWindow(Adw.ApplicationWindow):
         dev = self.active_device
         if not dev:
             self._device_icon.set_from_icon_name("phone-symbolic")
-            self._device_name.set_label("No Device")
-            self._status_dot.set_markup(
-                '<span foreground="#77767b">●</span>'
-            )
+            self._device_name.set_label("No phone linked")
+            self._status_dot.set_markup('<span foreground="#77767b">●</span>')
+            self._device_status_text.set_label("Pair a phone to begin")
             self._battery_icon.set_visible(False)
             self._battery_label.set_visible(False)
             return
@@ -344,17 +359,14 @@ class MainWindow(Adw.ApplicationWindow):
         self._device_name.set_label(dev.name)
 
         if dev.reachable:
-            self._status_dot.set_markup(
-                '<span foreground="#2ec27e">●</span>'
-            )
+            self._status_dot.set_markup('<span foreground="#2ec27e">●</span>')
+            self._device_status_text.set_label("Connected")
         elif dev.paired:
-            self._status_dot.set_markup(
-                '<span foreground="#c64600">●</span>'
-            )
+            self._status_dot.set_markup('<span foreground="#c64600">●</span>')
+            self._device_status_text.set_label("Offline")
         else:
-            self._status_dot.set_markup(
-                '<span foreground="#77767b">●</span>'
-            )
+            self._status_dot.set_markup('<span foreground="#77767b">●</span>')
+            self._device_status_text.set_label("Not paired")
 
         if dev.battery_charge >= 0:
             self._battery_icon.set_from_icon_name(dev.battery_icon_name)

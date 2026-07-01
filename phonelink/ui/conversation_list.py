@@ -1,6 +1,7 @@
 """Conversation list widget — left column of the SMS panel."""
 
 import re
+import zlib
 
 import gi
 
@@ -9,6 +10,16 @@ gi.require_version("Adw", "1")
 from gi.repository import Gtk, GObject, Pango
 
 from phonelink.contacts import contact_photo_path
+
+
+# Number of avatar tint classes defined in style.css (.avatar-hue-0 …).
+_AVATAR_HUE_COUNT = 10
+
+
+def _avatar_hue_class(key: str) -> str:
+    """Pick a stable tint for a contact so photoless avatars stay distinct."""
+    digest = zlib.crc32((key or "?").strip().lower().encode("utf-8"))
+    return f"avatar-hue-{digest % _AVATAR_HUE_COUNT}"
 
 
 def _build_avatar(name: str, phone: str, *, is_group: bool, group_count: int) -> Gtk.Widget:
@@ -30,6 +41,7 @@ def _build_avatar(name: str, phone: str, *, is_group: bool, group_count: int) ->
     else:
         avatar_label.set_label((name or phone or "?")[0].upper())
     avatar_label.add_css_class("conversation-avatar")
+    avatar_label.add_css_class(_avatar_hue_class(name or phone))
     avatar_label.set_halign(Gtk.Align.CENTER)
     avatar_label.set_valign(Gtk.Align.CENTER)
     return avatar_label

@@ -211,7 +211,7 @@ class NotificationsPanel(Gtk.Box):
         self._status = Adw.StatusPage()
         self._status.set_icon_name("xsi-notifications-symbolic")
         self._status.set_title("No Notifications")
-        self._status.set_description("No device connected.")
+        self._status.set_description("No phone linked yet.")
         self._stack.add_named(self._status, "status")
 
         # List page
@@ -279,11 +279,11 @@ class NotificationsPanel(Gtk.Box):
             self._stack.set_visible_child_name("list")
         elif device:
             self._status.set_description(
-                f"{device.name} is disconnected.\nConnect your phone to see notifications."
+                f"{device.name} is offline.\nReconnect your phone to see notifications."
             )
             self._stack.set_visible_child_name("status")
         else:
-            self._status.set_description("No device connected.")
+            self._status.set_description("No phone linked yet.")
             self._stack.set_visible_child_name("status")
 
     # ── D-Bus ──────────────────────────────────────────────────────

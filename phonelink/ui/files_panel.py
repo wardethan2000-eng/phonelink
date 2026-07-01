@@ -232,7 +232,9 @@ class FilesPanel(Gtk.Box):
         self._status = Adw.StatusPage()
         self._status.set_icon_name("folder-symbolic")
         self._status.set_title("Files")
-        self._status.set_description("No device connected.\nPair a phone to browse files.")
+        self._status.set_description(
+            "No phone linked yet.\nPair your phone to browse its files here."
+        )
         self._outer_stack.add_named(self._status, "status")
 
         # Mounting status page (shown while SFTP mount is in progress)
