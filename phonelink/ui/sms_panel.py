@@ -1185,6 +1185,15 @@ class SmsPanel(Gtk.Box):
             thread_id=thread_id,
         )
 
+    def zoom_messages_in(self):
+        self._thread.zoom_in()
+
+    def zoom_messages_out(self):
+        self._thread.zoom_out()
+
+    def zoom_messages_reset(self):
+        self._thread.zoom_reset()
+
     def _sync_thread(self, thread_id):
         """Incrementally reflect new messages in the active thread."""
         conv = self._conversations.get(thread_id)

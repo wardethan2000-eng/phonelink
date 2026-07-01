@@ -19,6 +19,12 @@ gi.require_version("Gdk", "4.0")
 gi.require_version("GdkPixbuf", "2.0")
 from gi.repository import Gtk, Gdk, GObject, Pango, GLib, Gio, GdkPixbuf
 
+from phonelink.settings import (
+    get_settings,
+    MESSAGE_FONT_SCALE_MIN,
+    MESSAGE_FONT_SCALE_MAX,
+)
+
 
 ATTACHMENT_CACHE_DIR = Path(tempfile.gettempdir()) / "phonelink" / "message_attachments"
 
@@ -240,6 +246,7 @@ class MessageBubble(Gtk.Box):
         body_label.set_max_width_chars(50)
         body_label.set_halign(Gtk.Align.START)
         body_label.set_selectable(not has_links)
+        body_label.add_css_class("message-zoomable")  # scales with pinch/ctrl-zoom
         if has_links:
             body_label.set_markup(body_markup)
             body_label.connect("activate-link", self._on_body_link_activated)
@@ -536,6 +543,33 @@ class MessageThread(Gtk.Box):
         self._messages_box.set_margin_bottom(8)
         self._scroll.set_child(self._messages_box)
 
+        # ── Message-text zoom (pinch, Ctrl+scroll, Ctrl +/-/0) ────────
+        self._settings = get_settings()
+        self._font_scale = self._settings.message_font_scale
+        self._zoom_base_scale = self._font_scale
+        self._font_provider = Gtk.CssProvider()
+        display = Gdk.Display.get_default()
+        if display is not None:
+            # Just above the app stylesheet so our dynamic font-size wins.
+            Gtk.StyleContext.add_provider_for_display(
+                display, self._font_provider,
+                Gtk.STYLE_PROVIDER_PRIORITY_APPLICATION + 1,
+            )
+        self._apply_font_scale()
+
+        pinch = Gtk.GestureZoom()
+        pinch.connect("begin", self._on_zoom_begin)
+        pinch.connect("scale-changed", self._on_zoom_scale_changed)
+        pinch.connect("end", self._on_zoom_end)
+        self._scroll.add_controller(pinch)
+
+        ctrl_scroll = Gtk.EventControllerScroll.new(
+            Gtk.EventControllerScrollFlags.VERTICAL
+        )
+        ctrl_scroll.set_propagation_phase(Gtk.PropagationPhase.CAPTURE)
+        ctrl_scroll.connect("scroll", self._on_ctrl_scroll)
+        self._scroll.add_controller(ctrl_scroll)
+
         # Loading indicator
         self._loading_spinner = Gtk.Spinner()
         self._loading_spinner.set_halign(Gtk.Align.CENTER)
@@ -746,7 +780,7 @@ class MessageThread(Gtk.Box):
         """Ask the phone for the full-resolution file of any inline image we
         only have a thumbnail for, so the chat shows the real image, not a
         blurry preview. Each attachment is requested at most once per session."""
-        if self._on_download_attachment is None or not self._thread_id:
+        if not self._thread_id:
             return
         for msg in messages:
             for att in (msg.attachments or []):
@@ -760,7 +794,7 @@ class MessageThread(Gtk.Box):
                 if key in self._auto_fetched:
                     continue
                 self._auto_fetched.add(key)
-                self._on_download_attachment(
+                self._request_attachment_download(
                     part_id, unique_identifier, _attachment_name(att)
                 )
 
@@ -788,6 +822,51 @@ class MessageThread(Gtk.Box):
         adj = self._scroll.get_vadjustment()
         adj.set_value(adj.get_upper())
         return GLib.SOURCE_REMOVE
+
+    # ── Message-text zoom ──────────────────────────────────────────
+
+    def _apply_font_scale(self):
+        pct = int(round(self._font_scale * 100))
+        css = f".message-zoomable {{ font-size: {pct}%; }}"
+        if hasattr(self._font_provider, "load_from_string"):
+            self._font_provider.load_from_string(css)  # GTK 4.12+
+        else:
+            self._font_provider.load_from_data(css.encode("utf-8"))
+
+    def _set_font_scale(self, scale: float, *, persist: bool):
+        scale = min(MESSAGE_FONT_SCALE_MAX, max(MESSAGE_FONT_SCALE_MIN, scale))
+        changed = abs(scale - self._font_scale) >= 0.001
+        if changed:
+            self._font_scale = scale
+            self._apply_font_scale()
+        if persist and (changed or self._settings.message_font_scale != scale):
+            self._settings.message_font_scale = scale
+
+    def zoom_in(self):
+        self._set_font_scale(self._font_scale + 0.1, persist=True)
+
+    def zoom_out(self):
+        self._set_font_scale(self._font_scale - 0.1, persist=True)
+
+    def zoom_reset(self):
+        self._set_font_scale(1.0, persist=True)
+
+    def _on_zoom_begin(self, _gesture, _sequence):
+        self._zoom_base_scale = self._font_scale
+
+    def _on_zoom_scale_changed(self, _gesture, scale):
+        self._set_font_scale(self._zoom_base_scale * scale, persist=False)
+
+    def _on_zoom_end(self, _gesture, _sequence):
+        self._settings.message_font_scale = self._font_scale
+
+    def _on_ctrl_scroll(self, controller, _dx, dy):
+        if not (controller.get_current_event_state() & Gdk.ModifierType.CONTROL_MASK):
+            return False  # normal scroll — let the list scroll
+        if dy == 0:
+            return False
+        self._set_font_scale(self._font_scale + (0.1 if dy < 0 else -0.1), persist=True)
+        return True
 
     def _on_send(self, _widget):
         text = self._text_entry.get_text().strip()

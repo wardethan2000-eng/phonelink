@@ -57,6 +57,27 @@ class SettingsPersistenceTests(unittest.TestCase):
             self.s.notifications_enabled = False  # same value → no write
             self.assertEqual(w.call_count, 0)
 
+    def test_message_font_scale_defaults_to_one(self):
+        self.assertEqual(self.s.message_font_scale, 1.0)
+
+    def test_message_font_scale_setter_clamps_and_persists(self):
+        import json
+        self.s.message_font_scale = 99.0  # absurd → clamped to max
+        self.assertEqual(self.s.message_font_scale, settings_mod.MESSAGE_FONT_SCALE_MAX)
+        self.assertEqual(
+            json.loads(self._path.read_text())["message_font_scale"],
+            settings_mod.MESSAGE_FONT_SCALE_MAX,
+        )
+        self.s.message_font_scale = 0.0  # below min → clamped to min
+        self.assertEqual(self.s.message_font_scale, settings_mod.MESSAGE_FONT_SCALE_MIN)
+
+    def test_message_font_scale_loads_clamped_from_disk(self):
+        self._path.write_text('{"message_font_scale": 42}')
+        reloaded = Settings()
+        self.assertEqual(
+            reloaded.message_font_scale, settings_mod.MESSAGE_FONT_SCALE_MAX
+        )
+
 
 if __name__ == "__main__":
     unittest.main()

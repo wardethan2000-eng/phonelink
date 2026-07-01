@@ -1,5 +1,51 @@
 import unittest
-from phonelink.ui.message_thread import _message_markup
+
+from phonelink.models import SmsMessage
+from phonelink.ui.message_thread import MessageThread, _message_markup
+
+
+class AutoFetchFullImagesTests(unittest.TestCase):
+    """Exercise MessageThread._auto_fetch_full_images without building a widget
+    (headless GTK construction segfaults). This guards the real bug where the
+    method referenced a MessageBubble-only attribute and crashed set_messages."""
+
+    def _thread(self):
+        t = MessageThread.__new__(MessageThread)
+        t._thread_id = 1
+        t._auto_fetched = set()
+        t.requested = []
+        t._request_attachment_download = lambda pid, uid, name: t.requested.append(
+            (pid, uid, name)
+        )
+        return t
+
+    def _image_msg(self, part_id=3, uid="PART_1.jpg", full=False):
+        att = {"partId": part_id, "mimeType": "image/jpeg", "uniqueIdentifier": uid,
+               "fileName": uid}
+        if full:
+            att["fullPath"] = __file__  # any existing file counts as "have full"
+        return SmsMessage(uid=1, body="", date=1, msg_type=1, thread_id=1,
+                          attachments=[att])
+
+    def test_requests_full_res_once_per_attachment(self):
+        t = self._thread()
+        msg = self._image_msg()
+        t._auto_fetch_full_images([msg])
+        t._auto_fetch_full_images([msg])  # dedup — no second request
+        self.assertEqual(t.requested, [(3, "PART_1.jpg", "PART_1.jpg")])
+
+    def test_skips_when_full_already_present(self):
+        t = self._thread()
+        t._auto_fetch_full_images([self._image_msg(full=True)])
+        self.assertEqual(t.requested, [])
+
+    def test_skips_non_images_and_thumbnailless(self):
+        t = self._thread()
+        text_only = SmsMessage(uid=2, body="hi", date=1, msg_type=1, thread_id=1)
+        no_partid = SmsMessage(uid=3, body="", date=1, msg_type=1, thread_id=1,
+                               attachments=[{"mimeType": "image/png", "partId": 0}])
+        t._auto_fetch_full_images([text_only, no_partid])
+        self.assertEqual(t.requested, [])
 
 
 class MessageThreadMarkupTests(unittest.TestCase):

@@ -28,7 +28,12 @@ _DEFAULTS = {
     "google_last_sync_ts": 0.0,
     "google_last_attempt_ts": 0.0,
     "hidden_conversations": {},
+    "message_font_scale": 1.0,   # pinch/ctrl-zoom level for message text
 }
+
+# Bounds for the message-text zoom level.
+MESSAGE_FONT_SCALE_MIN = 0.8
+MESSAGE_FONT_SCALE_MAX = 3.0
 
 
 def _quote_desktop_exec_arg(value: str) -> str:
@@ -89,6 +94,13 @@ class Settings:
         self._data["google_last_attempt_ts"] = float(
             self._data.get("google_last_attempt_ts", 0.0) or 0.0
         )
+        try:
+            scale = float(self._data.get("message_font_scale", 1.0) or 1.0)
+        except (TypeError, ValueError):
+            scale = 1.0
+        self._data["message_font_scale"] = min(
+            MESSAGE_FONT_SCALE_MAX, max(MESSAGE_FONT_SCALE_MIN, scale)
+        )
         raw_hidden = self._data.get("hidden_conversations", {}) or {}
         normalized_hidden: dict[str, dict[str, dict[str, int]]] = {}
         if isinstance(raw_hidden, dict):
@@ -140,6 +152,16 @@ class Settings:
     def color_scheme(self, value: str):
         assert value in ("system", "light", "dark")
         self._data["color_scheme"] = value
+        self.save()
+
+    @property
+    def message_font_scale(self) -> float:
+        return self._data["message_font_scale"]
+
+    @message_font_scale.setter
+    def message_font_scale(self, value: float):
+        clamped = min(MESSAGE_FONT_SCALE_MAX, max(MESSAGE_FONT_SCALE_MIN, float(value)))
+        self._data["message_font_scale"] = clamped
         self.save()
 
     @property

@@ -594,6 +594,16 @@ class MainWindow(Adw.ApplicationWindow):
         if ctrl and keyval == Gdk.KEY_n:
             self._notif_toggle.set_active(not self._notif_toggle.get_active())
             return True
+        # Ctrl +/-/0 zooms message text (matches pinch-to-zoom).
+        if ctrl and keyval in (Gdk.KEY_plus, Gdk.KEY_equal, Gdk.KEY_KP_Add):
+            self.sms_panel.zoom_messages_in()
+            return True
+        if ctrl and keyval in (Gdk.KEY_minus, Gdk.KEY_KP_Subtract):
+            self.sms_panel.zoom_messages_out()
+            return True
+        if ctrl and keyval in (Gdk.KEY_0, Gdk.KEY_KP_0):
+            self.sms_panel.zoom_messages_reset()
+            return True
         return False
 
     def _on_ring_phone(self, _btn):
