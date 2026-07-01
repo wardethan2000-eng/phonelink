@@ -844,37 +844,44 @@ class FilesPanel(Gtk.Box):
 
             self._photo_grid.append(fb_child)
 
-        # Load thumbnails in background
-        self._load_thumbnails_async(image_files)
+        # Load thumbnails in background against a snapshot of *this* scan's tiles.
+        self._load_thumbnails_async(image_files, list(self._photo_tiles), generation)
         return GLib.SOURCE_REMOVE
 
-    def _load_thumbnails_async(self, image_files: list[tuple[str, float]]):
-        """Load thumbnails in a background thread, posting to main thread."""
+    def _load_thumbnails_async(self, image_files, tiles, generation):
+        """Load thumbnails in a background thread, posting to the main thread.
+
+        ``tiles`` is a snapshot of this scan's tiles and ``generation`` its scan
+        id.  The worker only ever touches its own snapshot and bails the moment a
+        newer scan starts or loading is cancelled \u2014 so it can never ``IndexError``
+        on a concurrently-cleared list or paint thumbnails onto replaced tiles.
+        """
         total = len(image_files)
+
+        def superseded():
+            return self._loading_cancelled or generation != self._photo_scan_generation
 
         def worker():
             for i, (full_path, _) in enumerate(image_files):
-                if self._loading_cancelled:
+                if superseded():
                     return
                 try:
                     pixbuf = GdkPixbuf.Pixbuf.new_from_file_at_scale(
                         full_path, THUMB_SIZE * 2, THUMB_SIZE * 2, True
                     )
-                    if not self._loading_cancelled and i < len(self._photo_tiles):
-                        tile = self._photo_tiles[i]
-                        GLib.idle_add(tile.set_thumbnail, pixbuf)
-                        if (i + 1) % 5 == 0 or i == total - 1:
-                            GLib.idle_add(
-                                self._photo_status.set_label,
-                                f"Loading {i + 1}/{total} photos\u2026"
-                            )
                 except GLib.Error:
-                    pass
-            if not self._loading_cancelled:
-                GLib.idle_add(
-                    self._photo_status.set_label,
-                    f"{total} photos"
-                )
+                    continue
+                if superseded() or i >= len(tiles):
+                    continue
+                tile = tiles[i]
+                GLib.idle_add(tile.set_thumbnail, pixbuf)
+                if (i + 1) % 5 == 0 or i == total - 1:
+                    GLib.idle_add(
+                        self._photo_status.set_label,
+                        f"Loading {i + 1}/{total} photos\u2026"
+                    )
+            if not superseded():
+                GLib.idle_add(self._photo_status.set_label, f"{total} photos")
 
         t = threading.Thread(target=worker, daemon=True)
         self._thumb_threads.append(t)

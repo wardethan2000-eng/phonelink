@@ -81,6 +81,38 @@ class MessageStoreTests(unittest.TestCase):
         self.assertEqual(self.store.load_conversations("devA")[1].address, "a")
         self.assertEqual(self.store.load_conversations("devB")[1].address, "b")
 
+    def test_batch_coalesces_commits_but_persists_all(self):
+        # sqlite3.Connection.commit is read-only (C attr), so wrap the connection
+        # in a counting proxy to prove batching collapses N commits into 1.
+        class CountingConn:
+            def __init__(self, real):
+                self._real = real
+                self.commits = 0
+
+            def commit(self):
+                self.commits += 1
+                return self._real.commit()
+
+            def __getattr__(self, name):
+                return getattr(self._real, name)
+
+        self.store.upsert_conversation(
+            "dev1", Conversation(thread_id=1, address="111", addresses=["111"])
+        )
+        proxy = CountingConn(self.store._conn)
+        self.store._conn = proxy
+        with self.store.batch():
+            for uid in range(10):
+                self.store.upsert_message(
+                    "dev1", 1,
+                    SmsMessage(uid=uid, body=f"m{uid}", address="111",
+                               date=uid, thread_id=1),
+                )
+        self.assertEqual(proxy.commits, 1)  # one commit for the whole batch
+        # …and every message is durably persisted.
+        loaded = self.store.load_conversations("dev1")
+        self.assertEqual(len(loaded[1].messages), 10)
+
     def test_orphan_message_synthesizes_conversation(self):
         # Message with no conversation row should still load under its thread.
         self.store.upsert_message(
@@ -89,6 +121,59 @@ class MessageStoreTests(unittest.TestCase):
         loaded = self.store.load_conversations("dev1")
         self.assertIn(8, loaded)
         self.assertEqual(loaded[8].messages[0].body, "hi")
+
+
+class ContactsStoreTests(unittest.TestCase):
+    def setUp(self):
+        self._dir = tempfile.TemporaryDirectory()
+        self._root = Path(self._dir.name)
+        self.store = MessageStore(path=self._root / "messages.db")
+
+    def tearDown(self):
+        self.store.close()
+        self._dir.cleanup()
+
+    def test_save_load_delete_contact(self):
+        self.store.save_contact("3165551212", "Jane")
+        self.store.save_contact("3165559999", "Bob")
+        self.assertEqual(
+            self.store.load_contacts(),
+            {"3165551212": "Jane", "3165559999": "Bob"},
+        )
+        self.store.save_contact("3165551212", "Jane Doe")  # upsert
+        self.assertEqual(self.store.load_contacts()["3165551212"], "Jane Doe")
+        self.store.delete_contact("3165559999")
+        self.assertEqual(self.store.load_contacts(), {"3165551212": "Jane Doe"})
+
+    def test_replace_contacts_makes_table_match_exactly(self):
+        self.store.save_contact("111", "A")
+        self.store.replace_contacts({"222": "B", "333": "C"})
+        self.assertEqual(self.store.load_contacts(), {"222": "B", "333": "C"})
+
+    def test_contacts_json_migrated_once(self):
+        import json as _json
+        # A pristine directory whose DB has never been opened, so the very first
+        # store creation performs the one-time migration.
+        fresh = self._root / "fresh"
+        fresh.mkdir()
+        (fresh / "contacts.json").write_text(
+            _json.dumps({"5551110000": "Legacy One", "5551112222": "Legacy Two"})
+        )
+        store2 = MessageStore(path=fresh / "messages.db")
+        try:
+            self.assertEqual(
+                store2.load_contacts(),
+                {"5551110000": "Legacy One", "5551112222": "Legacy Two"},
+            )
+            # A later edit + reopen must NOT re-import the legacy file over it.
+            store2.delete_contact("5551110000")
+        finally:
+            store2.close()
+        store3 = MessageStore(path=fresh / "messages.db")
+        try:
+            self.assertEqual(store3.load_contacts(), {"5551112222": "Legacy Two"})
+        finally:
+            store3.close()
 
 
 if __name__ == "__main__":

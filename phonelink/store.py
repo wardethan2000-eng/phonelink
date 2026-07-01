@@ -17,6 +17,7 @@ from __future__ import annotations
 import json
 import sqlite3
 import threading
+from contextlib import contextmanager
 from pathlib import Path
 
 from phonelink.models import Conversation, SmsMessage
@@ -32,7 +33,33 @@ class MessageStore:
         self._path = str(path or STORE_FILE)
         self._lock = threading.Lock()
         self._conn: sqlite3.Connection | None = None
+        self._batch_depth = 0  # >0 → coalesce commits until the batch ends
         self._open()
+
+    def _commit(self):
+        """Commit unless we're inside a batch (then defer to batch exit)."""
+        if self._conn is not None and self._batch_depth == 0:
+            self._conn.commit()
+
+    @contextmanager
+    def batch(self):
+        """Coalesce many upserts into a single commit (bulk sync path).
+
+        Per-message commits during a full-phone sync of hundreds of messages are
+        the dominant write cost; one commit at the end is dramatically cheaper.
+        """
+        with self._lock:
+            self._batch_depth += 1
+        try:
+            yield self
+        finally:
+            with self._lock:
+                self._batch_depth -= 1
+                if self._batch_depth == 0 and self._conn is not None:
+                    try:
+                        self._conn.commit()
+                    except sqlite3.Error as exc:
+                        print(f"[phonelink] store.batch commit failed: {exc}")
 
     # ── lifecycle ──────────────────────────────────────────────────
 
@@ -77,9 +104,50 @@ class MessageStore:
             );
             CREATE INDEX IF NOT EXISTS idx_messages_thread
                 ON messages (device_id, thread_id);
+            CREATE TABLE IF NOT EXISTS contacts (
+                phone TEXT PRIMARY KEY,
+                name  TEXT
+            );
+            CREATE TABLE IF NOT EXISTS meta (
+                key   TEXT PRIMARY KEY,
+                value TEXT
+            );
             """
         )
         self._conn.commit()
+        self._migrate_contacts_json()
+
+    def _migrate_contacts_json(self):
+        """One-time import of the legacy ``contacts.json`` into the store.
+
+        Runs once (guarded by a ``meta`` flag).  The JSON file is left in place
+        as a backup; after this the store is the single source of truth.
+        """
+        assert self._conn is not None
+        try:
+            row = self._conn.execute(
+                "SELECT value FROM meta WHERE key='contacts_migrated'"
+            ).fetchone()
+            if row is not None:
+                return
+            legacy = Path(self._path).parent / "contacts.json"
+            imported = 0
+            if legacy.is_file():
+                data = json.loads(legacy.read_text(encoding="utf-8"))
+                if isinstance(data, dict):
+                    self._conn.executemany(
+                        "INSERT OR REPLACE INTO contacts (phone, name) VALUES (?, ?)",
+                        [(str(k), str(v)) for k, v in data.items() if k and v],
+                    )
+                    imported = len(data)
+            self._conn.execute(
+                "INSERT OR REPLACE INTO meta (key, value) VALUES ('contacts_migrated', '1')"
+            )
+            self._conn.commit()
+            if imported:
+                print(f"[phonelink] migrated {imported} contacts from contacts.json")
+        except (sqlite3.Error, OSError, ValueError) as exc:
+            print(f"[phonelink] contacts migration skipped: {exc}")
 
     def close(self):
         with self._lock:
@@ -110,7 +178,7 @@ class MessageStore:
                         int(msg.read), json.dumps(msg.attachments or []),
                     ),
                 )
-                self._conn.commit()
+                self._commit()
             except sqlite3.Error as exc:
                 print(f"[phonelink] store.upsert_message failed: {exc}")
 
@@ -134,7 +202,7 @@ class MessageStore:
                         1 if conv.is_read else 0,
                     ),
                 )
-                self._conn.commit()
+                self._commit()
             except sqlite3.Error as exc:
                 print(f"[phonelink] store.upsert_conversation failed: {exc}")
 
@@ -164,7 +232,7 @@ class MessageStore:
                     """,
                     rows,
                 )
-                self._conn.commit()
+                self._commit()
             except sqlite3.Error as exc:
                 print(f"[phonelink] store.upsert_conversations failed: {exc}")
 
@@ -182,9 +250,66 @@ class MessageStore:
                     "DELETE FROM messages WHERE device_id=? AND thread_id=?",
                     (device_id, int(thread_id)),
                 )
-                self._conn.commit()
+                self._commit()
             except sqlite3.Error as exc:
                 print(f"[phonelink] store.delete_conversation failed: {exc}")
+
+    # ── contacts (normalised phone → display name) ─────────────────
+
+    def load_contacts(self) -> dict[str, str]:
+        if self._conn is None:
+            return {}
+        with self._lock:
+            try:
+                rows = self._conn.execute(
+                    "SELECT phone, name FROM contacts"
+                ).fetchall()
+            except sqlite3.Error as exc:
+                print(f"[phonelink] store.load_contacts failed: {exc}")
+                return {}
+        return {phone: name for phone, name in rows if phone}
+
+    def save_contact(self, phone: str, name: str):
+        if self._conn is None or not phone:
+            return
+        with self._lock:
+            try:
+                self._conn.execute(
+                    "INSERT OR REPLACE INTO contacts (phone, name) VALUES (?, ?)",
+                    (str(phone), str(name)),
+                )
+                self._commit()
+            except sqlite3.Error as exc:
+                print(f"[phonelink] store.save_contact failed: {exc}")
+
+    def delete_contact(self, phone: str):
+        if self._conn is None or not phone:
+            return
+        with self._lock:
+            try:
+                self._conn.execute(
+                    "DELETE FROM contacts WHERE phone=?", (str(phone),)
+                )
+                self._commit()
+            except sqlite3.Error as exc:
+                print(f"[phonelink] store.delete_contact failed: {exc}")
+
+    def replace_contacts(self, mapping: dict[str, str]):
+        """Make the contacts table exactly match ``mapping`` (one transaction)."""
+        if self._conn is None:
+            return
+        rows = [(str(k), str(v)) for k, v in (mapping or {}).items() if k]
+        with self._lock:
+            try:
+                self._conn.execute("DELETE FROM contacts")
+                if rows:
+                    self._conn.executemany(
+                        "INSERT OR REPLACE INTO contacts (phone, name) VALUES (?, ?)",
+                        rows,
+                    )
+                self._commit()
+            except sqlite3.Error as exc:
+                print(f"[phonelink] store.replace_contacts failed: {exc}")
 
     # ── reads ──────────────────────────────────────────────────────
 

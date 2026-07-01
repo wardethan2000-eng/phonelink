@@ -1,7 +1,6 @@
-"""Contact name resolution — local JSON store + KDE Connect vCard cache + CSV import."""
+"""Contact name resolution — SQLite store + KDE Connect vCard cache + CSV import."""
 
 import csv
-import json
 import quopri
 import re
 import unicodedata
@@ -10,9 +9,8 @@ from pathlib import Path
 # KDE Connect stores synced vCards here
 VCARD_BASE = Path.home() / ".local" / "share" / "kpeoplevcard"
 
-# Our own local contacts store
+# Contact photos we download live here (contact names are in the SQLite store).
 CONTACTS_DIR = Path.home() / ".local" / "share" / "phonelink"
-CONTACTS_FILE = CONTACTS_DIR / "contacts.json"
 CONTACT_PHOTOS_DIR = CONTACTS_DIR / "contact_photos"
 
 
@@ -85,25 +83,15 @@ def _notification_message_text(props: dict) -> str:
 # ── Local JSON contacts store ──────────────────────────────────────
 
 def _load_local_contacts() -> dict[str, str]:
-    """Load our local contacts JSON: {normalized_phone: display_name}."""
-    if not CONTACTS_FILE.is_file():
-        return {}
-    try:
-        data = json.loads(CONTACTS_FILE.read_text(encoding="utf-8"))
-        if isinstance(data, dict):
-            return data
-    except (json.JSONDecodeError, OSError):
-        pass
-    return {}
+    """Load our local contacts {normalized_phone: display_name} from the store."""
+    from phonelink.store import get_message_store
+    return get_message_store().load_contacts()
 
 
 def _save_local_contacts(contacts: dict[str, str]):
-    """Persist contacts to our JSON file."""
-    CONTACTS_DIR.mkdir(parents=True, exist_ok=True)
-    CONTACTS_FILE.write_text(
-        json.dumps(contacts, indent=2, ensure_ascii=False),
-        encoding="utf-8",
-    )
+    """Persist the full local contacts map to the store."""
+    from phonelink.store import get_message_store
+    get_message_store().replace_contacts(contacts)
 
 
 def store_contact_photo(address: str, image_bytes: bytes, content_type: str | None = None) -> bool:
@@ -188,20 +176,18 @@ def merge_contacts(contact_names: dict[str, str]) -> int:
 
 def save_contact(address: str, name: str):
     """Save or update a single contact name for a phone number."""
-    contacts = _load_local_contacts()
     norm = _normalize_phone(address)
     if norm:
-        contacts[norm] = name
-        _save_local_contacts(contacts)
+        from phonelink.store import get_message_store
+        get_message_store().save_contact(norm, name)
 
 
 def delete_contact(address: str):
     """Remove a contact by phone number."""
-    contacts = _load_local_contacts()
     norm = _normalize_phone(address)
-    if norm and norm in contacts:
-        del contacts[norm]
-        _save_local_contacts(contacts)
+    if norm:
+        from phonelink.store import get_message_store
+        get_message_store().delete_contact(norm)
 
 
 def import_google_csv(csv_path: str) -> int:
@@ -504,7 +490,8 @@ def harvest_contacts_from_notifications(client, device_id: str,
                 if norm and existing.get(norm) != title:
                     existing[norm] = title
                     new_count += 1
-        except Exception:
+        except Exception as exc:
+            print(f"[phonelink] harvest_contacts_from_notifications: skipped one: {exc}")
             continue
 
     if new_count:
@@ -550,8 +537,8 @@ def harvest_contact_from_notification_signal(
                     if norm and contact_map.get(norm) != title:
                         save_contact(conv.address, title)
                         return (norm, title)
-    except Exception:
-        pass
+    except Exception as exc:
+        print(f"[phonelink] contact-from-notification match failed: {exc}")
     return None
 
 
@@ -593,8 +580,8 @@ def match_contact_from_notification_props(
                     if norm and contact_map.get(norm) != title:
                         save_contact(conv.address, title)
                         return (norm, title)
-    except Exception:
-        pass
+    except Exception as exc:
+        print(f"[phonelink] contact-from-notification match failed: {exc}")
     return None
 
 

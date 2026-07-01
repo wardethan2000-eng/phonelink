@@ -194,14 +194,104 @@ Status as of the latest commit on `claude/codebase-review-architecture-7lj1b3`.
 | M2 — Event-driven status | ✅ Done | `Gio.bus_watch_name` for daemon up/down; per-device `reachableChanged` + battery `refreshed` signals; 30 s poll replaced by a 120 s safety-net watchdog. |
 | M3 — SQLite store | ✅ Done | `phonelink/store.py` (`MessageStore`, gi-free, WAL). Loads cached history on connect (instant startup); persists messages/conversations on merge/read/rename; deletes on removal. `tests/test_store.py` (6 tests). **Contacts NOT migrated** — still `contacts.json` (fine for now). |
 | M4 — Incremental UI | ✅ Done (scoped) | `MessageThread.sync()` appends only new bubbles; `ConversationList` updates rows in place via a `thread_id→row` map + sort-func. **Did NOT do the full `Gtk.ListView`/`Gio.ListModel` widget swap** — kept the existing `ListBox`/`Box` widgets to avoid an untested large rewrite; captures the perf win with far lower regression risk. True virtualization can be a later, device-tested milestone. |
-| M5 — Simplify reconciliation | ⬜ Not started | Replace render-time `_detect_self_number` / `_thread_redirects` / `_deduplicated_conversations` with a canonical participant-set identity computed on ingest (now anchorable on the SQLite store). Most behavior-sensitive change; **runtime-test after**. |
-| M6 — Hardening | ⬜ Not started | Atomic writes (temp + `os.replace`) for `contacts.json` / `settings.json` / Google token; debounce settings writes; batch store commits during bulk sync; harden or drop the tray subprocess; add CI + more tests. |
+| M5 — Simplify reconciliation | ✅ Done | New gi-free `phonelink/reconcile.py` (`ConversationIndex` + pure `conversation_identity` / `detect_self_key`). Conversations are now normalized **once, on ingest**, keyed by a canonical participant-set identity (last-10-digit set, self number removed for groups); SMS/MMS/dual-SIM threads collapse the moment their messages land and stay collapsed with a stable primary thread ID. `_deduplicated_conversations` is now a **pure, side-effect-free filter** (was the render-time heuristic that mutated messages/active-thread/unread on every refresh — the flicker/split/merge source); `_thread_redirects` removed (derived from identity via `secondary_threads` / `primary_for`); `_detect_self_number` delegates to the pure helper and only re-keys on change. Tests: `tests/test_reconcile.py` (17, pure logic) + `tests/test_sms_panel_reconcile.py` (6, the real panel glue driven headlessly). Panel shrank ~124 lines. |
+| M6 — Hardening | ✅ Done | **Atomic writes:** new gi-free `phonelink/atomicio.py` (`atomic_write_text`/`_json` = temp-in-same-dir + `fsync` + `os.replace`), applied to `settings.json`, `contacts.json`, the Google token, and the autostart `.desktop` — a crash mid-write can no longer truncate-and-reset state. **Settings writes** now batch (`Settings.batch()` context manager → one write per dialog session) and skip redundant identical writes. **Store commits** batch during bulk sync (`MessageStore.batch()` → the ingest loop in `_apply_active_conversations` commits once, not per-message). **Tray hardened:** new `phonelink/proc.py` `(pid, start_time)` identity check — the tray verifies the parent's start token before trusting liveness or sending `SIGUSR1/2`, closing the recycled-PID mis-signal hole (bug #10); did **not** rip out the subprocess for an in-process `StatusNotifierItem` (bigger, display-dependent rewrite — deferred). **CI:** `.github/workflows/ci.yml` installs GTK4/Adw typelibs and runs `compileall` + `pytest` on every push/PR. Tests: `test_atomicio.py` (4), `test_proc.py` (5), + settings/store batch tests (`tests/` total = 52 green). |
 
-### Verification caveat (applies to all milestones so far)
-This environment has no `gi`/GTK, no display, and no `kdeconnectd`, so **the GTK code paths have not been run** — they are verified by `py_compile` + code review only. The gi-free unit tests (`tests/test_store.py`, `tests/test_contacts.py`, `tests/test_settings.py`) do run and pass. Before relying on M1–M4, smoke-test on a real machine: instant startup from cache, no UI freeze on SFTP mount / send, live battery+connection updates, and a long thread appending (not rebuilding) on a new message.
+### Verification status
+`gi`/GTK4/Libadwaita **are** importable in this environment, but there is no
+display or `kdeconnectd`, so **GTK widgets cannot be constructed headlessly** (it
+segfaults) and the on-screen rendering paths are still unrun. What *is* now
+covered by automated tests (39 total, all green — run `python3 -m pytest`):
 
-### Next up
-**M5**, then **M6**. M5 is the one that most directly fixes the "inconsistent" feeling (thread split/merge flicker, duplicate drafts) and should be runtime-tested before building further on it.
+- **Pure reconciliation logic** — `phonelink/reconcile.py` via `tests/test_reconcile.py` (17): identity canonicalisation, self-number detection, ingest merge/dedup, primary stability, legacy-duplicate collapse, reindex.
+- **The real panel reconciliation glue** — `tests/test_sms_panel_reconcile.py` (6) constructs an actual `SmsPanel` without `Gtk.Box.__init__` (widgets faked, real store + settings-fake) and drives `_apply_active_conversations` / `_merge_message` / `_deduplicated_conversations` / hide / delete / cached-load with real KDE Connect message tuples. This exercises the M5 code paths end-to-end, not a reimplementation.
+- **Store / contacts / settings** — the existing gi-free suites.
+
+Writing the panel test already caught one realism bug (hidden-until is stamped on
+the wall clock, so resurrection needs epoch-millis dates). Still unrun and worth a
+real-device smoke test: instant startup feel, no UI freeze on SFTP mount / send,
+live battery+connection updates, a long thread *appending* (not rebuilding) on a
+new message, and that a split SMS/MMS contact renders as **one** stable row with
+no unread flicker.
+
+### Status: all six milestones landed
+M1–M6 are complete. M5 (reconciliation) and M6 (hardening) were both smoke-tested
+on a real machine against a live Galaxy S25: the app starts, syncs 225
+conversations with **zero split/duplicate threads**, writes `settings.json` /
+`contacts.json` atomically (no `.tmp` debris), keeps the message DB at
+`integrity_check: ok` under batched commits, and the hardened tray exits on its
+own when the parent dies (identity-checked liveness).
+
+**Duplicate-SMS-on-send — resolved.** The set-aside fixes were re-checked against
+the M5 send path.  M5 did not introduce a structural double-send (the old
+notification-reply path only fell back on failure), but it *preferred* the two
+methods empirically shown to duplicate SMS on the Galaxy S25 (notification reply,
+then `replyToConversation`).  `_send_text_reply` now sends 1:1 threads via
+`sendWithoutConversation` (`send_sms([address])`) — the only reliable path on that
+device — and keeps group threads on `replyToConversation` to preserve recipients;
+all attachment sends route through the same helper.  Covered by
+`tests/test_sms_panel_reconcile.py` (send-routing tests).  The now-unused
+notification reply-*target* machinery (`_notification_reply_targets`,
+`_remember_notification_reply_target`, `_conversation_matches_notification`,
+`_message_text_matches`, `_refresh_notification_reply_targets`) has been deleted;
+contact-name harvesting from notifications (`match_contact_from_notification_props`)
+is retained.  This removed a per-notification conversation scan that computed a
+reply target nothing read anymore.
+
+**Robustness quick-wins — done.** Three lingering bugs from the §3 table fixed
+and verified on-device:
+- **#14 clipboard poll wedge** (`clipboard_panel.py`): added a watchdog so a
+  dropped async clipboard read can no longer pin `_poll_pending` True forever and
+  silently stop clipboard sync.
+- **#11 files photo-load cancel race** (`files_panel.py`): the thumbnail worker now
+  operates on a per-scan tile *snapshot* + scan generation, so a concurrent
+  `_clear_photo_grid()` (cancel or a newer scan) can't `IndexError` on a cleared
+  list or paint thumbnails onto replaced tiles.
+- **#13 silent excepts** (`contacts.py`, `google_contacts.py`): the seven
+  `except Exception: pass/return` swallows now log a `[phonelink] …` diagnostic so
+  D-Bus/network failures are no longer invisible.
+
+(For the record, table bug **#12** — mount error leaving `_is_mounted` True — was
+already fixed in the current code; the mount-failure path resets the mount state.)
+
+**Notifications panel incremental update (#9) — done.** `NotificationsPanel`
+no longer rebuilds the whole list on every change.  `_rebuild_list` (full teardown
++ reconnect-all-handlers) is replaced by `_sync_list`, which diffs the desired vs.
+existing rows (via the pure, tested `diff_notification_rows`) and only
+removes/adds/recreates the rows that actually changed — untouched rows keep their
+expansion state and their handler connections.  Ordering is handled by a
+`set_sort_func` (newest first).  Covered by `tests/test_notifications_panel.py`
+(5 tests: the pure diff + `_sync_list` preserving/dropping/recreating the right
+rows, driven on a bare panel with a fake list box).
+
+**In-process tray (#1) — done.** `phonelink/tray_sni.py` implements the
+`org.kde.StatusNotifierItem` + `com.canonical.dbusmenu` spec directly over Gio
+(no GTK3), so the tray now runs *in-process* when a StatusNotifierWatcher is
+available.  `app.py` tries it first and **falls back to the hardened subprocess**
+if registration fails, so desktops without a watcher are unaffected.  Verified
+live end-to-end: registers with the watcher (no subprocess spawned), serves the
+icon + menu (`GetLayout`/`GetGroupProperties`), left-click activates the window,
+and the Quit menu item cleanly exits.  Marshalling covered by
+`tests/test_tray_sni.py`.
+
+**contacts.json → SQLite (#4) — done.** Contact names now live in a `contacts`
+table in the store (single source of truth), with a one-time, flag-guarded
+migration of the legacy `contacts.json` (the JSON is left as a backup).
+`contacts.py`'s storage layer delegates to `MessageStore`
+(`load_contacts`/`save_contact`/`delete_contact`/`replace_contacts`).  Verified on
+real data (18 contacts migrated) and covered by `tests/test_store.py`.
+
+**ListView virtualization (#3) — deliberately NOT done (won't-do).**
+`ConversationList`/`MessageThread` already update in place (M4) and render 225
+conversations with no flicker.  `Gtk.ListView` virtualization only pays off at
+thousands of rows, so a full rewrite of these two large, feature-dense widgets
+(avatars, search + suggestions, filter/sort, selection, context menus, message
+grouping, attachments, links) would carry real regression risk to the primary UI
+for **zero user-visible benefit** at this scale.  Left as-is by design; revisit
+only if conversation counts grow into the thousands.
+
+All six milestones plus every table-#bug except this one deliberate scale-gated
+skip are now addressed.
 
 ---
 

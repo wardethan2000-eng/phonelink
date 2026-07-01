@@ -1,5 +1,6 @@
 """Clipboard sync panel — shared clipboard history between PC and phone."""
 
+import time
 from datetime import datetime
 
 import gi
@@ -9,6 +10,10 @@ gi.require_version("Adw", "1")
 from gi.repository import Gtk, Adw, Gdk, GLib
 
 from phonelink.dbus_client import IFACE_CLIPBOARD
+
+# If an async clipboard read stays "pending" longer than this, assume its
+# callback was dropped and allow a fresh read (otherwise polling wedges forever).
+_POLL_STUCK_SECONDS = 10
 
 
 class ClipboardPanel(Gtk.Box):
@@ -24,6 +29,7 @@ class ClipboardPanel(Gtk.Box):
         self._history: list[dict] = []  # {text, source, timestamp}
         self._poll_source: int | None = None
         self._poll_pending = False
+        self._poll_pending_since = 0.0  # monotonic time the read was started
         self._last_clipboard_text = ""
 
         # ── Outer stack: status vs content ─────────────────────────
@@ -148,8 +154,17 @@ class ClipboardPanel(Gtk.Box):
             GLib.source_remove(self._poll_source)
             self._poll_source = None
         self._poll_pending = False
+        self._poll_pending_since = 0.0
 
     def _poll_local_clipboard(self):
+        # Watchdog: if a read has been pending across several ticks its callback
+        # was probably dropped — clear the flag so sync can recover.
+        if (
+            self._poll_pending
+            and self._poll_pending_since
+            and time.monotonic() - self._poll_pending_since > _POLL_STUCK_SECONDS
+        ):
+            self._poll_pending = False
         self._read_local_clipboard("synced")
         return GLib.SOURCE_CONTINUE
 
@@ -160,11 +175,13 @@ class ClipboardPanel(Gtk.Box):
         if display is None:
             return
         self._poll_pending = True
+        self._poll_pending_since = time.monotonic()
         clipboard = display.get_clipboard()
         clipboard.read_text_async(None, self._on_polled_text_read, source)
 
     def _on_polled_text_read(self, clipboard, result, source):
         self._poll_pending = False
+        self._poll_pending_since = 0.0
         try:
             text = clipboard.read_text_finish(result)
         except GLib.Error:
