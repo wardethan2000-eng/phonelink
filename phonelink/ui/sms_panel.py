@@ -618,28 +618,23 @@ class SmsPanel(Gtk.Box):
     def _send_text_reply(self, thread_id: int, text: str, attachments=None):
         """Send into an existing thread, off the main thread.
 
-        On the Galaxy S25 (and other Android/KDE Connect builds) replying via the
-        messaging notification *or* ``replyToConversation`` duplicates the SMS.
-        ``sendWithoutConversation`` is the only reliable path for a one-to-one
-        thread, so we use it whenever we know the single recipient's address.
-        Group threads must reply in-thread to preserve all recipients.
+        Uses ``replyToConversation`` — the path KDE Connect's own SMS app uses
+        and the reliable one on the Galaxy S25. ``sendWithoutConversation`` is
+        silently dropped by the phone (verified with dbus-monitor: a reply
+        echoes back within a second, a sendWithoutConversation never does), so
+        it's reserved for *starting* a brand-new conversation, where no
+        conversationID exists yet (see ``_on_send_message``, ``thread_id < 0``).
         """
         if not self._device:
             return
         device_id = self._device.id
         attachments = list(attachments) if attachments else None
-
-        conv = self._conversations.get(self._index.primary_for(thread_id))
-        if conv and conv.address and not conv.is_group:
-            self.client.submit(
-                self.client.send_sms, device_id, [conv.address], text or "",
-                attachments=attachments,
-            )
-        else:
-            self.client.submit(
-                self.client.reply_to_conversation, device_id, thread_id, text or "",
-                attachments=attachments,
-            )
+        conv_id = self._index.primary_for(thread_id)
+        self.client.submit(
+            self.client.reply_to_conversation, device_id, conv_id, text or "",
+            attachments=attachments,
+            on_error=lambda exc: print(f"[phonelink] reply failed: {exc}"),
+        )
 
     def _handle_telephony_contact(self, event: str, number: str, contact_name: str):
         """Persist a contact name emitted by the telephony plugin."""
@@ -1270,7 +1265,8 @@ class SmsPanel(Gtk.Box):
 
     def _on_send_message(self, widget, thread_id, text):
         """Handle send from the compose bar."""
-        if not self._device or not self._device.reachable:
+        if not (self._device and self._device.reachable):
+            self._show_toast("Can't send — your phone isn't connected right now")
             return
 
         if thread_id < 0:

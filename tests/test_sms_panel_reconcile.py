@@ -184,9 +184,10 @@ class PanelReconcileTests(unittest.TestCase):
 
     # ── send routing (duplicate-SMS fix) ───────────────────────────
 
-    def test_one_to_one_send_uses_send_without_conversation(self):
-        # A 1:1 thread must send via sendWithoutConversation (send_sms), never
-        # replyToConversation or a notification reply — those duplicate on Android.
+    def test_one_to_one_send_uses_reply_to_conversation(self):
+        # sendWithoutConversation is silently dropped by the phone; replyToConversation
+        # is the reliable path (what KDE Connect's own SMS app uses), so an existing
+        # 1:1 thread replies in-thread by conversation id — never send_sms/notification.
         self.p._apply_active_conversations("dev1", [
             tup(1, thread_id=10, addrs=["+13165551212"], date=100),
         ])
@@ -194,12 +195,12 @@ class PanelReconcileTests(unittest.TestCase):
         self.p.client.calls.clear()
         self.p._send_text_reply(conv.thread_id, "hi there")
         names = self.p.client.call_names()
-        self.assertIn("send_sms", names)
-        self.assertNotIn("reply_to_conversation", names)
+        self.assertIn("reply_to_conversation", names)
+        self.assertNotIn("send_sms", names)
         self.assertNotIn("reply_to_notification", names)
-        # …addressed to the recipient's number, not the thread id.
-        args = dict(self.p.client.calls)["send_sms"]
-        self.assertEqual(args[1], ["+13165551212"])
+        # …addressed to the conversation id, not the phone number.
+        args = dict(self.p.client.calls)["reply_to_conversation"]
+        self.assertEqual(args[1], conv.thread_id)
 
     def test_group_send_replies_in_thread(self):
         self.p._apply_active_conversations("dev1", [
