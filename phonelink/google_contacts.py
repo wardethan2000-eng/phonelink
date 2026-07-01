@@ -7,6 +7,7 @@ import os
 from dataclasses import dataclass
 from pathlib import Path
 
+from phonelink.atomicio import atomic_write_text
 from phonelink.contacts import (
     _normalize_phone,
     delete_contact_photo,
@@ -137,16 +138,15 @@ def _credentials_have_required_scopes(creds) -> bool:
     if hasattr(creds, "has_scopes"):
         try:
             return bool(creds.has_scopes(SCOPES))
-        except Exception:
-            pass
+        except Exception as exc:
+            print(f"[phonelink] google: has_scopes check failed, falling back: {exc}")
     scopes = set(getattr(creds, "scopes", []) or [])
     return scopes.issuperset(SCOPES)
 
 
 def _save_credentials(creds):
-    DATA_DIR.mkdir(parents=True, exist_ok=True)
     if hasattr(creds, "to_json"):
-        GOOGLE_TOKEN_FILE.write_text(creds.to_json(), encoding="utf-8")
+        atomic_write_text(GOOGLE_TOKEN_FILE, creds.to_json())
         return
 
     payload = {
@@ -161,7 +161,7 @@ def _save_credentials(creds):
     if id_token:
         payload["id_token"] = id_token
 
-    GOOGLE_TOKEN_FILE.write_text(json.dumps(payload), encoding="utf-8")
+    atomic_write_text(GOOGLE_TOKEN_FILE, json.dumps(payload))
 
 
 def _ensure_credentials(allow_browser: bool = True):
@@ -176,7 +176,8 @@ def _ensure_credentials(allow_browser: bool = True):
             creds.refresh(Request())
             _save_credentials(creds)
             return creds
-        except Exception:
+        except Exception as exc:
+            print(f"[phonelink] google: token refresh failed: {exc}")
             if not allow_browser:
                 disconnect_google_contacts()
                 raise GoogleContactsAuthRequiredError(
@@ -222,7 +223,8 @@ def _pick_account_label(service) -> str:
             resourceName="people/me",
             personFields="names,emailAddresses",
         ).execute()
-    except Exception:
+    except Exception as exc:
+        print(f"[phonelink] google: profile fetch failed: {exc}")
         return "Google account"
 
     emails = profile.get("emailAddresses", []) or []
@@ -328,7 +330,8 @@ def upsert_google_contact(
 def _download_contact_photo(session, url: str) -> tuple[bytes, str] | None:
     try:
         response = session.get(url, timeout=20)
-    except Exception:
+    except Exception as exc:
+        print(f"[phonelink] google: contact photo download failed: {exc}")
         return None
     if getattr(response, "status_code", 0) != 200:
         return None

@@ -1,7 +1,10 @@
 """App settings — persisted to ~/.local/share/phonelink/settings.json."""
 
 import json
+from contextlib import contextmanager
 from pathlib import Path
+
+from phonelink.atomicio import atomic_write_text
 
 APPLICATION_ID = "dev.phonelink.app"
 DESKTOP_FILENAME = f"{APPLICATION_ID}.desktop"
@@ -57,6 +60,9 @@ def _desktop_entry_text() -> str:
 class Settings:
     def __init__(self):
         self._data: dict = {}
+        self._last_written: str | None = None  # serialized form last persisted
+        self._batch_depth = 0                   # >0 → defer writes until exit
+        self._batch_dirty = False
         self.load()
 
     # ── Persistence ────────────────────────────────────────────────
@@ -101,9 +107,28 @@ class Settings:
         self._data["hidden_conversations"] = normalized_hidden
 
     def save(self):
-        _DATA_DIR.mkdir(parents=True, exist_ok=True)
-        with open(_SETTINGS_FILE, "w") as f:
-            json.dump(self._data, f, indent=2)
+        # Inside a batch, defer the write until the outermost batch() exits so a
+        # settings-dialog session writes disk once instead of on every setter.
+        if self._batch_depth > 0:
+            self._batch_dirty = True
+            return
+        serialized = json.dumps(self._data, indent=2)
+        if serialized == self._last_written:
+            return  # nothing actually changed — skip the redundant write
+        atomic_write_text(_SETTINGS_FILE, serialized)
+        self._last_written = serialized
+
+    @contextmanager
+    def batch(self):
+        """Group several setters into a single atomic write on exit."""
+        self._batch_depth += 1
+        try:
+            yield self
+        finally:
+            self._batch_depth -= 1
+            if self._batch_depth == 0 and self._batch_dirty:
+                self._batch_dirty = False
+                self.save()
 
     # ── Accessors / mutators ───────────────────────────────────────
 
@@ -233,9 +258,7 @@ class Settings:
 
     def _apply_autostart(self, enable: bool):
         if enable:
-            _AUTOSTART_DIR.mkdir(parents=True, exist_ok=True)
-            with open(_AUTOSTART_FILE, "w") as f:
-                f.write(_desktop_entry_text())
+            atomic_write_text(_AUTOSTART_FILE, _desktop_entry_text())
             try:
                 _LEGACY_AUTOSTART_FILE.unlink()
             except FileNotFoundError:
@@ -260,8 +283,7 @@ class Settings:
                 current = ""
             desired = _desktop_entry_text()
             if current != desired:
-                _AUTOSTART_DIR.mkdir(parents=True, exist_ok=True)
-                _AUTOSTART_FILE.write_text(desired, encoding="utf-8")
+                atomic_write_text(_AUTOSTART_FILE, desired)
             if _LEGACY_AUTOSTART_FILE.exists():
                 try:
                     _LEGACY_AUTOSTART_FILE.unlink()

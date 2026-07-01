@@ -10,6 +10,11 @@ import os
 import signal
 import sys
 
+# Running as a script puts this file's dir (phonelink/) on sys.path; add its
+# parent so the gi-free `phonelink.proc` helper is importable.
+sys.path.insert(0, os.path.dirname(os.path.dirname(os.path.abspath(__file__))))
+from phonelink.proc import process_matches
+
 import gi
 gi.require_version("Gtk", "3.0")
 try:
@@ -27,16 +32,27 @@ def main():
 
     icon_path = sys.argv[1]
     parent_pid = int(sys.argv[2])
+    parent_token = int(sys.argv[3]) if len(sys.argv) > 3 else 0
 
     if XApp is None:
         print("[phonelink] XApp not available — tray icon disabled. Install gir1.2-xapp-1.0")
         sys.exit(0)
 
-    # Exit if the parent process dies
+    def parent_alive():
+        # Identity-checked liveness: a recycled PID won't match the start token.
+        return process_matches(parent_pid, parent_token)
+
+    def signal_parent(sig):
+        # Never deliver a signal to a stranger that recycled the parent's PID.
+        if parent_alive():
+            try:
+                os.kill(parent_pid, sig)
+            except OSError:
+                pass
+
+    # Exit if the parent process dies.
     def check_parent():
-        try:
-            os.kill(parent_pid, 0)
-        except OSError:
+        if not parent_alive():
             Gtk.main_quit()
             return False
         return True
@@ -51,7 +67,7 @@ def main():
     # Left-click: show window
     def on_activate(status_icon, button, time):
         if button == 1:  # left click
-            os.kill(parent_pid, signal.SIGUSR1)
+            signal_parent(signal.SIGUSR1)
 
     icon.connect("activate", on_activate)
 
@@ -59,14 +75,14 @@ def main():
     menu = Gtk.Menu()
 
     show_item = Gtk.MenuItem(label="Show Phone Link")
-    show_item.connect("activate", lambda _: os.kill(parent_pid, signal.SIGUSR1))
+    show_item.connect("activate", lambda _: signal_parent(signal.SIGUSR1))
     menu.append(show_item)
 
     menu.append(Gtk.SeparatorMenuItem())
 
     quit_item = Gtk.MenuItem(label="Quit")
     quit_item.connect("activate", lambda _: (
-        os.kill(parent_pid, signal.SIGUSR2),
+        signal_parent(signal.SIGUSR2),
         GLib.timeout_add(500, Gtk.main_quit),
     ))
     menu.append(quit_item)

@@ -113,6 +113,11 @@ class Conversation:
     last_date: int = 0
     is_read: bool = True
     messages: list[SmsMessage] = field(default_factory=list)
+    # Canonical participant-set key + every phone thread ID merged into this
+    # conversation.  Kept in memory only (the store persists messages under the
+    # primary thread_id, so these are re-derived on load — see phonelink.reconcile).
+    identity: str = ""
+    thread_ids: list[int] = field(default_factory=list)
 
     @property
     def is_group(self) -> bool:

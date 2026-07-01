@@ -11,6 +11,21 @@ from phonelink.models import Notification
 from phonelink.settings import get_settings
 
 
+def diff_notification_rows(existing: dict, desired: dict):
+    """Diff two ``{id: signature}`` maps for an in-place list update.
+
+    Pure (no GTK) so it can be unit-tested.  ``remove`` = rows to drop,
+    ``add`` = new rows, ``recreate`` = present rows whose content changed,
+    ``keep`` = present rows that are untouched (their expansion state must be
+    preserved).
+    """
+    remove = [i for i in existing if i not in desired]
+    add = [i for i in desired if i not in existing]
+    recreate = [i for i in desired if i in existing and existing[i] != desired[i]]
+    keep = [i for i in desired if i in existing and existing[i] == desired[i]]
+    return remove, add, recreate, keep
+
+
 # ── Single notification row (expandable in-place) ─────────────────
 
 
@@ -239,6 +254,7 @@ class NotificationsPanel(Gtk.Box):
 
         self._list_box = Gtk.ListBox()
         self._list_box.set_selection_mode(Gtk.SelectionMode.NONE)
+        self._list_box.set_sort_func(self._sort_notifs)
         self._list_box.connect("row-activated", self._on_row_activated)
         scroll.set_child(self._list_box)
 
@@ -303,7 +319,7 @@ class NotificationsPanel(Gtk.Box):
         self._notifications.clear()
         for nid, props in entries:
             self._notifications[nid] = Notification.from_properties(nid, props)
-        self._rebuild_list()
+        self._sync_list()
 
     def _on_notif_posted(self, conn, sender, path, iface, signal, params):
         public_id = params.unpack()[0]
@@ -336,57 +352,86 @@ class NotificationsPanel(Gtk.Box):
             return
         if props:
             self._notifications[public_id] = Notification.from_properties(public_id, props)
-            self._rebuild_list()
+            self._sync_list()
 
     def _remove_one(self, public_id: str):
         self._notifications.pop(public_id, None)
-        self._rebuild_list()
+        self._sync_list()
 
     def _clear_all(self):
         self._notifications.clear()
-        self._rebuild_list()
+        self._sync_list()
 
     # ── List ───────────────────────────────────────────────────────
 
-    def _rebuild_list(self):
-        while self._list_box.get_row_at_index(0):
-            self._list_box.remove(self._list_box.get_row_at_index(0))
-        self._rows.clear()
+    @staticmethod
+    def _notif_signature(n: Notification) -> tuple:
+        """Display-relevant fields — a row is only recreated when these change."""
+        return (
+            n.app_name, n.title, n.ticker, n.text,
+            n.dismissable, n.can_reply, n.has_icon, n.icon_path,
+        )
 
+    def _sort_notifs(self, row_a, row_b) -> int:
+        # Newest first.
+        ta, tb = row_a.notif.timestamp, row_b.notif.timestamp
+        return -1 if ta > tb else (1 if ta < tb else 0)
+
+    def _remove_all_rows(self):
+        for public_id in list(self._rows):
+            self._list_box.remove(self._rows.pop(public_id))
+
+    def _make_row(self, notif: Notification) -> NotifRow:
+        row = NotifRow(notif)
+        row._signature = self._notif_signature(notif)
+        if row._dismiss_btn:
+            row._dismiss_btn.connect(
+                "clicked", self._on_dismiss_clicked, notif.public_id
+            )
+        if row._reply_btn and row._reply_entry:
+            row._reply_btn.connect(
+                "clicked", self._on_reply_clicked, notif.public_id, row._reply_entry
+            )
+            row._reply_entry.connect(
+                "activate", self._on_reply_enter, notif.public_id
+            )
+        return row
+
+    def _sync_list(self):
+        """Update the list in place — untouched rows keep their expansion state.
+
+        Only the changed rows are removed/added/recreated, so a single incoming
+        notification no longer tears down and reconnects the whole list.
+        """
         settings = get_settings()
-
         if not settings.notifications_enabled:
+            self._remove_all_rows()
             self._count_label.set_label("Notifications disabled")
             return
 
-        sorted_notifs = sorted(
-            (
-                n for n in self._notifications.values()
-                if not settings.is_app_ignored(n.app_name or "")
-            ),
-            key=lambda n: n.timestamp,
-            reverse=True,
-        )
-        count = len(sorted_notifs)
+        desired = {
+            nid: n for nid, n in self._notifications.items()
+            if not settings.is_app_ignored(n.app_name or "")
+        }
+        count = len(desired)
         self._count_label.set_label(
             f"{count} notification{'s' if count != 1 else ''}" if count else "No notifications"
         )
 
-        for notif in sorted_notifs:
-            row = NotifRow(notif)
-            if row._dismiss_btn:
-                row._dismiss_btn.connect(
-                    "clicked", self._on_dismiss_clicked, notif.public_id
-                )
-            if row._reply_btn and row._reply_entry:
-                row._reply_btn.connect(
-                    "clicked", self._on_reply_clicked, notif.public_id, row._reply_entry
-                )
-                row._reply_entry.connect(
-                    "activate", self._on_reply_enter, notif.public_id
-                )
-            self._rows[notif.public_id] = row
+        existing_sig = {nid: row._signature for nid, row in self._rows.items()}
+        desired_sig = {nid: self._notif_signature(n) for nid, n in desired.items()}
+        remove, add, recreate, _keep = diff_notification_rows(existing_sig, desired_sig)
+
+        for nid in remove:
+            self._list_box.remove(self._rows.pop(nid))
+        for nid in recreate:
+            self._list_box.remove(self._rows.pop(nid))
+        for nid in recreate + add:
+            row = self._make_row(desired[nid])
+            self._rows[nid] = row
             self._list_box.append(row)
+
+        self._list_box.invalidate_sort()
 
     def _on_row_activated(self, _lb, row):
         if isinstance(row, NotifRow):

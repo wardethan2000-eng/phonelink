@@ -24,6 +24,7 @@ class PhoneLinkApp(Adw.Application):
         )
         self.client = KDEConnectClient()
         self._tray_proc = None
+        self._sni_tray = None
 
     def do_startup(self):
         Adw.Application.do_startup(self)
@@ -69,7 +70,19 @@ class PhoneLinkApp(Adw.Application):
         Gtk.Window.set_default_icon_name("phonelink")
 
     def _setup_tray_icon(self):
-        """Launch the tray icon as a separate subprocess (avoids GTK3/GTK4 conflict)."""
+        """Set up the tray: prefer an in-process StatusNotifierItem, else a subprocess."""
+        try:
+            from phonelink.tray_sni import InProcessTray
+            tray = InProcessTray()
+            if tray.start(on_activate=self._toggle_window, on_quit=self._quit_from_tray):
+                self._sni_tray = tray
+                return
+        except Exception as e:  # noqa: BLE001 — any failure → fall back
+            print(f"[phonelink] in-process tray failed, falling back: {e}")
+        self._start_tray_subprocess()
+
+    def _start_tray_subprocess(self):
+        """Launch the GTK3 tray icon in a separate process (fallback)."""
         icon_path = os.path.join(
             os.path.dirname(os.path.dirname(__file__)), "data", "icons", "phonelink-128.png"
         )
@@ -82,9 +95,13 @@ class PhoneLinkApp(Adw.Application):
 
         tray_script = os.path.join(os.path.dirname(__file__), "_tray.py")
         main_pid = str(os.getpid())
+        # Pass our process start time so the tray can tell us apart from any
+        # future process that reuses our PID (see phonelink.proc).
+        from phonelink.proc import proc_start_time
+        main_token = str(proc_start_time(os.getpid()) or 0)
         try:
             self._tray_proc = subprocess.Popen(
-                [sys.executable, tray_script, icon_path, main_pid],
+                [sys.executable, tray_script, icon_path, main_pid, main_token],
                 stdout=subprocess.DEVNULL,
                 stderr=subprocess.DEVNULL,
             )
@@ -96,8 +113,8 @@ class PhoneLinkApp(Adw.Application):
         # Listen for SIGUSR2 (quit) from tray subprocess
         GLib.unix_signal_add(GLib.PRIORITY_DEFAULT, signal.SIGUSR2, self._on_tray_quit)
 
-    def _on_tray_show(self):
-        """Toggle the main window visibility (triggered by tray icon)."""
+    def _toggle_window(self):
+        """Show/hide the main window (tray activate)."""
         win = self.props.active_window
         if win and win.get_visible():
             win.set_visible(False)
@@ -106,16 +123,22 @@ class PhoneLinkApp(Adw.Application):
             win.present()
         else:
             self.do_activate()
-        return GLib.SOURCE_CONTINUE
 
-    def _on_tray_quit(self):
-        """Actually quit the application (triggered by tray icon SIGUSR2)."""
+    def _quit_from_tray(self):
+        """Quit the application (tray quit action)."""
         self._cleanup_tray()
         win = self.props.active_window
         if win:
             win._quitting = True
             win.close()
         self.quit()
+
+    def _on_tray_show(self):
+        self._toggle_window()
+        return GLib.SOURCE_CONTINUE
+
+    def _on_tray_quit(self):
+        self._quit_from_tray()
         return GLib.SOURCE_REMOVE
 
     def do_shutdown(self):
@@ -123,7 +146,13 @@ class PhoneLinkApp(Adw.Application):
         Adw.Application.do_shutdown(self)
 
     def _cleanup_tray(self):
-        """Terminate the tray subprocess if it's still running."""
+        """Tear down whichever tray is active."""
+        if self._sni_tray is not None:
+            try:
+                self._sni_tray.stop()
+            except Exception:
+                pass
+            self._sni_tray = None
         if self._tray_proc is not None:
             try:
                 self._tray_proc.terminate()
