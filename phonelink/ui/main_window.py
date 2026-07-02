@@ -20,6 +20,7 @@ from phonelink.dbus_client import (
 from phonelink.ui.sms_panel import SmsPanel
 from phonelink.ui.notifications_panel import NotificationsPanel
 from phonelink.ui.files_panel import FilesPanel
+from phonelink.ui.fabric_panel import FabricPanel
 from phonelink.ui.clipboard_panel import ClipboardPanel
 from phonelink.ui.settings_dialog import SettingsPanel
 
@@ -201,6 +202,12 @@ class MainWindow(Adw.ApplicationWindow):
         self.clipboard_panel = ClipboardPanel(client=self.client)
         page = self.stack.add_titled(self.clipboard_panel, "clipboard", "Clipboard")
         page.set_icon_name("edit-paste-symbolic")
+
+        # Loom fabric — browse other devices' files and pull them here. Independent of the KDE
+        # Connect device (it talks to a local loomd), so it's not in the set_device refresh loops.
+        self.fabric_panel = FabricPanel(client=self.client)
+        page = self.stack.add_titled(self.fabric_panel, "fabric", "Fabric")
+        page.set_icon_name("network-workgroup-symbolic")
 
         self.stack.set_vexpand(True)
         self.stack.set_hexpand(True)
