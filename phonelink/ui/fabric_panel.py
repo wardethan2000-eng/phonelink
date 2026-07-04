@@ -117,6 +117,12 @@ class FabricPanel(Gtk.Box):
         status_box.append(self._subtitle_label)
         toolbar.append(status_box)
 
+        invite_btn = Gtk.Button(icon_name="contact-new-symbolic")
+        invite_btn.add_css_class("flat")
+        invite_btn.set_tooltip_text("Invite a device to your realm (shows a QR to scan)")
+        invite_btn.connect("clicked", lambda *_: self._do_invite())
+        toolbar.append(invite_btn)
+
         sync_btn = Gtk.Button(icon_name="emblem-synchronizing-symbolic")
         sync_btn.add_css_class("flat")
         sync_btn.set_tooltip_text("Sync catalogs with your peers")
@@ -245,6 +251,97 @@ class FabricPanel(Gtk.Box):
             self.refresh()
 
         self.client.bridge.submit(work, on_result=done, on_error=self._on_error)
+
+    # ── Invite a device (network enrollment) ───────────────────────────────────────────────────────
+
+    def _do_invite(self):
+        self._toast("Creating invite…")
+        self.client.bridge.submit(
+            self._make_invite, on_result=self._show_invite_dialog, on_error=self._on_error
+        )
+
+    @staticmethod
+    def _make_invite():
+        """Worker: mint an invite and render it as a scannable QR PNG."""
+        result = loom_bridge.connect().enroll_invite(900)  # 15 minutes
+        code = result.get("invite", "")
+        realm = result.get("realm_id", "?")
+        png = None
+        try:
+            import qrcode
+
+            path = os.path.join(GLib.get_user_cache_dir(), "loom_invite.png")
+            qrcode.make(code).save(path)
+            png = path
+        except Exception:  # noqa: BLE001 — no qrcode lib → fall back to the code text only
+            png = None
+        return code, realm, png
+
+    def _show_invite_dialog(self, result):
+        code, realm, png = result
+        win = Adw.Window(modal=True, default_width=380, default_height=560)
+        win.set_transient_for(self.get_root())
+        win.set_title("Invite a device")
+
+        view = Adw.ToolbarView()
+        view.add_top_bar(Adw.HeaderBar())
+
+        box = Gtk.Box(orientation=Gtk.Orientation.VERTICAL, spacing=14)
+        for m in ("set_margin_top", "set_margin_bottom", "set_margin_start", "set_margin_end"):
+            getattr(box, m)(20)
+
+        heading = Gtk.Label(label="Scan on the new device")
+        heading.add_css_class("title-3")
+        box.append(heading)
+
+        steps = Gtk.Label(label="Open Loom → Join your realm → Scan invite QR")
+        steps.add_css_class("dim-label")
+        steps.set_wrap(True)
+        steps.set_justify(Gtk.Justification.CENTER)
+        box.append(steps)
+
+        if png:
+            picture = Gtk.Picture.new_for_filename(png)
+            picture.set_size_request(280, 280)
+            picture.set_halign(Gtk.Align.CENTER)
+            box.append(picture)
+        else:
+            box.append(Gtk.Label(label="(install python3-qrcode to show a QR)"))
+
+        or_lbl = Gtk.Label(label="…or paste this code into the app:")
+        or_lbl.add_css_class("caption")
+        or_lbl.add_css_class("dim-label")
+        box.append(or_lbl)
+
+        code_lbl = Gtk.Label(label=code)
+        code_lbl.set_selectable(True)
+        code_lbl.set_wrap(True)
+        code_lbl.set_wrap_mode(0)  # WRAP_WORD_CHAR ~ break anywhere for the long code
+        code_lbl.add_css_class("monospace")
+        code_lbl.add_css_class("caption")
+        box.append(code_lbl)
+
+        copy_btn = Gtk.Button(label="Copy code")
+        copy_btn.add_css_class("pill")
+        copy_btn.set_halign(Gtk.Align.CENTER)
+        copy_btn.connect("clicked", lambda *_: self._copy(win, code))
+        box.append(copy_btn)
+
+        footer = Gtk.Label(label=f"Realm “{realm}” · expires in 15 min · single use")
+        footer.add_css_class("caption")
+        footer.add_css_class("dim-label")
+        box.append(footer)
+
+        view.set_content(box)
+        win.set_content(view)
+        win.present()
+
+    def _copy(self, win, text):
+        try:
+            win.get_clipboard().set(text)
+            self._toast("Invite code copied")
+        except Exception:  # noqa: BLE001
+            self._toast("Couldn't copy — select the code and copy it manually")
 
     # ── Helpers ──────────────────────────────────────────────────────────────────────────────────
 
