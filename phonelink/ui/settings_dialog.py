@@ -21,6 +21,7 @@ class SettingsPanel(Gtk.Box):
         on_google_connect=None,
         on_google_refresh=None,
         on_google_disconnect=None,
+        on_notifications_transport_changed=None,
     ):
         super().__init__(orientation=Gtk.Orientation.HORIZONTAL)
         self._settings = get_settings()
@@ -29,6 +30,7 @@ class SettingsPanel(Gtk.Box):
         self._on_google_connect = on_google_connect
         self._on_google_refresh = on_google_refresh
         self._on_google_disconnect = on_google_disconnect
+        self._on_notifications_transport_changed = on_notifications_transport_changed or (lambda _t: None)
         self._ignored_rows: list = []
         self._build()
 
@@ -222,6 +224,16 @@ class SettingsPanel(Gtk.Box):
         )
         sync_group.add(enabled_row)
 
+        # Transport: KDE Connect (over the LAN) or Loom (the phone's node, works anywhere).
+        self._transport_row = Adw.ComboRow(
+            title="Notifications via",
+            subtitle="KDE Connect over the LAN, or Loom — your phone's node, anywhere",
+        )
+        self._transport_row.set_model(Gtk.StringList.new(["KDE Connect", "Loom"]))
+        self._transport_row.set_selected(1 if self._settings.notifications_transport == "loom" else 0)
+        self._transport_row.connect("notify::selected", self._on_transport_changed)
+        sync_group.add(self._transport_row)
+
         self._ignored_group = Adw.PreferencesGroup(
             title="Hidden Apps",
             description="Notifications from these apps will not appear in the tray.",
@@ -242,6 +254,11 @@ class SettingsPanel(Gtk.Box):
         scheme = ["system", "light", "dark"][row.get_selected()]
         self._settings.color_scheme = scheme
         _apply_color_scheme(scheme)
+
+    def _on_transport_changed(self, row, _param):
+        transport = "loom" if row.get_selected() == 1 else "kdeconnect"
+        self._settings.notifications_transport = transport
+        self._on_notifications_transport_changed(transport)
 
     def _on_add_ignored_app(self, entry_row):
         name = entry_row.get_text().strip()

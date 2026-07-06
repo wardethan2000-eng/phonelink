@@ -193,6 +193,30 @@ class Notification:
         return dt.strftime("%b %d %I:%M %p").lstrip("0")
 
     @classmethod
+    def from_loom(cls, n) -> "Notification":
+        """Build from a ``loom_sdk.Notification`` (the ``loom/phone/0`` mirror).
+
+        Fields line up 1:1 with KDE Connect's; Loom defers icon *bytes* in v0 (``has_icon`` only), so
+        ``icon_path`` stays empty and the row falls back to the app's generic icon. The phone's own
+        post time (``n.time``, unix seconds) is used when present so the time label is accurate.
+        """
+        import time
+        return cls(
+            public_id=n.public_id,
+            app_name=n.app_name,
+            title=n.title,
+            text=(n.text or "").strip(),
+            ticker=n.ticker,
+            icon_path="",
+            has_icon=n.has_icon,
+            dismissable=n.dismissable,
+            silent=n.silent,
+            reply_id=n.reply_id,
+            internal_id=n.internal_id,
+            timestamp=float(n.time) if n.time else time.time(),
+        )
+
+    @classmethod
     def from_properties(cls, public_id: str, props: dict) -> "Notification":
         import time
         return cls(
