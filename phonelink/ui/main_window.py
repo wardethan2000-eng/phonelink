@@ -23,6 +23,9 @@ from phonelink.ui.files_panel import FilesPanel
 from phonelink.ui.fabric_panel import FabricPanel
 from phonelink.ui.clipboard_panel import ClipboardPanel
 from phonelink.ui.settings_dialog import SettingsPanel
+from phonelink import loom_bridge
+from phonelink.loom_phone import LoomPhoneClient
+from phonelink.settings import get_settings
 
 
 class MainWindow(Adw.ApplicationWindow):
@@ -232,7 +235,11 @@ class MainWindow(Adw.ApplicationWindow):
 
         notif_box.append(Gtk.Separator(orientation=Gtk.Orientation.HORIZONTAL))
 
-        self.notif_panel = NotificationsPanel(client=self.client)
+        # The notifications panel can source from KDE Connect (default) or Loom (loom/phone/0). We hand
+        # it a LoomPhoneClient when the Loom SDK is importable; loomd itself may come up later (the
+        # client retries), so we don't block startup probing it.
+        loom_client = LoomPhoneClient() if loom_bridge.sdk_available() else None
+        self.notif_panel = NotificationsPanel(client=self.client, loom_client=loom_client)
         self.notif_panel.set_vexpand(True)
         notif_box.append(self.notif_panel)
 
@@ -258,7 +265,12 @@ class MainWindow(Adw.ApplicationWindow):
             on_google_connect=self.sms_panel.connect_google_contacts,
             on_google_refresh=self.sms_panel.refresh_google_contacts,
             on_google_disconnect=self.sms_panel.disconnect_google_contacts,
+            on_notifications_transport_changed=self._on_notifications_transport_changed,
         )
+
+        # Start the notification source matching the saved transport (starts the Loom subscription
+        # immediately when the user has chosen Loom, independent of any KDE Connect device).
+        self.notif_panel.apply_transport(get_settings().notifications_transport)
         self.sms_panel.connect(
             "google-status-changed",
             lambda *_args: self._settings_panel.refresh_google_status(),
@@ -283,6 +295,10 @@ class MainWindow(Adw.ApplicationWindow):
 
     def _show_main(self):
         self._body_stack.set_visible_child_name("main")
+
+    def _on_notifications_transport_changed(self, transport: str):
+        """Switch the notifications panel between KDE Connect and Loom when the setting changes."""
+        self.notif_panel.apply_transport(transport)
 
     # ── Data refresh ───────────────────────────────────────────────
 
