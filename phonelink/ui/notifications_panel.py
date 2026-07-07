@@ -1,5 +1,7 @@
 """Notifications panel — compact single-column list for the slide-out tray."""
 
+import threading
+
 import gi
 
 gi.require_version("Gtk", "4.0")
@@ -540,11 +542,27 @@ class NotificationsPanel(Gtk.Box):
 
     # ── Actions ────────────────────────────────────────────────────
 
+    def _loom_action(self, fn, *args):
+        """Run a blocking :class:`~phonelink.loom_phone.LoomPhoneClient` action (dismiss/reply) off the
+        GTK main loop, so a slow phone dial never freezes the UI. On failure, surface it via the same
+        status banner the connection uses (the optimistic row change is already applied; a live
+        re-snapshot from the phone corrects the view if the action didn't take)."""
+        def worker():
+            try:
+                fn(*args)
+            except Exception as e:  # noqa: BLE001 — network/refusal: report, don't crash the UI
+                GLib.idle_add(self._loom_apply_status, "error", f"Couldn't reach your phone: {e}")
+
+        threading.Thread(target=worker, name="loom-phone-action", daemon=True).start()
+
     def _on_dismiss_clicked(self, _btn, public_id: str):
-        # Over Loom, dismiss/reply are the request/response actions of P5 (they need the inbound seam);
-        # for now Loom is a read-only mirror, so we just drop the row locally (the phone stays the
-        # source of truth and a re-snapshot restores it if still present).
-        if self._transport == "kdeconnect" and self._device:
+        # Both transports dismiss on the phone, then drop the row optimistically (the phone stays the
+        # source of truth; a re-snapshot restores it if the action didn't take). Over Loom this is the
+        # P5 `loom/phone-action/0` request; over KDE Connect it's the D-Bus call.
+        if self._transport == "loom":
+            if self._loom:
+                self._loom_action(self._loom.dismiss_notification, public_id)
+        elif self._device:
             self.client.submit(
                 self.client.dismiss_notification, self._device.id, public_id
             )
@@ -557,14 +575,19 @@ class NotificationsPanel(Gtk.Box):
         self._send_reply(public_id, entry)
 
     def _send_reply(self, public_id: str, entry: Gtk.Entry):
-        # Inline reply over Loom is P5 (needs the phone's inbound request/response seam); only KDE
-        # Connect can send a reply today.
-        if self._transport != "kdeconnect":
-            return
         text = entry.get_text().strip()
-        if not text or not self._device:
+        if not text:
             return
         notif = self._notifications.get(public_id)
+        if self._transport == "loom":
+            # P5 reply over `loom/phone-action/0`: send the notification's captured reply token + text.
+            if self._loom and notif and notif.reply_id:
+                self._loom_action(self._loom.reply_to_notification, notif.reply_id, text)
+            entry.set_text("")
+            return
+        # KDE Connect: reply keyed by the notification's public_id.
+        if not self._device:
+            return
         if notif and notif.reply_id:
             self.client.submit(
                 self.client.reply_to_notification, self._device.id, public_id, text
@@ -581,19 +604,23 @@ class NotificationsPanel(Gtk.Box):
             self._load_notifications(self._device.id)
 
     def _on_dismiss_all(self, _btn):
-        if self._transport == "kdeconnect":
-            if not self._device:
-                return
-            device_id = self._device.id
-            dismissable_ids = [
-                nid for nid, notif in self._notifications.items()
-                if notif and notif.dismissable
-            ]
+        dismissable_ids = [
+            nid for nid, notif in self._notifications.items()
+            if notif and notif.dismissable
+        ]
+        if self._transport == "loom":
+            if self._loom and dismissable_ids:
+                self._loom_action(self._dismiss_many_loom, dismissable_ids)
+        elif self._device:
             if dismissable_ids:
                 self.client.submit(
-                    self._dismiss_many, device_id, dismissable_ids
+                    self._dismiss_many, self._device.id, dismissable_ids
                 )
         self._clear_all()
+
+    def _dismiss_many_loom(self, ids: list):
+        for nid in ids:
+            self._loom.dismiss_notification(nid)
 
     def _dismiss_many(self, device_id: str, ids: list):
         for nid in ids:

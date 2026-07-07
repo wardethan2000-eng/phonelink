@@ -43,6 +43,8 @@ class LoomPhoneClient:
         self._stop = threading.Event()
         self._lock = threading.Lock()
         self._stream = None
+        # The phone node-id we're currently subscribed to; the P5 dismiss/reply actions target it.
+        self._device_id: Optional[str] = None
         # Callbacks (set in start()); default to no-ops so a stray event is harmless.
         self._on_snapshot: Callable[[List[Notification]], None] = lambda _n: None
         self._on_posted: Callable[[Notification], None] = lambda _n: None
@@ -109,6 +111,7 @@ class LoomPhoneClient:
         with self._lock:
             stream = self._stream
             self._stream = None
+            self._device_id = None
         if stream is not None:
             stream.close()  # unblocks a read parked in the worker thread
         thread = self._thread
@@ -157,6 +160,7 @@ class LoomPhoneClient:
             backoff = 1.0
             with self._lock:
                 self._stream = stream
+                self._device_id = device
             self._on_status("connected", device)
             try:
                 for ev in stream:
@@ -188,3 +192,27 @@ class LoomPhoneClient:
             self._on_posted(Notification.from_loom(ev.notification))
         elif ev.kind == "removed":
             self._on_removed(ev.public_id)
+
+    # --- actions (P5: loom/phone-action/0) -------------------------------------------------------
+
+    def _target_device(self, loom) -> str:
+        """The phone node-id an action targets: the currently-subscribed device if we have one, else
+        freshly resolved from the realm (so an action works even before the stream first connects)."""
+        device = self._device_id or self._resolve_phone_device(loom)
+        if not device:
+            raise loom_bridge.LoomError("no phone in your Loom realm to act on")
+        return device
+
+    def dismiss_notification(self, public_id: str) -> None:
+        """Ask the phone to dismiss one of its notifications over Loom (P5). **Blocking** (a loomd
+        socket call + a phone dial), so call it off the GTK main loop; raises ``LoomError`` if the
+        phone is unreachable, refuses us, or can't dismiss it."""
+        loom = self._loom_factory()
+        loom.dismiss_notification(self._target_device(loom), public_id)
+
+    def reply_to_notification(self, reply_id: str, text: str) -> None:
+        """Ask the phone to send an inline reply over Loom (P5). ``reply_id`` is the token on a
+        repliable :class:`~phonelink.models.Notification`. Same blocking/error semantics as
+        :meth:`dismiss_notification`."""
+        loom = self._loom_factory()
+        loom.reply_to_notification(self._target_device(loom), reply_id, text)

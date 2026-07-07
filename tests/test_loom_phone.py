@@ -7,9 +7,11 @@ phonelink's ``Notification`` model).
 
 import threading
 
+import pytest
 from loom_sdk import Notification as SdkNotification
 from loom_sdk import NotificationEvent
 
+from phonelink import loom_bridge
 from phonelink.loom_phone import LoomPhoneClient
 from phonelink.models import Notification
 
@@ -41,6 +43,8 @@ class FakeLoom:
         self._me = me
         self.subscribed = None
         self.subscribe_count = 0
+        self.dismissed = []
+        self.replied = []
 
     def status(self):
         return {"device_id": self._me}
@@ -54,6 +58,12 @@ class FakeLoom:
         # Only the first subscribe carries events; a reconnect gets an empty (immediately-ending)
         # stream so the test isn't sensitive to reconnect timing.
         return FakeStream(self._events if self.subscribe_count == 1 else [])
+
+    def dismiss_notification(self, device_id, public_id):
+        self.dismissed.append((device_id, public_id))
+
+    def reply_to_notification(self, device_id, reply_id, text):
+        self.replied.append((device_id, reply_id, text))
 
 
 # ── device resolution ──────────────────────────────────────────────────────────────────────────
@@ -136,3 +146,42 @@ def test_stop_is_idempotent_and_safe_without_start():
     client = LoomPhoneClient(loom_factory=lambda: FakeLoom(devices=[]))
     client.stop()  # never started — must not raise
     client.stop()
+
+
+# ── actions (P5: dismiss / reply over loom/phone-action/0) ───────────────────────────────────────
+
+
+def test_dismiss_targets_the_resolved_phone():
+    loom = FakeLoom(
+        devices=[{"device": "laptop", "label": "desktop"}, {"device": "phone", "label": "Galaxy S25"}],
+        me="laptop",
+    )
+    client = LoomPhoneClient(loom_factory=lambda: loom)
+    client.dismiss_notification("0|com.whatsapp|1")
+    assert loom.dismissed == [("phone", "0|com.whatsapp|1")]
+
+
+def test_reply_targets_the_resolved_phone():
+    loom = FakeLoom(
+        devices=[{"device": "laptop", "label": "d"}, {"device": "phone", "label": "Galaxy"}],
+        me="laptop",
+    )
+    client = LoomPhoneClient(loom_factory=lambda: loom)
+    client.reply_to_notification("tok-42", "omw")
+    assert loom.replied == [("phone", "tok-42", "omw")]
+
+
+def test_action_prefers_the_subscribed_device_id():
+    # Once a subscription is live, actions target that device without re-resolving from the realm.
+    loom = FakeLoom(devices=[{"device": "phone-id", "label": "Galaxy S25"}], me="laptop")
+    client = LoomPhoneClient(loom_factory=lambda: loom)
+    client._device_id = "phone-id"
+    client.dismiss_notification("n1")
+    assert loom.dismissed == [("phone-id", "n1")]
+
+
+def test_action_raises_when_no_phone_in_realm():
+    loom = FakeLoom(devices=[{"device": "me", "label": "x"}], me="me")
+    client = LoomPhoneClient(loom_factory=lambda: loom)
+    with pytest.raises(loom_bridge.LoomError):
+        client.dismiss_notification("n1")
