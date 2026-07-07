@@ -216,3 +216,16 @@ class LoomPhoneClient:
         :meth:`dismiss_notification`."""
         loom = self._loom_factory()
         loom.reply_to_notification(self._target_device(loom), reply_id, text)
+
+    # --- small capabilities (P6: battery / find-my-phone) ----------------------------------------
+
+    def battery(self) -> dict:
+        """The phone's battery status over Loom (P6): ``{"level": 0-100, "charging": bool}``. Blocking;
+        raises ``LoomError`` on refusal/unreachable/unsupported."""
+        loom = self._loom_factory()
+        return loom.battery(self._target_device(loom))
+
+    def ring(self, stop: bool = False) -> None:
+        """Find-my-phone (P6): ring the phone to locate it, or stop it with ``stop=True``. Blocking."""
+        loom = self._loom_factory()
+        loom.ring(self._target_device(loom), stop)

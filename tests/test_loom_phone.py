@@ -65,6 +65,13 @@ class FakeLoom:
     def reply_to_notification(self, device_id, reply_id, text):
         self.replied.append((device_id, reply_id, text))
 
+    def battery(self, device_id):
+        self.battery_device = device_id
+        return {"level": 88, "charging": True}
+
+    def ring(self, device_id, stop):
+        self.rang = (device_id, stop)
+
 
 # ── device resolution ──────────────────────────────────────────────────────────────────────────
 
@@ -185,3 +192,28 @@ def test_action_raises_when_no_phone_in_realm():
     client = LoomPhoneClient(loom_factory=lambda: loom)
     with pytest.raises(loom_bridge.LoomError):
         client.dismiss_notification("n1")
+
+
+# ── small capabilities (P6: battery / find-my-phone) ─────────────────────────────────────────────
+
+
+def test_battery_targets_resolved_phone():
+    loom = FakeLoom(
+        devices=[{"device": "laptop", "label": "d"}, {"device": "phone", "label": "Galaxy"}],
+        me="laptop",
+    )
+    client = LoomPhoneClient(loom_factory=lambda: loom)
+    assert client.battery() == {"level": 88, "charging": True}
+    assert loom.battery_device == "phone"
+
+
+def test_ring_targets_resolved_phone():
+    loom = FakeLoom(
+        devices=[{"device": "laptop", "label": "d"}, {"device": "phone", "label": "Galaxy"}],
+        me="laptop",
+    )
+    client = LoomPhoneClient(loom_factory=lambda: loom)
+    client.ring()
+    assert loom.rang == ("phone", False)
+    client.ring(stop=True)
+    assert loom.rang == ("phone", True)
