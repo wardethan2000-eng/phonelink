@@ -34,6 +34,9 @@ class FakeLoom:
         self.msg_query = (device_id, thread_id, limit)
         return self._messages
 
+    def send_sms(self, device_id, addresses, text):
+        self.sent = (device_id, list(addresses), text)
+
 
 # ── SmsMessage.from_loom mapping ─────────────────────────────────────────────────────────────────
 
@@ -89,6 +92,16 @@ def test_messages_passes_thread_and_limit_as_str():
     msgs = client.messages(7, limit=25)
     assert loom.msg_query == ("phone", "7", 25)  # thread_id coerced to str for the wire
     assert msgs[0].thread_id == 7 and msgs[0].is_sent
+
+
+def test_send_targets_resolved_phone():
+    loom = FakeLoom(
+        devices=[{"device": "laptop", "label": "d"}, {"device": "phone", "label": "Galaxy"}],
+        me="laptop",
+    )
+    client = LoomSmsClient(loom_factory=lambda: loom)
+    client.send(["+15551234567"], "omw")
+    assert loom.sent == ("phone", ["+15551234567"], "omw")
 
 
 def test_raises_when_no_phone_in_realm():

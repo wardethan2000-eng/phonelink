@@ -84,3 +84,10 @@ class LoomSmsClient:
             SmsMessage.from_loom(d)
             for d in loom.sms_messages(self._device(loom), str(thread_id), limit)
         ]
+
+    def send(self, addresses: List[str], text: str) -> None:
+        """Send an SMS from the phone to ``addresses`` over Loom (P5). **Sends a real text.** Blocking;
+        raises ``LoomError`` if the phone is unreachable, refuses us, or lacks SEND_SMS. ``addresses``
+        with more than one recipient is a group send."""
+        loom = self._loom_factory()
+        loom.send_sms(self._device(loom), list(addresses), text)
