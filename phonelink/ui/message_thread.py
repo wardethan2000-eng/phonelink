@@ -24,6 +24,7 @@ from phonelink.settings import (
     MESSAGE_FONT_SCALE_MIN,
     MESSAGE_FONT_SCALE_MAX,
 )
+from phonelink.ui.icons import resolve_icon
 
 
 ATTACHMENT_CACHE_DIR = Path(tempfile.gettempdir()) / "phonelink" / "message_attachments"
@@ -338,7 +339,9 @@ class MessageBubble(Gtk.Box):
         att_row.add_css_class("message-attachment-row")
 
         att_icon = Gtk.Image.new_from_icon_name(
-            "image-x-generic-symbolic" if mime.startswith("image") else "mail-attachment-symbolic"
+            resolve_icon(
+                "image-x-generic-symbolic" if mime.startswith("image") else "mail-attachment-symbolic"
+            )
         )
         att_icon.set_pixel_size(14)
         att_row.append(att_icon)

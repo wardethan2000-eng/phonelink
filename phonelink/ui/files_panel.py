@@ -14,6 +14,7 @@ gi.require_version("Adw", "1")
 from gi.repository import Gtk, Adw, GLib, Gio, GObject, Gdk, GdkPixbuf
 
 from phonelink.dbus_client import IFACE_SFTP, IFACE_SHARE
+from phonelink.ui.icons import resolve_icon
 
 IMAGE_EXTS = {".jpg", ".jpeg", ".png", ".gif", ".webp", ".bmp", ".heic", ".heif"}
 THUMB_SIZE = 160
@@ -109,7 +110,7 @@ class PhotoTile(Gtk.Overlay):
         placeholder = Gtk.Box(orientation=Gtk.Orientation.VERTICAL, spacing=4)
         placeholder.set_halign(Gtk.Align.CENTER)
         placeholder.set_valign(Gtk.Align.CENTER)
-        icon = Gtk.Image.new_from_icon_name("image-x-generic-symbolic")
+        icon = Gtk.Image.new_from_icon_name(resolve_icon("image-x-generic-symbolic"))
         icon.set_pixel_size(32)
         icon.set_opacity(0.4)
         placeholder.append(icon)
@@ -179,7 +180,7 @@ class FileRow(Gtk.Box):
         self.is_dir = is_dir
         self.file_name = name
 
-        icon = Gtk.Image.new_from_icon_name(_file_icon_name(name, is_dir))
+        icon = Gtk.Image.new_from_icon_name(resolve_icon(_file_icon_name(name, is_dir)))
         icon.set_pixel_size(24)
         self.append(icon)
 

@@ -9,6 +9,7 @@ gi.require_version("Adw", "1")
 from gi.repository import Gtk, Adw
 
 from phonelink.settings import get_settings
+from phonelink.ui.icons import resolve_icon
 
 
 class SettingsPanel(Gtk.Box):
@@ -82,7 +83,7 @@ class SettingsPanel(Gtk.Box):
             box.set_margin_end(12)
             box.set_margin_top(9)
             box.set_margin_bottom(9)
-            img = Gtk.Image.new_from_icon_name(icon_name)
+            img = Gtk.Image.new_from_icon_name(resolve_icon(icon_name))
             img.set_pixel_size(16)
             box.append(img)
             lbl = Gtk.Label(label=label)

@@ -11,6 +11,7 @@ from gi.repository import Gtk, Adw, GLib, GdkPixbuf
 from phonelink.dbus_client import IFACE_NOTIFICATIONS
 from phonelink.models import Notification
 from phonelink.settings import get_settings
+from phonelink.ui.icons import resolve_icon
 
 
 def diff_notification_rows(existing: dict, desired: dict):
@@ -179,7 +180,7 @@ class NotifRow(Gtk.ListBoxRow):
             (v for k, v in icon_map.items() if k in name),
             "dialog-information-symbolic",
         )
-        self._icon.set_from_icon_name(icon)
+        self._icon.set_from_icon_name(resolve_icon(icon))
 
     def toggle_expand(self):
         self._expanded = not self._expanded
@@ -214,7 +215,7 @@ class NotificationsPanel(Gtk.Box):
 
         # Status page (no device / disconnected)
         self._status = Adw.StatusPage()
-        self._status.set_icon_name("xsi-notifications-symbolic")
+        self._status.set_icon_name(resolve_icon("xsi-notifications-symbolic"))
         self._status.set_title("No Notifications")
         self._status.set_description("No phone linked yet.")
         self._stack.add_named(self._status, "status")
@@ -264,7 +265,7 @@ class NotificationsPanel(Gtk.Box):
         scroll.set_child(self._list_box)
 
         ph = Adw.StatusPage()
-        ph.set_icon_name("xsi-notifications-symbolic")
+        ph.set_icon_name(resolve_icon("xsi-notifications-symbolic"))
         ph.set_title("No Notifications")
         ph.set_description("Phone has no active notifications.")
         self._list_box.set_placeholder(ph)

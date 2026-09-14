@@ -23,6 +23,7 @@ from phonelink.ui.files_panel import FilesPanel
 from phonelink.ui.fabric_panel import FabricPanel
 from phonelink.ui.clipboard_panel import ClipboardPanel
 from phonelink.ui.settings_dialog import SettingsPanel
+from phonelink.ui.icons import device_icon_size, resolve_icon
 from phonelink import loom_bridge
 from phonelink.loom_phone import LoomPhoneClient
 from phonelink.settings import get_settings
@@ -90,7 +91,7 @@ class MainWindow(Adw.ApplicationWindow):
 
     def _show_status(self, icon, title, description):
         status = Adw.StatusPage()
-        status.set_icon_name(icon)
+        status.set_icon_name(resolve_icon(icon))
         status.set_title(title)
         status.set_description(description)
         self.set_content(status)
@@ -102,6 +103,10 @@ class MainWindow(Adw.ApplicationWindow):
 
         # ── Header bar ─────────────────────────────────────────────
         header = Adw.HeaderBar()
+        # Drop the window-menu icon some desktops (KDE's gtk-decoration-layout
+        # starts with "icon:") place on the start side; it renders as a tiny,
+        # out-of-place app icon next to the device switcher.
+        header.set_decoration_layout(":minimize,maximize,close")
 
         # Left side: device info — clickable button with popover for switching
         self._device_btn = Gtk.MenuButton()
@@ -110,7 +115,7 @@ class MainWindow(Adw.ApplicationWindow):
         self._device_box = Gtk.Box(orientation=Gtk.Orientation.HORIZONTAL, spacing=10)
 
         self._device_icon = Gtk.Image()
-        self._device_icon.set_pixel_size(24)
+        self._device_icon.set_pixel_size(device_icon_size(24))
         self._device_box.append(self._device_icon)
 
         # Two-line identity: device name over a live connection status.
@@ -181,7 +186,7 @@ class MainWindow(Adw.ApplicationWindow):
         find_btn.connect("clicked", self._on_ring_phone)
         header.pack_end(find_btn)
 
-        self._notif_toggle = Gtk.ToggleButton(icon_name="xsi-notifications-symbolic")
+        self._notif_toggle = Gtk.ToggleButton(icon_name=resolve_icon("xsi-notifications-symbolic"))
         self._notif_toggle.set_tooltip_text("Notifications")
         self._notif_toggle.connect("toggled", self._on_notif_toggled)
         header.pack_end(self._notif_toggle)
@@ -476,7 +481,7 @@ class MainWindow(Adw.ApplicationWindow):
             box.set_margin_bottom(6)
 
             icon = Gtk.Image.new_from_icon_name(dev.type_icon_name)
-            icon.set_pixel_size(20)
+            icon.set_pixel_size(device_icon_size(20))
             box.append(icon)
 
             name_box = Gtk.Box(orientation=Gtk.Orientation.VERTICAL, spacing=2)
