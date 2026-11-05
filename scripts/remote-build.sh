@@ -1,0 +1,114 @@
+#!/usr/bin/env bash
+# Build and test Phone Link on the build box, never on the laptop.
+#
+#   scripts/remote-build.sh build [--release]   cargo build, binaries come back to ./target/
+#   scripts/remote-build.sh test  [ARGS...]     cargo test
+#   scripts/remote-build.sh check [ARGS...]     cargo check
+#   scripts/remote-build.sh clippy [ARGS...]    cargo clippy
+#   scripts/remote-build.sh run -- CMD...       any command in the synced checkout
+#   scripts/remote-build.sh log                 show the latest job's log (follows it if still running)
+#
+# The box is an ssh host. Set PHONELINK_BUILD_HOST (env, or in
+# ~/.config/phonelink-build.env); the default is the ssh alias "phonelink-build".
+# Jobs run detached under systemd on the box, so a dropped ssh connection
+# does not kill a build: rerun `log` to pick it back up, then `build` again
+# (nothing left to compile) to copy the binaries back.
+set -euo pipefail
+
+CONFIG="${XDG_CONFIG_HOME:-$HOME/.config}/phonelink-build.env"
+# shellcheck source=/dev/null
+[[ -f "$CONFIG" ]] && source "$CONFIG"
+HOST="${PHONELINK_BUILD_HOST:-phonelink-build}"
+REMOTE_DIR="${PHONELINK_BUILD_DIR:-work/phonelink}"   # relative to the box's $HOME
+MEMORY_MAX="${PHONELINK_BUILD_MEMORY:-3500M}"
+
+ROOT="$(cd "$(dirname "${BASH_SOURCE[0]}")/.." && pwd)"
+
+usage() { sed -n '2,14p' "${BASH_SOURCE[0]}" | sed 's/^# \{0,1\}//'; exit 2; }
+
+sync_up() {
+    ssh "$HOST" "mkdir -p '$REMOTE_DIR' work/logs"
+    # --checksum without --times: only files whose content changed are
+    # rewritten, and they get a fresh mtime, so cargo never builds stale.
+    rsync -rlpz --checksum --delete \
+        --exclude '/target/' --exclude '.git/' --exclude '__pycache__/' \
+        --exclude '*.pyc' --exclude '.venv/' \
+        "$ROOT/" "$HOST:$REMOTE_DIR/"
+}
+
+# Start CMD detached on the box, then stream its log until it ends.
+# Exits with the job's exit code.
+run_remote() {
+    local id log
+    id="$(date +%Y%m%dT%H%M%S)-$$"
+    log="work/logs/$id.log"
+    # The command travels as a file, so its quoting survives untouched.
+    printf '%q ' "$@" | ssh "$HOST" "cat > '$log.cmd'"
+    ssh "$HOST" bash -s -- "$id" "$REMOTE_DIR" "$MEMORY_MAX" <<'EOF'
+set -eu
+id=$1 dir=$2 mem=$3
+log=$HOME/work/logs/$id.log
+: > "$log"
+# ExecStopPost records the exit status even when the job is OOM-killed.
+# It shares the job's stdout, so the log must be append:, not truncate:.
+systemd-run --user --quiet --collect --unit="phonelink-$id" \
+    -p MemoryMax="$mem" --nice=10 --working-directory="$HOME/$dir" \
+    -p StandardOutput="append:$log" -p StandardError=inherit \
+    -p ExecStopPost="/bin/sh -c 'echo \$EXIT_STATUS > $log.exit'" \
+    flock -n -E 75 "$HOME/work/phonelink.lock" \
+    bash -lc "ln -sfn '$log' ~/work/logs/latest.log; source ~/.cargo/env; source '$log.cmd'"
+EOF
+    echo "job $id on $HOST (log: ~/$log)" >&2
+    follow "$log"
+}
+
+follow() {
+    ssh "$HOST" bash -s -- "$1" <<'EOF'
+log=$HOME/$1
+while [ ! -e "$log" ]; do sleep 0.5; done
+tail -n +1 -F "$log" 2>/dev/null &
+t=$!
+while [ ! -s "$log.exit" ]; do sleep 1; done
+sleep 0.5; kill $t 2>/dev/null
+code=$(cat "$log.exit")
+[ "$code" = 75 ] && echo "another job holds the build lock; see the previous log" >&2
+case $code in ''|*[!0-9]*) echo "job killed ($code)" >&2; exit 137 ;; esac
+exit "$code"
+EOF
+}
+
+bring_back() {
+    local profile=$1
+    mkdir -p "$ROOT/target/$profile"
+    ssh "$HOST" "cd '$REMOTE_DIR/target/$profile' 2>/dev/null && find . -maxdepth 1 -type f -executable -printf '%P\n'" \
+        | rsync -az --files-from=- "$HOST:$REMOTE_DIR/target/$profile/" "$ROOT/target/$profile/"
+    echo "binaries copied to target/$profile/" >&2
+}
+
+[[ $# -ge 1 ]] || usage
+action=$1; shift
+case "$action" in
+    build)
+        profile=debug
+        for a in "$@"; do [[ $a == --release ]] && profile=release; done
+        sync_up
+        run_remote cargo build "$@"
+        bring_back "$profile"
+        ;;
+    test|check|clippy)
+        sync_up
+        run_remote cargo "$action" "$@"
+        ;;
+    run)
+        [[ ${1:-} == -- ]] && shift
+        [[ $# -ge 1 ]] || usage
+        sync_up
+        run_remote "$@"
+        ;;
+    log)
+        latest="$(ssh "$HOST" 'readlink work/logs/latest.log' || true)"
+        [[ -n $latest ]] || { echo "no jobs yet" >&2; exit 1; }
+        follow "${latest#"$(ssh "$HOST" 'echo $HOME')/"}"
+        ;;
+    *) usage ;;
+esac
