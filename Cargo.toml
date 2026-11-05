@@ -1,0 +1,8 @@
+[workspace]
+members = ["phonelink-rs"]
+resolver = "3"
+
+[profile.release]
+lto = "thin"
+codegen-units = 4
+strip = "debuginfo"
