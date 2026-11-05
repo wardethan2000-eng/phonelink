@@ -290,7 +290,10 @@ impl MessagesPage {
                 Effect::Toast(text) => log::info!("toast: {text}"),
                 // TODO(Phase 3 step 3): sending and deleting. Nothing is sent
                 // to the phone until compose is wired up and reviewed.
-                Effect::Reply { .. } | Effect::SendNew { .. } | Effect::DeleteOnPhone { .. } => {
+                Effect::Reply { .. }
+                | Effect::ReplyViaNotification { .. }
+                | Effect::SendNew { .. }
+                | Effect::DeleteOnPhone { .. } => {
                     log::warn!("not wired up yet: {e:?}");
                 }
             }

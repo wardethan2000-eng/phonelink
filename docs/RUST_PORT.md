@@ -199,8 +199,9 @@ Google Contacts. 7. Side-by-side on the laptop, measure, switch autostart. The t
    is owned (the Python app is running). If it is, it says so and exits, because
    both would write the same store.
 8. Flatpak: **on hold** (Ethan, 2026-11-05: not sure he wants it). See below.
-9. RCS sending: notification replies first, then a Google Messages web
-   link. After cutover. See "Phase 9: RCS sending" below.
+9. RCS sending. Route A (notification replies) moved into Phase 3 at
+   Ethan's ask (2026-11-05). Route B (Google Messages web link) stays after
+   cutover. See "Phase 9: RCS sending" below.
 
 ## Public commitments
 Things said in public that the project owes people. Close each one out when
@@ -284,6 +285,18 @@ same path Wear OS and Android Auto replies use.
   ones.
 - **Gate before building:** Ethan replies to an RCS text from a Phone Link
   notification, and the phone shows it went out as RCS. Not yet done.
+- **Built in Phase 3 (2026-11-05), ahead of that gate at Ethan's ask:**
+  `Messages::send` returns `Effect::ReplyViaNotification` when a notification
+  clearly belongs to the open chat, else `Effect::Reply` as before. The
+  match is stricter than "by sender", because a wrong match sends the text
+  to someone else. The preview must quote the chat's newest received text,
+  and no other chat's. For a 1:1, a number title must be that number, and a
+  name title must equal the contact's name when the desktop knows the
+  contact. Exactly one notification may qualify; anything else falls back to
+  SMS. If `sendReply` fails, `notification_reply_failed` resends it as SMS.
+  Sent bubbles are labeled from the route (`route_of(uid)`) as "SMS" or
+  "via notification". The label changes to "RCS" only after the phone test
+  passes.
 
 ### Route B: pair as a "Messages for web" device
 Google Messages for web is a paired device that talks to the phone through

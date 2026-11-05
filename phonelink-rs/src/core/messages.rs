@@ -9,7 +9,8 @@
 
 use std::collections::{HashMap, HashSet};
 
-use super::contacts::{normalize_phone, resolve_name};
+use super::contacts::{is_messaging_app, looks_like_phone_number, normalize_phone, resolve_name};
+use super::hidden_texts::{body_matches, normalize_text};
 use super::message::{RawMessage, parse_message};
 use super::models::{Conversation, SmsMessage};
 use super::reconcile::{self, ConversationIndex};
@@ -50,6 +51,11 @@ pub enum Effect {
     /// `replyToConversation(conversation_id, text, attachments)` — the only
     /// send the S25 reliably delivers.
     Reply { conversation_id: i64, text: String, attachments: Vec<String> },
+    /// `notifications.sendReply(reply_id, text)`: answer through the texting
+    /// app's own notification, so the app (Google Messages) sends it, as RCS
+    /// in an RCS thread (Phase 9 route A). If the call fails, the UI calls
+    /// [`Messages::notification_reply_failed`] to send it the usual way.
+    ReplyViaNotification { thread_id: i64, reply_id: String, text: String },
     /// `sendWithoutConversation(addresses, text)` — only for brand-new
     /// conversations; the phone silently drops it otherwise.
     SendNew { addresses: Vec<String>, text: String },
@@ -65,6 +71,41 @@ pub const TOAST_NOT_CONNECTED: &str = "Can't send — your phone isn't connected
 pub const TOAST_LOCAL_DELETE_ONLY: &str =
     "Removed from Phone Link only; phone-side deletion is not available on this KDE Connect version";
 
+/// How a text sent from this app left it. Shown under the sent bubble so a
+/// fallback to SMS is never silent.
+#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+pub enum SendRoute {
+    /// `replyToConversation`: KDE Connect sends through Android's SMS API.
+    Sms,
+    /// Through the texting app's notification reply. Labeled "via
+    /// notification", not "RCS", until a phone test confirms it goes out as
+    /// RCS.
+    Notification,
+}
+
+impl SendRoute {
+    pub fn label(self) -> &'static str {
+        match self {
+            SendRoute::Sms => "SMS",
+            SendRoute::Notification => "via notification",
+        }
+    }
+}
+
+/// A live texting-app notification the phone lets us answer.
+#[derive(Debug, Clone, PartialEq, Default)]
+pub struct ReplyableNotification {
+    pub public_id: String,
+    pub app_name: String,
+    pub title: String,
+    /// The message preview (`contacts::notification_message_text`).
+    pub text: String,
+    pub reply_id: String,
+}
+
+/// Sends whose phone echo has not arrived yet: (conversation, text, route).
+const PENDING_ROUTES_MAX: usize = 32;
+
 #[derive(Debug, Default)]
 pub struct Messages {
     device_id: Option<String>,
@@ -75,6 +116,9 @@ pub struct Messages {
     active: Option<i64>,
     next_draft_id: i64,
     pub catch_up: CatchUp,
+    notifications: Vec<ReplyableNotification>,
+    pending_routes: Vec<(i64, String, SendRoute)>,
+    sent_routes: HashMap<i64, SendRoute>,
 }
 
 /// Display name for a conversation from the contact map.
@@ -114,6 +158,9 @@ impl Messages {
         self.read_thread_ids.clear();
         self.active = None;
         self.catch_up.cancel();
+        self.notifications.clear();
+        self.pending_routes.clear();
+        self.sent_routes.clear();
         self.set_reachable(reachable);
     }
 
@@ -247,6 +294,14 @@ impl Messages {
         let dev = self.device_id.clone().unwrap_or_default();
         if result.message_added {
             store.upsert_message(&dev, result.primary, &stored);
+            // The phone's copy of a text we sent: remember which way it left.
+            if is_sent {
+                let key = normalize_text(&stored.body);
+                if let Some(i) = self.pending_routes.iter().position(|p| p.0 == result.primary && p.1 == key) {
+                    let (_, _, route) = self.pending_routes.remove(i);
+                    self.sent_routes.insert(stored.uid, route);
+                }
+            }
         }
 
         let primary = result.primary;
@@ -419,7 +474,7 @@ impl Messages {
             return vec![Effect::Toast(TOAST_NOT_CONNECTED)];
         }
         if thread_id >= 0 {
-            return vec![self.reply(thread_id, text, Vec::new())];
+            return vec![self.send_existing(thread_id, text)];
         }
         // A draft: a real thread may have loaded since it was created.
         let Some(draft) = self.index.conversations.get(&thread_id) else { return Vec::new() };
@@ -429,7 +484,7 @@ impl Messages {
             Some(existing) => {
                 self.active = Some(existing);
                 self.read_thread_ids.insert(existing);
-                vec![self.reply(existing, text, Vec::new()), Effect::RefreshList, Effect::ShowThread(existing)]
+                vec![self.send_existing(existing, text), Effect::RefreshList, Effect::ShowThread(existing)]
             }
             None => {
                 self.active = None;
@@ -440,6 +495,111 @@ impl Messages {
                 ]
             }
         }
+    }
+
+    /// A text for an existing thread: through the texting app's notification
+    /// when one clearly belongs to this conversation, else `replyToConversation`.
+    fn send_existing(&mut self, thread_id: i64, text: &str) -> Effect {
+        let primary = self.index.primary_for(thread_id);
+        let (route, effect) = match self.notification_for(primary) {
+            Some(n) => (
+                SendRoute::Notification,
+                Effect::ReplyViaNotification { thread_id: primary, reply_id: n.reply_id.clone(), text: text.to_string() },
+            ),
+            None => (SendRoute::Sms, self.reply(primary, text, Vec::new())),
+        };
+        self.note_pending_route(primary, text, route);
+        effect
+    }
+
+    fn note_pending_route(&mut self, primary: i64, text: &str, route: SendRoute) {
+        self.pending_routes.push((primary, normalize_text(text), route));
+        if self.pending_routes.len() > PENDING_ROUTES_MAX {
+            self.pending_routes.remove(0);
+        }
+    }
+
+    /// `sendReply` failed: send it the usual way, and label it SMS.
+    pub fn notification_reply_failed(&mut self, thread_id: i64, text: &str) -> Vec<Effect> {
+        let key = normalize_text(text);
+        if let Some(p) = self.pending_routes.iter_mut().rev().find(|p| p.0 == thread_id && p.1 == key) {
+            p.2 = SendRoute::Sms;
+        }
+        vec![self.reply(thread_id, text, Vec::new())]
+    }
+
+    /// How a sent message (by uid) left this app, if it was sent from here.
+    pub fn route_of(&self, uid: i64) -> Option<SendRoute> {
+        self.sent_routes.get(&uid).copied()
+    }
+
+    // ── notifications (send route A) ──────────────────────────────
+
+    /// A notification was posted or updated. Kept only if it comes from a
+    /// texting app and can be answered.
+    pub fn note_notification(&mut self, n: ReplyableNotification) {
+        self.notifications.retain(|o| o.public_id != n.public_id);
+        if is_messaging_app(&n.app_name) && !n.reply_id.is_empty() && !n.text.is_empty() {
+            self.notifications.push(n);
+        }
+    }
+
+    pub fn remove_notification(&mut self, public_id: &str) {
+        self.notifications.retain(|n| n.public_id != public_id);
+    }
+
+    pub fn clear_notifications(&mut self) {
+        self.notifications.clear();
+    }
+
+    /// A 1:1 notification's title: the number itself, or (when the desktop
+    /// knows the contact) that contact's name. A name we can't check passes;
+    /// the text match still has to be unique.
+    fn title_fits(title: &str, conv: &Conversation) -> bool {
+        if looks_like_phone_number(title) {
+            return same_number(&normalize_phone(title), &normalize_phone(&conv.address));
+        }
+        // Without a contact the display name is just the address.
+        let known_name = !conv.display_name.is_empty()
+            && conv.display_name != conv.address
+            && !looks_like_phone_number(&conv.display_name);
+        !known_name || normalize_text(title) == normalize_text(&conv.display_name)
+    }
+
+    /// Newest text received in a conversation.
+    fn newest_received(conv: &Conversation) -> Option<&SmsMessage> {
+        conv.messages.iter().filter(|m| !m.is_sent() && !m.body.trim().is_empty()).max_by_key(|m| m.date)
+    }
+
+    /// The notification to answer for a conversation, only when the match is
+    /// unambiguous; a wrong match would send the text to someone else.
+    ///
+    /// The notification's preview must quote the conversation's newest
+    /// received text, and no other conversation's; for a 1:1 with a known
+    /// name its title must be that name; and exactly one notification may
+    /// qualify.
+    fn notification_for(&self, primary: i64) -> Option<&ReplyableNotification> {
+        let conv = self.index.get(primary)?;
+        if conv.thread_id < 0 {
+            return None;
+        }
+        let newest = Self::newest_received(conv)?;
+        let mut candidates = self.notifications.iter().filter(|n| {
+            if !body_matches(&n.text, &newest.body) {
+                return false;
+            }
+            if !conv.is_group() && !Self::title_fits(&n.title, conv) {
+                return false;
+            }
+            // The same preview fits another conversation too: ambiguous.
+            !self.index.conversations.values().any(|other| {
+                other.thread_id != conv.thread_id
+                    && other.thread_id >= 0
+                    && Self::newest_received(other).is_some_and(|m| body_matches(&n.text, &m.body))
+            })
+        });
+        let found = candidates.next()?;
+        candidates.next().is_none().then_some(found)
     }
 
     /// Reply into an existing thread, addressed by conversation id.
@@ -706,6 +866,97 @@ mod tests {
         p.apply(&[tup(2, 30, &["3165551111"], 200)]);
         let effects = p.m.open_or_create("3165551111", "");
         assert_eq!(effects.last(), Some(&Effect::ShowThread(30)));
+    }
+
+    // ── send route A: reply through the notification ──────────────
+
+    fn incoming(uid: i64, thread_id: i64, addr: &str, body: &str, date: i64) -> RawMessage {
+        RawMessage { body: body.into(), ..tup(uid, thread_id, &[addr], date) }
+    }
+
+    fn notif(id: &str, title: &str, text: &str) -> ReplyableNotification {
+        ReplyableNotification {
+            public_id: id.into(),
+            app_name: "Messages".into(),
+            title: title.into(),
+            text: text.into(),
+            reply_id: format!("reply-{id}"),
+        }
+    }
+
+    fn sent_echo(uid: i64, thread_id: i64, addr: &str, body: &str, date: i64) -> RawMessage {
+        RawMessage { msg_type: 2, ..incoming(uid, thread_id, addr, body, date) }
+    }
+
+    #[test]
+    fn reply_goes_through_the_matching_notification_and_is_labeled() {
+        let mut p = Panel::new();
+        p.m.contact_map.insert("3165551111".into(), "Alex".into());
+        p.apply(&[incoming(1, 10, "3165551111", "Are you still coming tonight?", 100)]);
+        p.m.note_notification(notif("n1", "Alex", "Are you still coming tonight?"));
+        let effects = p.m.send(10, "Yes, leaving now");
+        assert_eq!(
+            effects,
+            vec![Effect::ReplyViaNotification { thread_id: 10, reply_id: "reply-n1".into(), text: "Yes, leaving now".into() }]
+        );
+        p.merge(sent_echo(2, 10, "3165551111", "Yes, leaving now", 200));
+        assert_eq!(p.m.route_of(2), Some(SendRoute::Notification));
+        assert_eq!(SendRoute::Notification.label(), "via notification");
+    }
+
+    #[test]
+    fn without_a_notification_it_sends_as_now_and_says_sms() {
+        let mut p = Panel::new();
+        p.apply(&[incoming(1, 10, "3165551111", "Are you still coming tonight?", 100)]);
+        let effects = p.m.send(10, "Yes");
+        assert!(matches!(&effects[0], Effect::Reply { conversation_id: 10, .. }));
+        p.merge(sent_echo(2, 10, "3165551111", "Yes", 200));
+        assert_eq!(p.m.route_of(2), Some(SendRoute::Sms));
+        // A text sent on the phone itself gets no label.
+        p.merge(sent_echo(3, 10, "3165551111", "typed on the phone", 300));
+        assert_eq!(p.m.route_of(3), None);
+    }
+
+    #[test]
+    fn ambiguous_or_mismatched_notifications_are_not_used() {
+        let mut p = Panel::new();
+        p.m.contact_map.insert("3165551111".into(), "Alex".into());
+        p.apply(&[
+            incoming(1, 10, "3165551111", "See you at the game tonight", 100),
+            incoming(2, 20, "3165552222", "See you at the game tonight", 110),
+        ]);
+        // The same preview fits both chats: never guess.
+        p.m.note_notification(notif("n1", "Alex", "See you at the game tonight"));
+        assert!(matches!(p.m.send(10, "ok")[0], Effect::Reply { .. }));
+        // A title that isn't this contact's name.
+        p.apply(&[incoming(3, 10, "3165551111", "Running ten minutes late", 120)]);
+        p.m.note_notification(notif("n2", "Sam", "Running ten minutes late"));
+        assert!(matches!(p.m.send(10, "ok")[0], Effect::Reply { .. }));
+        // A number title that is a different number.
+        p.m.note_notification(notif("n6", "+1 316 555 9999", "Running ten minutes late"));
+        assert!(matches!(p.m.send(10, "ok")[0], Effect::Reply { .. }));
+        p.m.remove_notification("n6");
+        // Not a texting app, or no reply action.
+        p.m.note_notification(ReplyableNotification { app_name: "Gmail".into(), ..notif("n3", "Alex", "Running ten minutes late") });
+        p.m.note_notification(ReplyableNotification { reply_id: String::new(), ..notif("n4", "Alex", "Running ten minutes late") });
+        assert!(matches!(p.m.send(10, "ok")[0], Effect::Reply { .. }));
+        // The right one, then removed from the phone: back to SMS.
+        p.m.note_notification(notif("n5", "Alex", "Running ten minutes late"));
+        assert!(matches!(p.m.send(10, "ok")[0], Effect::ReplyViaNotification { .. }));
+        p.m.remove_notification("n5");
+        assert!(matches!(p.m.send(10, "ok")[0], Effect::Reply { .. }));
+    }
+
+    #[test]
+    fn a_failed_notification_reply_falls_back_to_sms_and_says_so() {
+        let mut p = Panel::new();
+        p.apply(&[incoming(1, 10, "3165551111", "Are you still coming tonight?", 100)]);
+        p.m.note_notification(notif("n1", "+13165551111", "Are you still coming tonight?"));
+        assert!(matches!(p.m.send(10, "On my way")[0], Effect::ReplyViaNotification { .. }));
+        let effects = p.m.notification_reply_failed(10, "On my way");
+        assert!(matches!(&effects[0], Effect::Reply { conversation_id: 10, text, .. } if text == "On my way"));
+        p.merge(sent_echo(2, 10, "3165551111", "On my way", 200));
+        assert_eq!(p.m.route_of(2), Some(SendRoute::Sms));
     }
 
     #[test]
