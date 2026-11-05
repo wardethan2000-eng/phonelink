@@ -199,6 +199,8 @@ Google Contacts. 7. Side-by-side on the laptop, measure, switch autostart. The t
    is owned (the Python app is running). If it is, it says so and exits, because
    both would write the same store.
 8. Flatpak: **on hold** (Ethan, 2026-11-05: not sure he wants it). See below.
+9. RCS sending: notification replies first, then a Google Messages web
+   link. After cutover. See "Phase 9: RCS sending" below.
 
 ## Public commitments
 Things said in public that the project owes people. Close each one out when
@@ -252,3 +254,78 @@ go away.
   meantime.
 - **Then:** keep the promise to #8, and reply on #2 and #6 (texts shown to
   Ethan first).
+
+## Phase 9: RCS sending
+Added 2026-11-05 at Ethan's ask. Today every text the app sends goes out as
+SMS/MMS, even in RCS threads, because KDE Connect sends through Android's SMS
+API and Android has no public RCS API (the RCS classes in AOSP are `@hide`;
+KDE bug 464654 has been open since 2023). The only thing on the phone that
+can send RCS is Google Messages, so both routes below make it do the
+sending. This is a new feature, so it comes after cutover, per "no new
+features during the port". Route A is small enough to move earlier if Ethan
+asks.
+
+### Route A: reply through the Google Messages notification
+A Google Messages notification mirrored by KDE Connect carries an inline
+reply (`RemoteInput`). Answering it hands the text to Google Messages, which
+sends it its own way: RCS, end-to-end encrypted in an RCS thread. This is the
+same path Wear OS and Android Auto replies use.
+- **Already there:** `DbusClient` has both `sendReply` forms
+  (`src/dbus/client.rs`), and `hidden_texts` already matches a notification
+  to a conversation.
+- **Send rule:** if the open thread has a live Google Messages notification
+  with a reply id (matched by sender, as in `hidden_texts`), send with
+  `sendReply`. Otherwise use `replyToConversation`, as now. The echo from the
+  phone reconciles both the same way.
+- **Honesty:** mark each sent bubble "RCS" or "SMS" by the route used, so a
+  fallback is never silent.
+- **Limit:** works only while that notification is still on the phone. So it
+  covers answering a text that just came in, but not new threads or old
+  ones.
+- **Gate before building:** Ethan replies to an RCS text from a Phone Link
+  notification, and the phone shows it went out as RCS. Not yet done.
+
+### Route B: pair as a "Messages for web" device
+Google Messages for web is a paired device that talks to the phone through
+Google's servers. Its protocol has been reverse-engineered as **libgm** (Go,
+AGPL-3.0), part of mautrix-gmessages (Beeper used it for years). gmcli and
+openmessage are small Go tools built on it that pair, sync and send. A Phone
+Link that pairs the same way gets RCS sending in every thread (new ones
+included), read receipts, typing and reactions, and receives encrypted RCS
+directly. That also removes the Android 17 hidden-texts problem and its
+`adb appops` fix.
+- **Pairing:** QR pairing was removed in spring 2026 (mautrix-gmessages
+  v26.05). Pairing is now Google account sign-in followed by tapping a
+  matching emoji on the phone. The bridge gets the account cookies from a
+  browser sign-in, and we would need the same.
+- **License:** the app is MIT, and libgm is AGPL. **B1** is a separate sidecar
+  process (`phonelink-gm`, Go, AGPL, its own repo or directory and its own
+  licence) that the Rust app talks to over a local socket or D-Bus.
+  Separate programs talking this way don't make the app AGPL.
+- **B2 (later, Ethan open to it):** a clean Rust implementation of the
+  protocol. That means protobuf schemas, the pairing crypto, AES-CTR + HMAC
+  message encryption and the long-poll receive loop on
+  `instantmessaging-pa.googleapis.com`. Must be written from protocol
+  notes and traffic, not translated from libgm, or the AGPL follows it.
+  Do it once B1 has shown the protocol holds up and is worth owning.
+- **Risks:** unofficial, so Google can break it at any time. The phone must
+  be online. Pairing lapses after about 14 days unused. A web session may
+  conflict with Ethan's own messages.google.com tab (check).
+- **Integration:** an optional "Link Google Messages" setting. When linked,
+  it is the send and receive path for RCS threads, and KDE Connect stays the
+  path for SMS, calls, files and the rest. Messages from both go into the
+  same store. Conversation identity needs a mapping from Google's
+  conversation ids to the phone's thread ids (match by participants).
+- **First step (no shipping):** run gmcli on the build box against a
+  fresh Google sign-in. Check that pairing, sync and one RCS send work with
+  Ethan's account and carrier.
+
+### Ruled out
+- Embedding messages.google.com in a webview: official, but it is a
+  browser tab, not part of the conversation list.
+- A phone-side helper that types into Google Messages via an accessibility
+  service (or Tasker + AutoInput): breaks whenever Google Messages changes
+  its layout, and needs a second app on the phone.
+- Microsoft Phone Link's RCS: Samsung Messages only, through access only
+  Samsung's built-in software gets, and Samsung's own page says it is not
+  supported.
