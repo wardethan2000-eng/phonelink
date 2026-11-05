@@ -77,6 +77,12 @@ exit "$code"
 EOF
 }
 
+# Cargo updates Cargo.lock on the box when dependencies change; bring it back
+# so the committed lock matches what was built (sync_up would overwrite it).
+lock_back() {
+    rsync -az --checksum "$HOST:$REMOTE_DIR/Cargo.lock" "$ROOT/Cargo.lock" 2>/dev/null || true
+}
+
 bring_back() {
     local profile=$1
     mkdir -p "$ROOT/target/$profile"
@@ -92,12 +98,16 @@ case "$action" in
         profile=debug
         for a in "$@"; do [[ $a == --release ]] && profile=release; done
         sync_up
-        run_remote cargo build "$@"
+        code=0; run_remote cargo build "$@" || code=$?
+        lock_back
+        [[ $code -eq 0 ]] || exit "$code"
         bring_back "$profile"
         ;;
     test|check|clippy)
         sync_up
-        run_remote cargo "$action" "$@"
+        code=0; run_remote cargo "$action" "$@" || code=$?
+        lock_back
+        exit "$code"
         ;;
     run)
         [[ ${1:-} == -- ]] && shift

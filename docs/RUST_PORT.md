@@ -121,6 +121,23 @@ D-Bus surface is verified against kdeconnect 26.08 before Phase 2 is called
 done; `markConversationAsRead` (absent in 26.08) and a missing battery object
 are handled quietly.
 
+## Phase 2 status (D-Bus layer)
+`src/dbus/`: `client.rs` (every method of `dbus_client.py`, async on
+`call_future`, same names, paths and timeouts), `variant.rs` (message and
+attachment tuples, tolerant of int widths, `v` wrappers and `a(s)`/`av`/`as`
+address lists), `introspect.rs` (introspection XML → interfaces/members),
+`signals.rs` (subscriptions that unsubscribe on drop, daemon name watch,
+logind `PrepareForSleep`). One change from Python: a device refresh is two
+`GetAll` calls (device + battery) instead of six property reads.
+`tests/mock_daemon.rs` runs the client against a mock `org.kde.kdeconnect`
+on the build box's session bus; `cargo run --example mock_daemon` runs the
+same mock for trying `--dump` (and later the UI) without a phone.
+`phonelink-rs --dump [--dump-signatures]` is the live check on the laptop.
+`--dump-signatures` also compares the daemon's introspected surface with the
+list in rule 11, so `busctl` is not needed. Expected wire shape, unverified
+until the laptop run: `(isa(s)xiixxxa(xsss))` inside `v`.
+Live results: _pending Ethan's run_.
+
 ## Reported GitHub issues (as of 2026-11-05)
 | # | Issue | Plan |
 |---|---|---|
