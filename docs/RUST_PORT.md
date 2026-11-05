@@ -136,7 +136,30 @@ same mock for trying `--dump` (and later the UI) without a phone.
 `--dump-signatures` also compares the daemon's introspected surface with the
 list in rule 11, so `busctl` is not needed. Expected wire shape, unverified
 until the laptop run: `(isa(s)xiixxxa(xsss))` inside `v`.
-Live results: _pending Ethan's run_.
+Live results (laptop, daemon 26.08, 2026-11-05):
+- Wire shape inside `v` is `(isa(s)xiixixa(xsss))`: uID is `i` and subID is
+  `x`. 342 of 342 `activeConversations` entries and 1144 of 1144 replayed
+  signals parsed. `conversationLoaded` is `(xt)`.
+- The surface matches rule 11 except as follows.
+  - `deleteConversation` and `markConversationAsRead` are absent (both expected
+    and handled).
+  - `clipboard.content` and the `clipboardChanged` signal are absent. The
+    clipboard plugin only has `sendClipboard` overloads, `isAutoShareDisabled`
+    and `autoShareDisabledChanged`, so the Python clipboard tab's subscription
+    never fires. Re-check what that tab can show before porting it (Phase 4).
+  - Unused but available: `sms.requestAllConversations`, `sms.sendSms`
+    (also with a sub id), `share.shareText`, `notifications.sendAction`,
+    `device.hasPlugin` / `loadedPlugins`, and `battery.hasBattery`.
+- Qt quirks the introspection reader now handles: signal args are marked
+  `direction="out"`; a subclass repeats `org.kde.kdeconnect.daemon` as a second
+  `<interface>` block, which is merged; methods with default arguments appear
+  once per overload.
+- 342 phone threads merge into 326 conversations (47 groups). The dump finds
+  no self number (it does not read contacts).
+- Bug carried over from Python: threads with no addresses all get identity `""`
+  and merge into one conversation (seen: 2 phone threads). A fix would key
+  them by thread id; it waits for Ethan's OK because it changes the list.
+
 
 ## Reported GitHub issues (as of 2026-11-05)
 | # | Issue | Plan |

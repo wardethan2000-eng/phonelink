@@ -41,6 +41,10 @@ impl Interface {
     pub fn method(&self, name: &str) -> Option<&Member> {
         self.methods.iter().find(|m| m.name == name)
     }
+    /// Every overload of a method (Qt exports one per default-argument form).
+    pub fn overloads(&self, name: &str) -> Vec<&Member> {
+        self.methods.iter().filter(|m| m.name == name).collect()
+    }
     pub fn signal(&self, name: &str) -> Option<&Member> {
         self.signals.iter().find(|m| m.name == name)
     }
@@ -64,6 +68,10 @@ pub fn parse(xml: &str) -> Node {
     let mut node = Node::default();
     let mut depth_nodes = 0usize;
     let mut open = Open::None;
+    // Index of the interface being read. Qt emits one block per class in the
+    // object's hierarchy, and a subclass may reuse its parent's interface
+    // name, so blocks with the same name are merged.
+    let mut cur: Option<usize> = None;
     for cap in TAG.captures_iter(xml) {
         let closing = &cap[1] == "/";
         let tag = &cap[2];
@@ -91,10 +99,19 @@ pub fn parse(xml: &str) -> Node {
             }
             ("node", true) => depth_nodes = depth_nodes.saturating_sub(1),
             _ if depth_nodes > 1 => {} // a child node's inline description
-            ("interface", false) => node.interfaces.push(Interface { name: attr("name"), ..Default::default() }),
+            ("interface", false) => {
+                let name = attr("name");
+                cur = Some(match node.interfaces.iter().position(|i| i.name == name) {
+                    Some(i) => i,
+                    None => {
+                        node.interfaces.push(Interface { name, ..Default::default() });
+                        node.interfaces.len() - 1
+                    }
+                });
+            }
             ("method" | "signal", false) => {
                 let m = Member { name: attr("name"), ..Default::default() };
-                if let Some(iface) = node.interfaces.last_mut() {
+                if let Some(iface) = cur.map(|i| &mut node.interfaces[i]) {
                     if tag == "method" {
                         iface.methods.push(m);
                     } else {
@@ -109,14 +126,16 @@ pub fn parse(xml: &str) -> Node {
             }
             ("method" | "signal", true) => open = Open::None,
             ("property", false) => {
-                if let Some(iface) = node.interfaces.last_mut() {
+                if let Some(iface) = cur.map(|i| &mut node.interfaces[i]) {
                     iface.properties.push((attr("name"), attr("type")));
                 }
             }
             ("arg", false) => {
-                let Some(iface) = node.interfaces.last_mut() else { continue };
+                let Some(iface) = cur.map(|i| &mut node.interfaces[i]) else { continue };
                 let ty = attr("type");
-                let out = attr("direction") == "out";
+                // Qt marks signal args direction="out"; for a signal they are
+                // simply its arguments.
+                let out = open == Open::Method && attr("direction") == "out";
                 let member = match open {
                     Open::Method => iface.methods.last_mut(),
                     Open::Signal => iface.signals.last_mut(),
@@ -184,5 +203,43 @@ mod tests {
         assert_eq!(d.signal("reachableChanged").unwrap().args_in, "b");
         assert_eq!(n.children, vec!["sms", "battery"]);
         assert!(n.interface("ignored.inline").is_none());
+    }
+
+    /// What kdeconnectd 26.08 actually emits (seen on the laptop): signal args
+    /// marked out, a subclass repeating the daemon interface, overloads.
+    #[test]
+    fn qt_quirks() {
+        let xml = r#"<node>
+  <interface name="org.kde.kdeconnect.daemon">
+    <method name="sendSimpleNotification">
+      <arg name="a" type="s" direction="in"/><arg name="b" type="s" direction="in"/>
+    </method>
+  </interface>
+  <interface name="org.kde.kdeconnect.daemon">
+    <signal name="deviceListChanged"/>
+    <method name="devices">
+      <arg type="as" direction="out"/>
+      <arg name="onlyReachable" type="b" direction="in"/>
+      <arg name="onlyPaired" type="b" direction="in"/>
+    </method>
+    <method name="devices">
+      <arg type="as" direction="out"/>
+    </method>
+  </interface>
+  <interface name="org.kde.kdeconnect.device">
+    <signal name="reachableChanged">
+      <arg name="reachable" type="b" direction="out"/>
+    </signal>
+  </interface>
+</node>"#;
+        let n = parse(xml);
+        assert_eq!(n.interfaces.len(), 2);
+        let d = n.interface("org.kde.kdeconnect.daemon").unwrap();
+        assert!(d.method("sendSimpleNotification").is_some());
+        assert!(d.signal("deviceListChanged").is_some());
+        let sigs: Vec<_> = d.overloads("devices").iter().map(|m| m.args_in.as_str()).collect();
+        assert_eq!(sigs, vec!["bb", ""]);
+        let dev = n.interface("org.kde.kdeconnect.device").unwrap();
+        assert_eq!(dev.signal("reachableChanged").unwrap().args_in, "b");
     }
 }

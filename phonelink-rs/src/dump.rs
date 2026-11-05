@@ -226,7 +226,11 @@ async fn print_surface(client: &Client, device_id: Option<&str>) {
         };
         let iface_info = nodes[&path].as_ref().and_then(|n| n.interface(iface));
         let found = iface_info.and_then(|i| match kind {
-            Kind::Method => i.method(member).map(|m| format!("method ({})->({})", m.args_in, m.args_out)),
+            Kind::Method => {
+                let all: Vec<String> =
+                    i.overloads(member).iter().map(|m| format!("({})->({})", m.args_in, m.args_out)).collect();
+                (!all.is_empty()).then(|| format!("method {}", all.join(" | ")))
+            }
             Kind::Signal => i.signal(member).map(|m| format!("signal ({})", m.args_in)),
             Kind::Property => i.property(member).map(|t| format!("property {t}")),
         });

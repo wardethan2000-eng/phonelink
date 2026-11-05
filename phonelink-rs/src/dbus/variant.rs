@@ -172,10 +172,9 @@ mod tests {
     use super::*;
     use glib::prelude::*;
 
-    /// The shape kdeconnectd 26.08 marshals (ConversationMessage +
-    /// `a(xsss)` attachments). TODO(Phase 2 verify): confirm against the
-    /// laptop's `--dump-signatures` output.
-    const WIRE_SIGNATURE: &str = "(isa(s)xiixxxa(xsss))";
+    /// What kdeconnectd 26.08 sends, inside `v` (from `--dump-signatures` on
+    /// the laptop, 2026-11-05): uID is `i`, subID `x`.
+    const WIRE_SIGNATURE: &str = "(isa(s)xiixixa(xsss))";
 
     fn wire_message(addresses: &[&str], attachments: &[(i64, &str, &str, &str)]) -> Variant {
         let addrs: Vec<(String,)> = addresses.iter().map(|a| (a.to_string(),)).collect();
@@ -191,7 +190,7 @@ mod tests {
             2i32.to_variant(),
             1i32.to_variant(),
             615i64.to_variant(),
-            72001i64.to_variant(),
+            72001i32.to_variant(),
             (-1i64).to_variant(),
             atts.to_variant(),
         ])
