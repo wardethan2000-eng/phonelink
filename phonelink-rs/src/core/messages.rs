@@ -364,23 +364,23 @@ impl Messages {
         v
     }
 
-    /// Start a conversation from contact search: open the existing one for
-    /// that number, or create a draft (negative id).
-    ///
-    /// Parity note: like the Python, this can match a *group* whose first
-    /// address is the number; `find_thread_for_address` (used on send)
-    /// skips groups.
+    /// Start a conversation from contact search: open the 1:1 thread for that
+    /// number, or a draft already started for it, or create a draft
+    /// (negative id). Group chats never count, even when the number is
+    /// their first member (Python opened the group).
     pub fn open_or_create(&mut self, address: &str, display_name: &str) -> Vec<Effect> {
         if self.device_id.is_none() || !self.reachable {
             return Vec::new();
         }
         let norm = normalize_phone(address);
-        let existing = self
-            .index
-            .conversations
-            .values()
-            .find(|c| same_number(&normalize_phone(&c.address), &norm))
-            .map(|c| c.thread_id);
+        let existing = self.find_thread_for_address(address).or_else(|| {
+            self.index
+                .conversations
+                .values()
+                .filter(|c| c.thread_id < 0)
+                .find(|c| same_number(&normalize_phone(&c.address), &norm))
+                .map(|c| c.thread_id)
+        });
         if let Some(tid) = existing {
             self.active = Some(tid);
             self.read_thread_ids.insert(tid);
@@ -688,6 +688,24 @@ mod tests {
         // A number we already have a 1:1 thread with opens that thread.
         let effects = p.m.open_or_create("316-555-1212", "");
         assert_eq!(effects.last(), Some(&Effect::ShowThread(10)));
+    }
+
+    #[test]
+    fn starting_a_chat_with_a_group_member_never_opens_the_group() {
+        let mut p = Panel::new();
+        // A group whose first member is 3165551111, and no 1:1 yet.
+        p.apply(&[tup(1, 20, &["3165551111", "3165552222"], 100)]);
+        let effects = p.m.open_or_create("3165551111", "");
+        let draft = p.m.active_thread().unwrap();
+        assert!(draft < 0, "opened {draft} instead of a new draft");
+        assert_eq!(effects.last(), Some(&Effect::ShowThread(draft)));
+        // Asking again reopens the same draft rather than making another.
+        p.m.open_or_create("+1 316 555 1111", "");
+        assert_eq!(p.m.active_thread(), Some(draft));
+        // Once the 1:1 exists, it wins over the group.
+        p.apply(&[tup(2, 30, &["3165551111"], 200)]);
+        let effects = p.m.open_or_create("3165551111", "");
+        assert_eq!(effects.last(), Some(&Effect::ShowThread(30)));
     }
 
     #[test]
