@@ -121,6 +121,14 @@ D-Bus surface is verified against kdeconnect 26.08 before Phase 2 is called
 done; `markConversationAsRead` (absent in 26.08) and a missing battery object
 are handled quietly.
 
+## Reported GitHub issues (as of 2026-11-05)
+| # | Issue | Plan |
+|---|---|---|
+| 8 | `pip install .` fails (flat-layout auto-discovery; deprecated license table). Closed by the reporter, **not fixed** | Fix in the Python app now (explicit `[tool.setuptools] packages`, SPDX license string). The Rust app ships as a binary/Flatpak, so the problem does not carry over |
+| 6 | Linux Mint 21.1: the window shows only controls, which do nothing | Likely cause, unverified: Mint 21 ships GTK 4.6 / Adw 1.1, and the app uses Adw 1.4 widgets (`OverlaySplitView`, `SwitchRow`). Rust app: check versions at startup and show a clear message; the Flatpak (#2) removes the dependency on distro versions. Ask the reporter for terminal output |
+| 2 | Distribute as a Flatpak | Becomes the main install route for the Rust app, on the GNOME runtime with `--talk-name=org.kde.kdeconnect` and access to the sftp mount. KDE Connect stays on the host. Comes after cutover |
+| 1 | Use the phone as a desktop camera (reporter offers to help) | KDE Connect has no camera plugin. A feasible route is scrcpy's camera source plus v4l2loopback, which needs adb. A new feature, after the port; Ethan decides |
+
 ## Deferred / out of scope
 - No redesign, no new features during the port.
 - Google Contacts and the settings dialog come last (Phase 6); the Rust app
