@@ -71,14 +71,40 @@ const THREADS: &[(i64, &[&str], bool, &[&str])] = &[
     (24, &["+15555550116"], false, &["Here's the recipe I mentioned, it takes about an hour start to finish"]),
 ];
 
+/// Thread 11 gets a long history (to show the 60-message window and
+/// "Show earlier messages") and one photo.
+const LONG_THREAD: i64 = 11;
+const LONG_THREAD_LEN: usize = 150;
+
+/// A small solid-color PNG, base64, like KDE Connect's inline thumbnails.
+fn thumbnail_png() -> String {
+    let pb = gtk::gdk_pixbuf::Pixbuf::new(gtk::gdk_pixbuf::Colorspace::Rgb, false, 8, 100, 75).unwrap();
+    pb.fill(0xe5_a5_0a_ff); // amber, so it stands out from the sent-bubble color
+    let bytes = pb.save_to_bufferv("png", &[]).unwrap();
+    glib::base64_encode(&bytes).to_string()
+}
+
 fn now_ms() -> i64 {
     SystemTime::now().duration_since(UNIX_EPOCH).map_or(0, |d| d.as_millis() as i64)
 }
 
 /// One message in kdeconnectd 26.08's shape: `(isa(s)xiixixa(xsss))`.
 fn message(thread: i64, uid: i32, addresses: &[&str], body: &str, date: i64, sent: bool, read: bool) -> Variant {
+    message_with(thread, uid, addresses, body, date, sent, read, Vec::new())
+}
+
+#[allow(clippy::too_many_arguments)]
+fn message_with(
+    thread: i64,
+    uid: i32,
+    addresses: &[&str],
+    body: &str,
+    date: i64,
+    sent: bool,
+    read: bool,
+    atts: Vec<(i64, String, String, String)>,
+) -> Variant {
     let addrs: Vec<(String,)> = addresses.iter().map(|a| (a.to_string(),)).collect();
-    let atts: Vec<(i64, String, String, String)> = Vec::new();
     Variant::tuple_from_iter([
         1i32.to_variant(),
         body.to_variant(),
@@ -98,7 +124,24 @@ fn message(thread: i64, uid: i32, addresses: &[&str], body: &str, date: i64, sen
 fn thread_messages(index: usize) -> Vec<Variant> {
     let (thread, addrs, unread, lines) = THREADS[index];
     let base = now_ms() - (index as i64) * (index as i64) * 90 * 60_000;
-    lines
+    let mut out = Vec::new();
+    if thread == LONG_THREAD {
+        // Older history, an hour apart, alternating sides, with a photo.
+        let chatter = ["ok", "sounds good", "on my way", "see you there", "haha", "did you see that?", "yes", "tomorrow works"];
+        for k in 0..LONG_THREAD_LEN {
+            let date = base - ((LONG_THREAD_LEN - k) as i64) * 60 * 60_000;
+            let uid = 5000 + k as i32;
+            let body = chatter[k % chatter.len()];
+            let atts = if k == LONG_THREAD_LEN - 3 {
+                vec![(uid as i64, "image/png".to_string(), thumbnail_png(), format!("PART_{uid}.png"))]
+            } else {
+                Vec::new()
+            };
+            let text = if atts.is_empty() { body } else { "" };
+            out.push(message_with(thread, uid, addrs, text, date, k % 3 == 0, true, atts));
+        }
+    }
+    out.extend(lines
         .iter()
         .enumerate()
         .map(|(i, body)| {
@@ -108,8 +151,8 @@ fn thread_messages(index: usize) -> Vec<Variant> {
             let date = base - ((lines.len() - 1 - i) as i64) * 7 * 60_000;
             let uid = (thread * 100) as i32 + i as i32;
             message(thread, uid, addrs, body, date, sent, !(unread && newest && !sent))
-        })
-        .collect()
+        }));
+    out
 }
 
 fn main() {

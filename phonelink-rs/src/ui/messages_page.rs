@@ -16,6 +16,7 @@ use adw::prelude::*;
 use glib::Variant;
 
 use super::conversation_list::ConversationList;
+use super::thread_view::{BubbleActions, ThreadView};
 use crate::core::contacts::load_contact_map;
 use crate::core::message::parse_message;
 use crate::core::messages::{Effect, Messages};
@@ -46,7 +47,7 @@ struct Inner {
 pub struct MessagesPage {
     pub widget: gtk::Stack,
     list: Rc<ConversationList>,
-    thread_status: adw::StatusPage,
+    thread: Rc<ThreadView>,
     inner: RefCell<Inner>,
 }
 
@@ -67,19 +68,23 @@ impl MessagesPage {
         let list = ConversationList::new();
         content.append(&list.widget);
         content.append(&gtk::Separator::new(gtk::Orientation::Vertical));
-        // TODO(Phase 3 step 2): the thread view replaces this.
-        let thread_status = adw::StatusPage::new();
-        thread_status.set_icon_name(Some("mail-unread-symbolic"));
-        thread_status.set_title("Select a conversation");
-        thread_status.set_hexpand(true);
-        content.append(&thread_status);
+        let thread = ThreadView::new(BubbleActions {
+            // TODO(Phase 3): requestAttachmentFile + attachmentReceived, and
+            // the automatic full-image fetch.
+            download: Rc::new(|part, _uid, name| log::info!("download {name} (part {part}): not wired yet")),
+        });
+        // TODO(Phase 3 step 3): compose. Until then nothing can be sent.
+        thread.entry.set_sensitive(false);
+        thread.entry.set_placeholder_text(Some("Sending isn't connected yet"));
+        thread.send_button.set_sensitive(false);
+        content.append(&thread.widget);
         widget.add_named(&content, Some("content"));
         widget.set_visible_child_name("status");
 
         let this = Rc::new(Self {
             widget,
             list,
-            thread_status,
+            thread,
             inner: RefCell::new(Inner {
                 m: Messages::new(),
                 store,
@@ -283,10 +288,7 @@ impl MessagesPage {
                     c.mark_conversation_as_read(&d, thread_id).await;
                 }),
                 Effect::ShowThread(tid) => self.show_thread(tid),
-                Effect::ShowEmpty => {
-                    self.thread_status.set_title("Select a conversation");
-                    self.thread_status.set_description(None);
-                }
+                Effect::ShowEmpty => self.thread.show_empty(),
                 Effect::Toast(text) => log::info!("toast: {text}"),
                 // TODO(Phase 3 step 3): sending and deleting. Nothing is sent
                 // to the phone until compose is wired up and reviewed.
@@ -336,10 +338,6 @@ impl MessagesPage {
         let i = self.inner.borrow();
         let Some(conv) = i.m.index.get(tid) else { return };
         self.list.select_thread(conv.thread_id);
-        self.thread_status.set_title(if conv.display_name.is_empty() { &conv.address } else { &conv.display_name });
-        self.thread_status.set_description(Some(&format!(
-            "{} messages loaded. The thread view is the next step of Phase 3.",
-            conv.messages.len()
-        )));
+        self.thread.sync(conv, &|uid| i.m.route_of(uid));
     }
 }

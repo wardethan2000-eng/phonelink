@@ -3,6 +3,7 @@
 
 pub mod conversation_list;
 pub mod messages_page;
+pub mod thread_view;
 pub mod window;
 
 use adw::prelude::*;
