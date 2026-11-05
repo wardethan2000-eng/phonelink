@@ -20,13 +20,9 @@ from phonelink.dbus_client import (
 from phonelink.ui.sms_panel import SmsPanel
 from phonelink.ui.notifications_panel import NotificationsPanel
 from phonelink.ui.files_panel import FilesPanel
-from phonelink.ui.fabric_panel import FabricPanel
 from phonelink.ui.clipboard_panel import ClipboardPanel
 from phonelink.ui.settings_dialog import SettingsPanel
 from phonelink.ui.icons import device_icon_size, resolve_icon
-from phonelink import loom_bridge
-from phonelink.loom_phone import LoomPhoneClient
-from phonelink.settings import get_settings
 
 
 class MainWindow(Adw.ApplicationWindow):
@@ -43,12 +39,15 @@ class MainWindow(Adw.ApplicationWindow):
         self._devices_refresh_pending = False
         self._daemon_watch_id = None
         self._device_status_signal_ids: list[int] = []
+        self._sleep_signal_id = None
+        self._system_bus = None
 
         self.set_title("Phone Link")
         self.set_default_size(960, 640)
         self.set_size_request(640, 420)
 
         self.connect("close-request", self._on_close)
+        self.connect("notify::visible", self._on_visible_changed)
 
         # Keyboard shortcuts
         key_ctrl = Gtk.EventControllerKey()
@@ -211,12 +210,6 @@ class MainWindow(Adw.ApplicationWindow):
         page = self.stack.add_titled(self.clipboard_panel, "clipboard", "Clipboard")
         page.set_icon_name("edit-paste-symbolic")
 
-        # Loom fabric — browse other devices' files and pull them here. Independent of the KDE
-        # Connect device (it talks to a local loomd), so it's not in the set_device refresh loops.
-        self.fabric_panel = FabricPanel(client=self.client)
-        page = self.stack.add_titled(self.fabric_panel, "fabric", "Fabric")
-        page.set_icon_name("network-workgroup-symbolic")
-
         self.stack.set_vexpand(True)
         self.stack.set_hexpand(True)
 
@@ -240,11 +233,7 @@ class MainWindow(Adw.ApplicationWindow):
 
         notif_box.append(Gtk.Separator(orientation=Gtk.Orientation.HORIZONTAL))
 
-        # The notifications panel can source from KDE Connect (default) or Loom (loom/phone/0). We hand
-        # it a LoomPhoneClient when the Loom SDK is importable; loomd itself may come up later (the
-        # client retries), so we don't block startup probing it.
-        loom_client = LoomPhoneClient() if loom_bridge.sdk_available() else None
-        self.notif_panel = NotificationsPanel(client=self.client, loom_client=loom_client)
+        self.notif_panel = NotificationsPanel(client=self.client)
         self.notif_panel.set_vexpand(True)
         notif_box.append(self.notif_panel)
 
@@ -270,12 +259,7 @@ class MainWindow(Adw.ApplicationWindow):
             on_google_connect=self.sms_panel.connect_google_contacts,
             on_google_refresh=self.sms_panel.refresh_google_contacts,
             on_google_disconnect=self.sms_panel.disconnect_google_contacts,
-            on_notifications_transport_changed=self._on_notifications_transport_changed,
         )
-
-        # Start the notification source matching the saved transport (starts the Loom subscription
-        # immediately when the user has chosen Loom, independent of any KDE Connect device).
-        self.notif_panel.apply_transport(get_settings().notifications_transport)
         self.sms_panel.connect(
             "google-status-changed",
             lambda *_args: self._settings_panel.refresh_google_status(),
@@ -300,10 +284,6 @@ class MainWindow(Adw.ApplicationWindow):
 
     def _show_main(self):
         self._body_stack.set_visible_child_name("main")
-
-    def _on_notifications_transport_changed(self, transport: str):
-        """Switch the notifications panel between KDE Connect and Loom when the setting changes."""
-        self.notif_panel.apply_transport(transport)
 
     # ── Data refresh ───────────────────────────────────────────────
 
@@ -424,6 +404,17 @@ class MainWindow(Adw.ApplicationWindow):
             "deviceListChanged",
             self._on_device_list_changed,
         )
+        # Texts and photos that reached the phone while the laptop slept were
+        # never pushed to us, so pull them after every resume.
+        try:
+            self._system_bus = Gio.bus_get_sync(Gio.BusType.SYSTEM)
+            self._sleep_signal_id = self._system_bus.signal_subscribe(
+                "org.freedesktop.login1", "org.freedesktop.login1.Manager",
+                "PrepareForSleep", "/org/freedesktop/login1", None,
+                Gio.DBusSignalFlags.NONE, self._on_prepare_for_sleep,
+            )
+        except GLib.Error as exc:
+            print(f"[phonelink] can't watch for resume from sleep: {exc.message}")
         # Slow safety-net refresh in case a property-change signal is ever
         # missed (e.g. a plugin that doesn't emit one). Events do the real work.
         self._poll_source = GLib.timeout_add_seconds(120, self._on_watchdog)
@@ -585,6 +576,38 @@ class MainWindow(Adw.ApplicationWindow):
 
     def _on_reachable_changed(self, conn, sender, path, iface, signal, params):
         GLib.idle_add(self._refresh_devices)
+        # A quick drop-and-return can collapse into one "still reachable"
+        # snapshot, so act on the signal itself: a new connection means the
+        # phone has forgotten everything it didn't send over the old one.
+        try:
+            reachable = bool(params.unpack()[0])
+        except (TypeError, ValueError, IndexError):
+            reachable = False
+        if reachable:
+            GLib.idle_add(self._pull_from_phone)
+
+    def _on_prepare_for_sleep(self, conn, sender, path, iface, signal, params):
+        try:
+            going_to_sleep = bool(params.unpack()[0])
+        except (TypeError, ValueError, IndexError):
+            return
+        if not going_to_sleep:
+            # Give Wi-Fi and the phone link a moment to come back.
+            GLib.timeout_add_seconds(8, self._pull_from_phone)
+
+    def _on_visible_changed(self, _window, _param):
+        if self.get_visible():
+            self._pull_from_phone(catch_up_interval=120)
+
+    def _pull_from_phone(self, catch_up_interval=None):
+        """Catch up on texts and photos the phone didn't push."""
+        if self._ui_built:
+            if catch_up_interval is None:
+                self.sms_panel.catch_up()
+            else:
+                self.sms_panel.catch_up(min_interval=catch_up_interval)
+            self.files_panel.refresh_from_phone()
+        return GLib.SOURCE_REMOVE
 
     def _on_battery_refreshed(self, conn, sender, path, iface, signal, params):
         try:
@@ -657,6 +680,9 @@ class MainWindow(Adw.ApplicationWindow):
             if self._daemon_watch_id is not None:
                 Gio.bus_unwatch_name(self._daemon_watch_id)
                 self._daemon_watch_id = None
+            if self._sleep_signal_id is not None and self._system_bus:
+                self._system_bus.signal_unsubscribe(self._sleep_signal_id)
+                self._sleep_signal_id = None
             if self.client.bus:
                 for sid in self._device_status_signal_ids:
                     self.client.bus.signal_unsubscribe(sid)

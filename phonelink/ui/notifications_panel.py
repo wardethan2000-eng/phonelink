@@ -1,7 +1,5 @@
 """Notifications panel — compact single-column list for the slide-out tray."""
 
-import threading
-
 import gi
 
 gi.require_version("Gtk", "4.0")
@@ -196,12 +194,9 @@ class NotifRow(Gtk.ListBoxRow):
 class NotificationsPanel(Gtk.Box):
     """Compact notification list widget for the collapsible header tray."""
 
-    def __init__(self, client, loom_client=None):
+    def __init__(self, client):
         super().__init__(orientation=Gtk.Orientation.VERTICAL)
         self.client = client
-        self._loom = loom_client            # LoomPhoneClient | None — the alternate transport
-        self._loom_running = False
-        self._transport = get_settings().notifications_transport
         self._device = None
         self._notifications: dict[str, Notification] = {}
         self._signal_ids: list[int] = []
@@ -278,13 +273,6 @@ class NotificationsPanel(Gtk.Box):
         old = self._device
         self._device = device
 
-        # In Loom mode notifications come from the phone's node, not the KDE Connect device — so a KDE
-        # device coming or going doesn't drive the list; we only make sure the Loom source is running.
-        if self._transport == "loom":
-            if not self._loom_running:
-                self._start_loom()
-            return
-
         if device and device.reachable:
             if not old or old.id != device.id or not old.reachable:
                 self._subscribe_signals(device.id)
@@ -297,97 +285,6 @@ class NotificationsPanel(Gtk.Box):
             self._stack.set_visible_child_name("status")
         else:
             self._status.set_description("No phone linked yet.")
-            self._stack.set_visible_child_name("status")
-
-    # ── Transport (KDE Connect ⇆ Loom) ─────────────────────────────
-
-    def apply_transport(self, transport: str):
-        """Switch the notification source between ``"kdeconnect"`` and ``"loom"`` live.
-
-        The panel's rows and layout are unchanged — only where the data comes from. Tears the current
-        source down, clears the list, and starts the new one.
-        """
-        transport = transport if transport in ("kdeconnect", "loom") else "kdeconnect"
-        if transport == self._transport and (transport != "loom" or self._loom_running):
-            return
-
-        # Tear down the old source.
-        if self._transport == "loom":
-            self._stop_loom()
-        else:
-            self._unsubscribe_kde()
-
-        self._transport = transport
-        self._notifications.clear()
-        self._sync_list()
-
-        if transport == "loom":
-            self._start_loom()
-        else:
-            # Resume KDE Connect with the last known device.
-            self.set_device(self._device)
-
-    def _start_loom(self):
-        if not self._loom:
-            self._status.set_description(
-                "Loom isn't set up.\nInstall the Loom SDK and start loomd to mirror "
-                "notifications over Loom."
-            )
-            self._stack.set_visible_child_name("status")
-            return
-        self._loom_running = True
-        self._status.set_description("Connecting to your phone over Loom…")
-        self._stack.set_visible_child_name("status")
-        self._loom.start(
-            on_snapshot=lambda notifs: GLib.idle_add(self._loom_apply_snapshot, notifs),
-            on_posted=lambda n: GLib.idle_add(self._loom_apply_posted, n),
-            on_removed=lambda pid: GLib.idle_add(self._loom_apply_removed, pid),
-            on_status=lambda state, detail: GLib.idle_add(self._loom_apply_status, state, detail),
-        )
-
-    def _stop_loom(self):
-        self._loom_running = False
-        if self._loom:
-            self._loom.stop()
-
-    def _unsubscribe_kde(self):
-        if getattr(self.client, "bus", None):
-            for sid in self._signal_ids:
-                self.client.bus.signal_unsubscribe(sid)
-        self._signal_ids.clear()
-
-    # These run on the GTK thread (via GLib.idle_add), fed by the LoomPhoneClient worker. They reuse
-    # the same `_notifications` model + `_sync_list()` as the KDE path — only the source differs.
-    def _loom_apply_snapshot(self, notifs):
-        if self._transport != "loom":
-            return
-        self._notifications = {n.public_id: n for n in notifs}
-        self._sync_list()
-        self._stack.set_visible_child_name("list")
-
-    def _loom_apply_posted(self, notif):
-        if self._transport != "loom":
-            return
-        self._notifications[notif.public_id] = notif
-        self._sync_list()
-        self._stack.set_visible_child_name("list")
-
-    def _loom_apply_removed(self, public_id):
-        if self._transport != "loom":
-            return
-        self._notifications.pop(public_id, None)
-        self._sync_list()
-
-    def _loom_apply_status(self, state, detail):
-        if self._transport != "loom":
-            return
-        if state == "connected":
-            self._stack.set_visible_child_name("list")
-        elif state in ("connecting", "error") and not self._notifications:
-            if state == "error":
-                self._status.set_description(detail or "Couldn't reach your phone over Loom.")
-            else:
-                self._status.set_description(detail or "Connecting to your phone over Loom…")
             self._stack.set_visible_child_name("status")
 
     # ── D-Bus ──────────────────────────────────────────────────────
@@ -543,27 +440,8 @@ class NotificationsPanel(Gtk.Box):
 
     # ── Actions ────────────────────────────────────────────────────
 
-    def _loom_action(self, fn, *args):
-        """Run a blocking :class:`~phonelink.loom_phone.LoomPhoneClient` action (dismiss/reply) off the
-        GTK main loop, so a slow phone dial never freezes the UI. On failure, surface it via the same
-        status banner the connection uses (the optimistic row change is already applied; a live
-        re-snapshot from the phone corrects the view if the action didn't take)."""
-        def worker():
-            try:
-                fn(*args)
-            except Exception as e:  # noqa: BLE001 — network/refusal: report, don't crash the UI
-                GLib.idle_add(self._loom_apply_status, "error", f"Couldn't reach your phone: {e}")
-
-        threading.Thread(target=worker, name="loom-phone-action", daemon=True).start()
-
     def _on_dismiss_clicked(self, _btn, public_id: str):
-        # Both transports dismiss on the phone, then drop the row optimistically (the phone stays the
-        # source of truth; a re-snapshot restores it if the action didn't take). Over Loom this is the
-        # P5 `loom/phone-action/0` request; over KDE Connect it's the D-Bus call.
-        if self._transport == "loom":
-            if self._loom:
-                self._loom_action(self._loom.dismiss_notification, public_id)
-        elif self._device:
+        if self._device:
             self.client.submit(
                 self.client.dismiss_notification, self._device.id, public_id
             )
@@ -577,18 +455,9 @@ class NotificationsPanel(Gtk.Box):
 
     def _send_reply(self, public_id: str, entry: Gtk.Entry):
         text = entry.get_text().strip()
-        if not text:
+        if not text or not self._device:
             return
         notif = self._notifications.get(public_id)
-        if self._transport == "loom":
-            # P5 reply over `loom/phone-action/0`: send the notification's captured reply token + text.
-            if self._loom and notif and notif.reply_id:
-                self._loom_action(self._loom.reply_to_notification, notif.reply_id, text)
-            entry.set_text("")
-            return
-        # KDE Connect: reply keyed by the notification's public_id.
-        if not self._device:
-            return
         if notif and notif.reply_id:
             self.client.submit(
                 self.client.reply_to_notification, self._device.id, public_id, text
@@ -596,32 +465,22 @@ class NotificationsPanel(Gtk.Box):
         entry.set_text("")
 
     def _on_refresh(self, _btn):
-        if self._transport == "loom":
-            # The Loom subscription is a live stream; force a fresh snapshot by reconnecting.
-            if self._loom_running:
-                self._start_loom()
-            return
         if self._device and self._device.reachable:
             self._load_notifications(self._device.id)
 
     def _on_dismiss_all(self, _btn):
+        if not self._device:
+            return
+        device_id = self._device.id
         dismissable_ids = [
             nid for nid, notif in self._notifications.items()
             if notif and notif.dismissable
         ]
-        if self._transport == "loom":
-            if self._loom and dismissable_ids:
-                self._loom_action(self._dismiss_many_loom, dismissable_ids)
-        elif self._device:
-            if dismissable_ids:
-                self.client.submit(
-                    self._dismiss_many, self._device.id, dismissable_ids
-                )
+        if dismissable_ids:
+            self.client.submit(
+                self._dismiss_many, device_id, dismissable_ids
+            )
         self._clear_all()
-
-    def _dismiss_many_loom(self, ids: list):
-        for nid in ids:
-            self._loom.dismiss_notification(nid)
 
     def _dismiss_many(self, device_id: str, ids: list):
         for nid in ids:

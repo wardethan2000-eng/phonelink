@@ -79,32 +79,6 @@ class SmsMessage:
     thread_id: int = 0
     attachments: list[dict] = field(default_factory=list)
 
-    @classmethod
-    def from_loom(cls, d: dict) -> "SmsMessage":
-        """Map an SMS message dict from Loom (`loom/phone-action/0`, P5) onto this model, so the SMS
-        panel ingests it exactly like a KDE Connect message. Keys: ``thread_id`` (str), ``address``,
-        ``body``, ``date`` (ms), ``type`` (1=received, 2=sent), ``read``; optional ``addresses`` (group).
-        """
-
-        def _int(v, default: int) -> int:
-            # Only fall back on a truly-missing value — 0 is a legitimate value (e.g. read=0=unread).
-            return default if v is None else int(v)
-
-        msg = cls(
-            uid=_int(d.get("uid"), 0),
-            body=d.get("body") or "",
-            address=d.get("address") or "",
-            date=_int(d.get("date"), 0),
-            msg_type=_int(d.get("type"), 1),
-            read=_int(d.get("read"), 1),
-            thread_id=_int(d.get("thread_id"), 0),
-        )
-        # Group threads carry every participant; the panel reads this off `_all_addresses` on ingest.
-        addrs = d.get("addresses")
-        if addrs:
-            msg._all_addresses = list(addrs)
-        return msg
-
     @property
     def is_sent(self) -> bool:
         return self.msg_type == 2
@@ -217,30 +191,6 @@ class Notification:
         if delta == 1:
             return "Yesterday " + dt.strftime("%I:%M %p").lstrip("0")
         return dt.strftime("%b %d %I:%M %p").lstrip("0")
-
-    @classmethod
-    def from_loom(cls, n) -> "Notification":
-        """Build from a ``loom_sdk.Notification`` (the ``loom/phone/0`` mirror).
-
-        Fields line up 1:1 with KDE Connect's; Loom defers icon *bytes* in v0 (``has_icon`` only), so
-        ``icon_path`` stays empty and the row falls back to the app's generic icon. The phone's own
-        post time (``n.time``, unix seconds) is used when present so the time label is accurate.
-        """
-        import time
-        return cls(
-            public_id=n.public_id,
-            app_name=n.app_name,
-            title=n.title,
-            text=(n.text or "").strip(),
-            ticker=n.ticker,
-            icon_path="",
-            has_icon=n.has_icon,
-            dismissable=n.dismissable,
-            silent=n.silent,
-            reply_id=n.reply_id,
-            internal_id=n.internal_id,
-            timestamp=float(n.time) if n.time else time.time(),
-        )
 
     @classmethod
     def from_properties(cls, public_id: str, props: dict) -> "Notification":

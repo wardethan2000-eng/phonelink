@@ -49,6 +49,15 @@ _I_UID = 7
 _I_SUB = 8
 _I_ATT = 9
 
+# The phone only pushes texts that arrive while it is connected (KDE Connect's
+# SMS plugin starts counting from "now" on every connection), so anything that
+# arrives during sleep or a Wi-Fi drop has to be pulled.  A catch-up asks for
+# every thread's newest message; a gap fill asks for one thread's recent history.
+CATCH_UP_MIN_INTERVAL_SECONDS = 20
+GAP_FILL_MESSAGES = 50
+GAP_FILL_SPACING_MS = 250
+GAP_FILL_TIMEOUT_SECONDS = 60
+
 
 def _attachment_extension(mime_type: str) -> str:
     ext = mimetypes.guess_extension((mime_type or "").split(";", 1)[0].strip()) or ""
@@ -163,6 +172,10 @@ class SmsPanel(Gtk.Box):
         self._contact_sync_warned: set[str] = set()
         self._google_sync_in_flight = False
         self._all_conversations_refresh_source: int | None = None
+        self._last_catch_up = 0.0  # time.monotonic() of the last full pull
+        self._gap_fill_queue: list[int] = []      # phone thread IDs to pull
+        self._gap_fill_pending: dict[int, float] = {}  # asked of the phone, awaiting conversationLoaded
+        self._gap_fill_source: int | None = None
         self._conversation_refresh_source: int | None = None
         self._pending_refresh_force = False
         self._pending_show_thread_id: int | None = None
@@ -238,6 +251,7 @@ class SmsPanel(Gtk.Box):
             self._show_disconnected()
             self._unsubscribe_signals()
             self._cancel_all_conversations_refresh()
+            self._cancel_gap_fills()
             return
 
         if not device.reachable:
@@ -269,7 +283,10 @@ class SmsPanel(Gtk.Box):
             self._subscribe_signals(device.id)
             self._request_contact_sync(device.id)
             self._cancel_all_conversations_refresh()
-            self._load_active_conversations(device.id, schedule_if_empty=True)
+            self._cancel_gap_fills()
+            self._load_active_conversations(device.id)
+            # Deferred so the expensive full-phone pull waits until startup is interactive.
+            self.catch_up(delay_seconds=10, min_interval=0)
             self._run_startup_contact_backfill(device.id)
             self._maybe_refresh_google_contacts_in_background()
         elif not self._signal_ids or just_reconnected:
@@ -278,8 +295,8 @@ class SmsPanel(Gtk.Box):
                 self._subscribe_signals(device.id)
             self._load_contacts(device.id)
             self._request_contact_sync(device.id)
-            self._cancel_all_conversations_refresh()
-            self._load_active_conversations(device.id, schedule_if_empty=True)
+            self._load_active_conversations(device.id)
+            self.catch_up()
             self._run_startup_contact_backfill(device.id)
             self._maybe_refresh_google_contacts_in_background()
 
@@ -372,18 +389,15 @@ class SmsPanel(Gtk.Box):
         message_date = conv.last_date or (conv.messages[-1].date if conv.messages else 0)
         return self._should_keep_conversation_hidden(conversation_key, message_date)
 
-    def _load_active_conversations(self, device_id, schedule_if_empty: bool = False):
+    def _load_active_conversations(self, device_id):
         """Load cached conversations from the daemon (off the main thread)."""
         self.client.submit(
             self.client.get_active_conversations,
             device_id,
-            on_result=lambda raw: self._apply_active_conversations(
-                device_id, raw, schedule_if_empty
-            ),
+            on_result=lambda raw: self._apply_active_conversations(device_id, raw),
         )
 
-    def _apply_active_conversations(self, device_id, raw_list,
-                                    schedule_if_empty: bool = False):
+    def _apply_active_conversations(self, device_id, raw_list):
         if not self._device or self._device.id != device_id:
             return
         # Detect user's own number before merging (appears in many multi-
@@ -399,11 +413,23 @@ class SmsPanel(Gtk.Box):
                     count += 1
         if count:
             self._refresh_conversation_list()
-        if schedule_if_empty and count == 0:
-            self._schedule_all_conversations_refresh(device_id)
 
-    def _schedule_all_conversations_refresh(self, device_id: str, delay_seconds: int = 10):
-        """Defer the expensive full-phone conversation sync until startup is interactive."""
+    def catch_up(self, *, delay_seconds: int = 3,
+                 min_interval: float = CATCH_UP_MIN_INTERVAL_SECONDS):
+        """Pull texts the phone never pushed, then refresh the open thread.
+
+        Called on connect, reconnect, resume from sleep and window show.  Bursts
+        of those collapse into one pull per ``min_interval``.
+        """
+        if not self._device or not self._device.reachable:
+            return
+        if self._all_conversations_refresh_source:
+            return
+        if time.monotonic() - self._last_catch_up < min_interval:
+            return
+        self._schedule_all_conversations_refresh(self._device.id, delay_seconds)
+
+    def _schedule_all_conversations_refresh(self, device_id: str, delay_seconds: int):
         self._cancel_all_conversations_refresh()
         self._all_conversations_refresh_source = GLib.timeout_add_seconds(
             delay_seconds,
@@ -420,8 +446,59 @@ class SmsPanel(Gtk.Box):
         self._all_conversations_refresh_source = None
         if not self._device or self._device.id != device_id or not self._device.reachable:
             return GLib.SOURCE_REMOVE
+        self._last_catch_up = time.monotonic()
         self.client.submit(self.client.request_all_conversations, device_id)
+        if self._active_thread_id is not None and self._active_thread_id >= 0:
+            self._queue_thread_gap_fill(self._active_thread_id)
         return GLib.SOURCE_REMOVE
+
+    # ── Gap fill ───────────────────────────────────────────────────
+
+    def _queue_thread_gap_fill(self, thread_id: int):
+        """Gap-fill a conversation and every phone thread merged into it."""
+        self._queue_gap_fill(thread_id)
+        for sec_tid in self._index.secondary_threads(thread_id):
+            self._queue_gap_fill(sec_tid)
+
+    def _queue_gap_fill(self, thread_id: int):
+        """Pull a thread's recent messages from the phone.
+
+        Step 1 asks the phone (the daemon's cache can be missing the middle of a
+        thread); step 2, in :meth:`_on_dbus_conversation_loaded`, replays the
+        daemon's now-complete cache as conversationUpdated signals.
+        """
+        if thread_id is None or thread_id < 0 or thread_id in self._gap_fill_queue:
+            return
+        asked_at = self._gap_fill_pending.get(thread_id)
+        if asked_at and time.monotonic() - asked_at < GAP_FILL_TIMEOUT_SECONDS:
+            return
+        self._gap_fill_queue.append(thread_id)
+        if not self._gap_fill_source:
+            self._gap_fill_source = GLib.timeout_add(
+                GAP_FILL_SPACING_MS, self._drain_gap_fill
+            )
+
+    def _drain_gap_fill(self):
+        if not self._device or not self._device.reachable or not self._gap_fill_queue:
+            self._gap_fill_source = None
+            return GLib.SOURCE_REMOVE
+        thread_id = self._gap_fill_queue.pop(0)
+        self._gap_fill_pending[thread_id] = time.monotonic()
+        self.client.submit(
+            self.client.request_thread_from_phone,
+            self._device.id, thread_id, GAP_FILL_MESSAGES,
+        )
+        if self._gap_fill_queue:
+            return GLib.SOURCE_CONTINUE
+        self._gap_fill_source = None
+        return GLib.SOURCE_REMOVE
+
+    def _cancel_gap_fills(self):
+        if self._gap_fill_source:
+            GLib.source_remove(self._gap_fill_source)
+            self._gap_fill_source = None
+        self._gap_fill_queue.clear()
+        self._gap_fill_pending.clear()
 
     def _detect_self_number(self, raw_list):
         """Detect the user's own number and re-key identities if it changed.
@@ -527,6 +604,16 @@ class SmsPanel(Gtk.Box):
 
     def _on_dbus_conversation_loaded(self, conn, sender, path, iface, sig, params):
         """A conversation finished loading — debounce and reload from cache."""
+        try:
+            thread_id = int(params.unpack()[0])
+        except (TypeError, ValueError, IndexError):
+            thread_id = None
+        if thread_id in self._gap_fill_pending and self._device:
+            del self._gap_fill_pending[thread_id]
+            self.client.submit(
+                self.client.request_conversation,
+                self._device.id, thread_id, 0, GAP_FILL_MESSAGES,
+            )
         # Cancel any pending reload and schedule a new one 500ms from now.
         # This prevents hammering reload when many signals fire in sequence.
         if hasattr(self, '_conv_loaded_timer') and self._conv_loaded_timer:
@@ -1035,6 +1122,11 @@ class SmsPanel(Gtk.Box):
         result = self._index.ingest(msg, all_addrs, self._name_for)
         conv = result.conversation
 
+        # A newer latest message on a known thread means the phone may have
+        # received others in between that it never sent us.
+        if result.is_newer and not result.created:
+            self._queue_gap_fill(msg.thread_id)
+
         if self._device and result.message_added:
             self._store.upsert_message(self._device.id, conv.thread_id, msg)
 
@@ -1153,21 +1245,11 @@ class SmsPanel(Gtk.Box):
                 self.client.mark_conversation_as_read, self._device.id, thread_id
             )
 
-        # Show cached messages immediately, then request more in the background
-        # if this thread looks only partially loaded.
+        # Show cached messages immediately, then pull the thread's recent
+        # history from the phone (and from any secondary threads merged into
+        # it: SMS/MMS split, dual-SIM, etc.) so missed texts fill in.
         self._show_thread(thread_id)
-
-        if self._device and len(conv.messages) < 20:
-            self.client.submit(
-                self.client.request_conversation, self._device.id, thread_id, 0, 50
-            )
-            # Also request messages from any secondary threads that were
-            # merged into this conversation (SMS/MMS split, dual-SIM, etc.)
-            for sec_tid in self._index.secondary_threads(thread_id):
-                self.client.submit(
-                    self.client.request_conversation,
-                    self._device.id, sec_tid, 0, 50
-                )
+        self._queue_thread_gap_fill(thread_id)
 
     def _show_thread(self, thread_id):
         conv = self._conversations.get(thread_id)

@@ -23,6 +23,7 @@ IFACE_DEVICE = "org.kde.kdeconnect.device"
 IFACE_BATTERY = "org.kde.kdeconnect.device.battery"
 IFACE_NOTIFICATIONS = "org.kde.kdeconnect.device.notifications"
 IFACE_CONVERSATIONS = "org.kde.kdeconnect.device.conversations"
+IFACE_SMS = "org.kde.kdeconnect.device.sms"
 IFACE_CONTACTS = "org.kde.kdeconnect.device.contacts"
 IFACE_SFTP = "org.kde.kdeconnect.device.sftp"
 IFACE_SHARE = "org.kde.kdeconnect.device.share"
@@ -355,6 +356,21 @@ class KDEConnectClient:
             IFACE_CONVERSATIONS,
             "requestConversation",
             GLib.Variant("(xii)", (thread_id, start, end)),
+        )
+
+    def request_thread_from_phone(self, device_id, thread_id: int, count: int = 50):
+        """Ask the phone itself for a thread's newest ``count`` messages.
+
+        Unlike :meth:`request_conversation`, this bypasses the daemon's cache,
+        so it recovers texts the phone never pushed (it only pushes messages
+        that arrive while connected).  The daemon stores them and emits only
+        ``conversationLoaded``; replay them with :meth:`request_conversation`.
+        """
+        self._call(
+            self._device_path(device_id) + "/sms",
+            IFACE_SMS,
+            "requestConversation",
+            GLib.Variant("(xxx)", (thread_id, -1, count)),
         )
 
     def request_attachment_file(self, device_id, part_id: int, unique_identifier: str):

@@ -18,6 +18,7 @@ from phonelink.ui.icons import resolve_icon
 
 IMAGE_EXTS = {".jpg", ".jpeg", ".png", ".gif", ".webp", ".bmp", ".heic", ".heif"}
 THUMB_SIZE = 160
+PHONE_REFRESH_MIN_INTERVAL_SECONDS = 30
 
 
 # ── Helper: human-readable file size ───────────────────────────────
@@ -214,6 +215,7 @@ class FilesPanel(Gtk.Box):
         self._signal_ids: list[int] = []
         self._downloads_dir = str(Path.home() / "Downloads")
         self._photo_tiles: list[PhotoTile] = []
+        self._last_phone_refresh = 0.0  # time.monotonic() of the last refresh_from_phone
         self._thumb_threads: list[threading.Thread] = []
         self._loading_cancelled = False
         self._mount_in_progress = False
@@ -668,6 +670,40 @@ class FilesPanel(Gtk.Box):
         )
         return GLib.SOURCE_REMOVE
 
+    def refresh_from_phone(self):
+        """Re-check the mount and pick up new photos or files.
+
+        Called on reconnect, resume from sleep and window show; at most once
+        every :data:`PHONE_REFRESH_MIN_INTERVAL_SECONDS`.
+        """
+        if not self._device or not self._device.reachable or self._mount_in_progress:
+            return
+        now = time.monotonic()
+        if now - self._last_phone_refresh < PHONE_REFRESH_MIN_INTERVAL_SECONDS:
+            return
+        self._last_phone_refresh = now
+        device_id = self._device.id
+        self.client.submit(
+            self.client.fetch_sftp_state,
+            device_id,
+            on_result=lambda state: self._apply_phone_refresh(device_id, state),
+        )
+
+    def _apply_phone_refresh(self, device_id: str, state: dict):
+        if not self._device or self._device.id != device_id:
+            return
+        if (
+            not state.get("mounted")
+            or (state.get("mount_point") or "") != self._mount_point
+        ):
+            # A new connection unmounts the old storage; mount and reload.
+            self._apply_sftp_state(device_id, state, load_photos=True)
+            return
+        if self._view_stack.get_visible_child_name() == "photos":
+            self._refresh_recent_photos()
+        elif self._current_path:
+            self._load_directory(self._current_path)
+
     def _resolve_storage_base(self, device_id: str):
         """Find the actual accessible base dir (e.g. .../storage/emulated/0).
 
@@ -750,6 +786,29 @@ class FilesPanel(Gtk.Box):
             GLib.idle_add(self._finish_recent_photo_scan, generation, image_files)
 
         threading.Thread(target=worker, daemon=True).start()
+
+    def _refresh_recent_photos(self):
+        """Rescan recent photos; rebuild the grid only if the set changed."""
+        if not self._mount_point:
+            return
+        base = self._storage_base or self._mount_point
+        shown = [tile.full_path for tile in self._photo_tiles]
+
+        def worker():
+            image_files = self._collect_recent_photo_files(base)
+            GLib.idle_add(self._apply_photo_rescan, shown, image_files)
+
+        threading.Thread(target=worker, daemon=True).start()
+
+    def _apply_photo_rescan(self, shown: list[str], image_files: list[tuple[str, float]]):
+        current = [tile.full_path for tile in self._photo_tiles]
+        found = [path for path, _mtime in image_files]
+        # An empty scan over a live grid is a flaky mount, not a wiped phone.
+        if current != shown or found == current or not found:
+            return GLib.SOURCE_REMOVE
+        self._clear_photo_grid()
+        self._loading_cancelled = False
+        return self._finish_recent_photo_scan(self._photo_scan_generation, image_files)
 
     def _collect_recent_photo_files(self, base: str) -> list[tuple[str, float]]:
         # Use the resolved storage base (e.g. .../storage/emulated/0)

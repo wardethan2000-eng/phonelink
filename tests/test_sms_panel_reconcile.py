@@ -18,6 +18,8 @@ import unittest
 from pathlib import Path
 from types import SimpleNamespace
 
+from gi.repository import GLib
+
 from phonelink.reconcile import ConversationIndex
 from phonelink.store import MessageStore
 
@@ -104,6 +106,12 @@ class FakeClient:
     def request_conversation(self, *a, **k):
         pass
 
+    def request_thread_from_phone(self, *a, **k):
+        pass
+
+    def request_all_conversations(self, *a, **k):
+        pass
+
     def supports_conversation_deletion(self, _dev):
         return False
 
@@ -126,7 +134,16 @@ def make_panel():
     p._thread = FakeThread()
     p.client = FakeClient()
     p._refreshing = False
+    init_sync_state(p)
     return p
+
+
+def init_sync_state(p):
+    p._all_conversations_refresh_source = None
+    p._last_catch_up = 0.0
+    p._gap_fill_queue = []
+    p._gap_fill_pending = {}
+    p._gap_fill_source = None
 
 
 def tup(uid, thread_id, addrs, date, body="hi", mtype=1, read=1):
@@ -264,6 +281,7 @@ class PanelReconcileTests(unittest.TestCase):
         p2._thread = FakeThread()
         p2.client = FakeClient()
         p2._refreshing = False
+        init_sync_state(p2)
 
         p2._load_cached_conversations("dev1")
         self.assertEqual(len(p2._deduplicated_conversations()), 1)
@@ -271,6 +289,95 @@ class PanelReconcileTests(unittest.TestCase):
             {m.uid for m in p2._deduplicated_conversations()[0].messages}, {1, 2}
         )
         self.assertIsInstance(store_path, str)
+
+
+@unittest.skipIf(sms_panel is None, f"GTK/gi unavailable: {_IMPORT_ERR}")
+class PanelCatchUpTests(unittest.TestCase):
+    """Pulling texts the phone never pushed (it only pushes while connected)."""
+
+    def setUp(self):
+        self.p = make_panel()
+        self.p._apply_active_conversations("dev1", [
+            tup(1, thread_id=10, addrs=["111"], date=100),
+        ])
+        self.p.client.calls.clear()
+
+    def tearDown(self):
+        self.p._cancel_gap_fills()
+        self.p._cancel_all_conversations_refresh()
+        self.p._store.close()
+
+    def drain(self):
+        while self.p._drain_gap_fill() == GLib.SOURCE_CONTINUE:
+            pass
+
+    def loaded(self, thread_id, count=50):
+        self.p._on_dbus_conversation_loaded(
+            None, None, None, None, "conversationLoaded",
+            GLib.Variant("(xt)", (thread_id, count)),
+        )
+
+    def test_newer_message_on_known_thread_pulls_the_thread(self):
+        self.p._merge_message(sms_panel._parse_message_tuple(
+            tup(3, thread_id=10, addrs=["111"], date=300)))
+        self.drain()
+        self.assertEqual(self.p.client.calls, [
+            ("request_thread_from_phone", ("dev1", 10, sms_panel.GAP_FILL_MESSAGES)),
+        ])
+
+    def test_older_or_new_thread_messages_do_not_pull(self):
+        self.p._merge_message(sms_panel._parse_message_tuple(
+            tup(0, thread_id=10, addrs=["111"], date=50)))
+        self.p._merge_message(sms_panel._parse_message_tuple(
+            tup(2, thread_id=99, addrs=["222"], date=500)))
+        self.assertEqual(self.p._gap_fill_queue, [])
+
+    def test_loaded_thread_is_replayed_once(self):
+        self.p._queue_gap_fill(10)
+        self.drain()
+        self.p.client.calls.clear()
+        self.loaded(77)  # someone else's request
+        self.loaded(10)
+        self.loaded(10)
+        self.assertEqual(self.p.client.calls, [
+            ("request_conversation", ("dev1", 10, 0, sms_panel.GAP_FILL_MESSAGES)),
+        ])
+
+    def test_pending_thread_is_not_asked_twice(self):
+        self.p._queue_gap_fill(10)
+        self.drain()
+        self.p._queue_gap_fill(10)
+        self.drain()
+        self.assertEqual(self.p.client.call_names(), ["request_thread_from_phone"])
+
+    def test_opening_a_thread_pulls_it_even_when_cached(self):
+        conv = self.p._deduplicated_conversations()[0]
+        for uid in range(100, 130):  # well past the old "< 20 cached" cut-off
+            self.p._merge_message(sms_panel._parse_message_tuple(
+                tup(uid, thread_id=10, addrs=["111"], date=uid)))
+        self.p._cancel_gap_fills()
+        self.p._on_conversation_selected(None, conv.thread_id)
+        self.assertEqual(self.p._gap_fill_queue, [conv.thread_id])
+
+    def test_catch_up_pulls_everything_and_the_open_thread(self):
+        self.p._active_thread_id = 10
+        self.p.catch_up(delay_seconds=0, min_interval=0)
+        self.assertIsNotNone(self.p._all_conversations_refresh_source)
+        self.p._run_all_conversations_refresh("dev1")
+        self.assertEqual(self.p.client.call_names(), ["request_all_conversations"])
+        self.assertEqual(self.p._gap_fill_queue, [10])
+
+    def test_catch_up_bursts_collapse(self):
+        self.p._run_all_conversations_refresh("dev1")
+        self.p.catch_up()
+        self.assertIsNone(self.p._all_conversations_refresh_source)
+        self.p.catch_up(min_interval=0)
+        self.assertIsNotNone(self.p._all_conversations_refresh_source)
+
+    def test_catch_up_waits_for_the_phone(self):
+        self.p._device.reachable = False
+        self.p.catch_up(min_interval=0)
+        self.assertIsNone(self.p._all_conversations_refresh_source)
 
 
 if __name__ == "__main__":

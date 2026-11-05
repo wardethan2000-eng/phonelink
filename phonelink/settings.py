@@ -22,7 +22,6 @@ _DEFAULTS = {
     "color_scheme": "system",   # "system" | "light" | "dark"
     "open_on_startup": False,
     "notifications_enabled": True,
-    "notifications_transport": "kdeconnect",  # "kdeconnect" | "loom" — where notifications come from
     "notifications_ignored_apps": [],   # list of app_name strings to hide
     "google_background_sync": True,
     "google_account_label": "",
@@ -80,12 +79,10 @@ class Settings:
         except (FileNotFoundError, json.JSONDecodeError):
             stored = {}
         self._data = {**_DEFAULTS, **stored}
+        # Retired with the Loom transport; drop it from older settings files.
+        self._data.pop("notifications_transport", None)
         self._data["notifications_ignored_apps"] = list(
             self._data.get("notifications_ignored_apps", []) or []
-        )
-        transport = self._data.get("notifications_transport", "kdeconnect")
-        self._data["notifications_transport"] = (
-            transport if transport in ("kdeconnect", "loom") else "kdeconnect"
         )
         self._data["google_background_sync"] = bool(
             self._data.get("google_background_sync", True)
@@ -186,19 +183,6 @@ class Settings:
     @notifications_enabled.setter
     def notifications_enabled(self, value: bool):
         self._data["notifications_enabled"] = bool(value)
-        self.save()
-
-    @property
-    def notifications_transport(self) -> str:
-        """Where the notifications panel gets its data: ``"kdeconnect"`` (the KDE Connect daemon over
-        D-Bus) or ``"loom"`` (the phone's node over ``loom/phone/0``, works off-LAN)."""
-        return self._data["notifications_transport"]
-
-    @notifications_transport.setter
-    def notifications_transport(self, value: str):
-        self._data["notifications_transport"] = (
-            value if value in ("kdeconnect", "loom") else "kdeconnect"
-        )
         self.save()
 
     @property
