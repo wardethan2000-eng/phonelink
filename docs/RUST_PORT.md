@@ -216,7 +216,8 @@ Google Contacts. 7. Side-by-side on the laptop, measure, switch autostart. The t
 8. Flatpak: **on hold** (Ethan, 2026-11-05: not sure he wants it). See below.
 9. RCS sending. Route A (notification replies) moved into Phase 3 at
    Ethan's ask (2026-11-05). Route B (Google Messages web link) stays after
-   cutover. See "Phase 9: RCS sending" below.
+   cutover, as the `phonelink-gm` helper (B1). See "Phase 9: RCS sending"
+   below and `docs/RCS_HELPER.md`.
 
 ## Public commitments
 Things said in public that the project owes people. Close each one out when
@@ -336,27 +337,24 @@ directly. That also removes the Android 17 hidden-texts problem and its
   v26.05). Pairing is now Google account sign-in followed by tapping a
   matching emoji on the phone. The bridge gets the account cookies from a
   browser sign-in, and we would need the same.
-- **License:** the app is MIT, and libgm is AGPL. **B1** is a separate sidecar
-  process (`phonelink-gm`, Go, AGPL, its own repo or directory and its own
-  licence) that the Rust app talks to over a local socket or D-Bus.
-  Separate programs talking this way don't make the app AGPL.
-- **B2 (later, Ethan open to it):** a clean Rust implementation of the
-  protocol. That means protobuf schemas, the pairing crypto, AES-CTR + HMAC
-  message encryption and the long-poll receive loop on
-  `instantmessaging-pa.googleapis.com`. Must be written from protocol
-  notes and traffic, not translated from libgm, or the AGPL follows it.
-  Do it once B1 has shown the protocol holds up and is worth owning.
+- **Tested 2026-11-05:** gmcli (a Go CLI on libgm) paired with Ethan's
+  account on the laptop through a Chromium sign-in and an emoji tap, then
+  synced and sent RCS.
+- **Decided 2026-11-05: B1 is the plan.** `phonelink-gm` is a small Go
+  helper on libgm, AGPL, in `phonelink-gm/` with its own license. The app
+  starts it as a child process and talks JSON lines over stdin/stdout.
+  Separate programs exchanging messages like that are not a combined work,
+  so the app stays MIT, and both can ship together. Design:
+  `docs/RCS_HELPER.md`.
+- **B2 (a Rust rewrite of the protocol) is not needed for the license.**
+  Only worth doing if libgm stops being maintained or Go gets in the way of
+  packaging. Today the mautrix maintainers follow Google's changes for us.
+  If it is ever done, it must be written from protocol notes and traffic,
+  not translated from libgm.
 - **Risks:** unofficial, so Google can break it at any time. The phone must
-  be online. Pairing lapses after about 14 days unused. A web session may
-  conflict with Ethan's own messages.google.com tab (check).
-- **Integration:** an optional "Link Google Messages" setting. When linked,
-  it is the send and receive path for RCS threads, and KDE Connect stays the
-  path for SMS, calls, files and the rest. Messages from both go into the
-  same store. Conversation identity needs a mapping from Google's
-  conversation ids to the phone's thread ids (match by participants).
-- **First step (no shipping):** run gmcli on the build box against a
-  fresh Google sign-in. Check that pairing, sync and one RCS send work with
-  Ethan's account and carrier.
+  be online. Pairing lapses after about 14 days unused. Google keeps only
+  one web session active, so a messages.google.com tab takes over (the
+  design shows a "Use here" banner rather than fighting it).
 
 ### Ruled out
 - Embedding messages.google.com in a webview: official, but it is a
