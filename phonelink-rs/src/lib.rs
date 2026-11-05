@@ -2,7 +2,8 @@
 //!
 //! `core` holds everything that has no GTK or D-Bus dependency, so it can be
 //! unit tested headless; it is the parity spec against the Python app.
-//! `dbus` talks to the KDE Connect daemon over gio.
+//! `dbus` talks to the KDE Connect daemon over gio; `ui` is the GTK app.
 
 pub mod core;
 pub mod dbus;
+pub mod ui;

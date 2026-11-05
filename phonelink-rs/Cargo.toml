@@ -13,6 +13,10 @@ log = "0.4"
 env_logger = { version = "0.11", default-features = false, features = ["auto-color", "humantime"] }
 gio = "0.22"
 glib = "0.22"
+# Feature levels = the oldest versions the app supports (core::compat):
+# GTK 4.10 / libadwaita 1.4 (Ethan, 2026-11-05: wide reach).
+gtk = { package = "gtk4", version = "0.11", features = ["v4_10"] }
+adw = { package = "libadwaita", version = "0.9", features = ["v1_4"] }
 regex = "1"
 rusqlite = "0.37"
 serde = { version = "1", features = ["derive"] }
