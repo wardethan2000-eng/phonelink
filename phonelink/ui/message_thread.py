@@ -9,6 +9,8 @@ import re
 import shutil
 import tempfile
 import webbrowser
+from collections import OrderedDict
+from concurrent.futures import ThreadPoolExecutor
 from pathlib import Path
 from urllib.parse import unquote, urlparse
 
@@ -78,6 +80,55 @@ def _measure_image(path: str) -> tuple[int, int] | None:
     if not width or not height or width <= 0 or height <= 0:
         return None
     return width, height
+
+
+# Inline images are decoded off the main thread, at their on-screen size, and
+# kept for revisits.  Decoding full-resolution camera photos on the main thread
+# (≈0.2 s each, ≈48 MB per 12 MP texture) made switching chats lag.
+IMAGE_DECODE_SCALE = 2          # decode at 2× the display size so HiDPI stays crisp
+IMAGE_CACHE_MAX = 64            # decoded textures kept (≈3 MB each at most)
+_image_pool = ThreadPoolExecutor(max_workers=2, thread_name_prefix="phonelink-img")
+_image_sizes: dict[tuple[str, float], tuple[int, int] | None] = {}
+_image_textures: "OrderedDict[tuple[str, float], Gdk.Texture]" = OrderedDict()
+
+
+def _image_key(path: str) -> tuple[str, float]:
+    try:
+        return path, os.path.getmtime(path)
+    except OSError:
+        return path, 0.0
+
+
+def _image_display(width: int, height: int, can_fetch_full: bool):
+    """(display_w, display_h, is_full, awaiting_full) for an image of this size."""
+    # "Full" = an image already larger than a thumbnail (fetched full file, or a
+    # high-res image we sent).  Thumbnails stay placeholders.
+    is_full = max(width, height) > ATTACHMENT_THUMBNAIL_MAX
+    disp_w, disp_h = _scaled_image_size(width, height, full=is_full)
+    return disp_w, disp_h, is_full, (not is_full and can_fetch_full)
+
+
+def _decode_image(path: str, can_fetch_full: bool):
+    """Worker thread: measure and decode at display size.  Never touches GTK."""
+    measured = _measure_image(path)
+    if measured is None:
+        return None, None
+    disp_w, disp_h, _full, _awaiting = _image_display(*measured, can_fetch_full)
+    try:
+        pixbuf = GdkPixbuf.Pixbuf.new_from_file_at_scale(
+            path, disp_w * IMAGE_DECODE_SCALE, disp_h * IMAGE_DECODE_SCALE, True
+        )
+        pixbuf = pixbuf.apply_embedded_orientation() or pixbuf
+    except GLib.Error:
+        pixbuf = None
+    return measured, pixbuf
+
+
+def _remember_texture(key, texture):
+    _image_textures[key] = texture
+    _image_textures.move_to_end(key)
+    while len(_image_textures) > IMAGE_CACHE_MAX:
+        _image_textures.popitem(last=False)
 
 
 def _scaled_image_size(width: int, height: int, *, full: bool) -> tuple[int, int]:
@@ -298,44 +349,66 @@ class MessageBubble(Gtk.Box):
 
         if mime.startswith("image") and best_path:
             display_path = best_path
-            measured = _measure_image(display_path)
-            width, height = measured or (FULL_IMAGE_MAX_W, FULL_IMAGE_MAX_H)
-            # "Full" = an image already larger than a thumbnail (fetched full
-            # file, or a high-res image we sent). Thumbnails stay placeholders.
-            is_full = measured is not None and max(width, height) > ATTACHMENT_THUMBNAIL_MAX
-            awaiting_full = not is_full and can_fetch_full
-            disp_w, disp_h = _scaled_image_size(width, height, full=is_full)
-
-            picture = Gtk.Picture.new_for_filename(display_path)
+            key = _image_key(display_path)
+            picture = Gtk.Picture()
             picture.set_can_shrink(True)
             picture.set_content_fit(Gtk.ContentFit.CONTAIN)
-            # Size the widget to the image's real aspect ratio and pin it to the
-            # start edge so it never stretches to fill a wide bubble.
-            picture.set_size_request(disp_w, disp_h)
+            # Pin to the start edge so it never stretches to fill a wide bubble.
             picture.set_halign(Gtk.Align.START)
             picture.set_hexpand(False)
             picture.add_css_class("message-attachment-image")
             picture.set_cursor(Gdk.Cursor.new_from_name("pointer", None))
-            if awaiting_full:
-                picture.add_css_class("message-attachment-loading")
-                picture.set_tooltip_text("Loading full image…")
+            state = {"awaiting_full": can_fetch_full}
+
+            def on_click(*_a, p=display_path):
+                if state["awaiting_full"]:
+                    # Manual retry if the automatic fetch hasn't landed yet.
+                    self._on_download_attachment(part_id, unique_identifier, file_name)
+                else:
+                    self._on_open_attachment(None, p)
 
             click = Gtk.GestureClick(button=1)
-            if awaiting_full:
-                # Manual retry if the automatic fetch hasn't landed yet.
-                click.connect(
-                    "released",
-                    lambda *_a: self._on_download_attachment(
-                        part_id, unique_identifier, file_name
-                    ),
-                )
-            else:
-                picture.set_tooltip_text("Click to open image")
-                click.connect(
-                    "released",
-                    lambda *_a, p=display_path: self._on_open_attachment(None, p),
-                )
+            click.connect("released", on_click)
             picture.add_controller(click)
+
+            def apply_size(measured):
+                width, height = measured or (FULL_IMAGE_MAX_W, FULL_IMAGE_MAX_H)
+                disp_w, disp_h, _full, awaiting = _image_display(
+                    width, height, can_fetch_full
+                )
+                state["awaiting_full"] = measured is None and can_fetch_full or awaiting
+                # Size the widget to the image's real aspect ratio.
+                picture.set_size_request(disp_w, disp_h)
+                if state["awaiting_full"]:
+                    picture.add_css_class("message-attachment-loading")
+                    picture.set_tooltip_text("Loading full image…")
+                else:
+                    picture.remove_css_class("message-attachment-loading")
+                    picture.set_tooltip_text("Click to open image")
+
+            if key in _image_sizes:
+                apply_size(_image_sizes[key])
+            else:
+                # Placeholder box until the worker has measured the image.
+                picture.set_size_request(THUMB_IMAGE_MAX_W, THUMB_IMAGE_MAX_H)
+            texture = _image_textures.get(key)
+            if texture is not None:
+                _image_textures.move_to_end(key)
+                picture.set_paintable(texture)
+            else:
+                def done(measured, pixbuf):
+                    _image_sizes[key] = measured
+                    apply_size(measured)
+                    if pixbuf is not None:
+                        tex = Gdk.Texture.new_for_pixbuf(pixbuf)
+                        _remember_texture(key, tex)
+                        picture.set_paintable(tex)
+                    return GLib.SOURCE_REMOVE
+
+                future = _image_pool.submit(_decode_image, display_path, can_fetch_full)
+                future.add_done_callback(
+                    lambda f: GLib.idle_add(done, *(f.result() if not f.exception() else (None, None)))
+                )
             frame.append(picture)
 
         att_row = Gtk.Box(orientation=Gtk.Orientation.HORIZONTAL, spacing=6)
@@ -553,6 +626,12 @@ class MessageThread(Gtk.Box):
         self._messages_box = Gtk.Box(orientation=Gtk.Orientation.VERTICAL)
         self._messages_box.set_margin_bottom(8)
         self._scroll.set_child(self._messages_box)
+        # Images size themselves after they decode; stay at the newest message
+        # while they do, unless the user has scrolled up.
+        self._pinned_to_bottom = True
+        vadj = self._scroll.get_vadjustment()
+        vadj.connect("value-changed", self._on_scroll_value_changed)
+        vadj.connect("changed", self._on_scroll_extent_changed)
 
         # ── Message-text zoom (pinch, Ctrl+scroll, Ctrl +/-/0) ────────
         self._settings = get_settings()
@@ -882,8 +961,18 @@ class MessageThread(Gtk.Box):
 
     def _scroll_to_bottom(self):
         adj = self._scroll.get_vadjustment()
+        self._pinned_to_bottom = True
         adj.set_value(adj.get_upper())
         return GLib.SOURCE_REMOVE
+
+    def _on_scroll_value_changed(self, adj):
+        self._pinned_to_bottom = (
+            adj.get_value() + adj.get_page_size() >= adj.get_upper() - 48
+        )
+
+    def _on_scroll_extent_changed(self, adj):
+        if self._pinned_to_bottom:
+            adj.set_value(adj.get_upper() - adj.get_page_size())
 
     # ── Message-text zoom ──────────────────────────────────────────
 
