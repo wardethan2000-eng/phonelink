@@ -125,6 +125,11 @@ impl CatchUp {
         if thread_id < 0 || self.queue.contains(&thread_id) {
             return;
         }
+        // A page is being replayed: its own newer messages must not restart
+        // the gap fill (that reset the page counters in the Python app).
+        if self.pages.get(&thread_id).is_some_and(|p| p.check_at.is_some()) {
+            return;
+        }
         if let Some(&asked) = self.pending.get(&thread_id)
             && now - asked < GAP_FILL_TIMEOUT_SECONDS
         {
@@ -425,6 +430,16 @@ mod tests {
             now += 1.0;
         }
         assert_eq!(requests, GAP_FILL_MAX_PAGES as i64);
+    }
+
+    #[test]
+    fn replayed_messages_do_not_restart_a_page_in_progress() {
+        let mut s = online();
+        s.queue_gap_fill(3, 0.0);
+        s.tick(0.25, &[]);
+        s.on_conversation_loaded(3, 1.0);
+        s.queue_gap_fill(3, 1.5); // a replayed message newer than the thread's last
+        assert_eq!(s.next_deadline(), Some(4.0)); // only the page check
     }
 
     #[test]
