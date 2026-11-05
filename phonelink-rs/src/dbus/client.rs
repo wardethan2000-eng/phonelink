@@ -36,6 +36,13 @@ fn is_missing(err: &glib::Error) -> bool {
             .any(|s| err.message().contains(s))
 }
 
+/// The daemon definitely refused a call (object, method or interface gone,
+/// or arguments rejected), so it did nothing. A timeout or lost connection
+/// is not a refusal: the call may have gone through.
+pub fn is_definite_refusal(err: &glib::Error) -> bool {
+    is_missing(err) || err.matches(gio::DBusError::InvalidArgs) || err.message().contains("InvalidArgs")
+}
+
 /// Return a correctly escaped file URI for a local path.
 pub fn file_uri_for_path(path: &str) -> String {
     if path.starts_with("file://") {
@@ -556,6 +563,19 @@ impl Client {
             .is_some()
     }
 
+    /// [`Self::send_notification_reply_by_id`] with the error, so a caller can
+    /// tell a refusal ([`is_definite_refusal`]) from a timeout.
+    pub async fn try_send_notification_reply_by_id(
+        &self,
+        device_id: &str,
+        reply_id: &str,
+        message: &str,
+    ) -> Result<(), glib::Error> {
+        let path = format!("{}/notifications", device_path(device_id));
+        let args = Some((reply_id, message).to_variant());
+        self.try_call(&path, IFACE_NOTIFICATIONS, "sendReply", args, None, CALL_TIMEOUT_MS).await.map(|_| ())
+    }
+
     /// Reply by `replyId` through the notifications interface.
     pub async fn send_notification_reply_by_id(&self, device_id: &str, reply_id: &str, message: &str) -> bool {
         let path = format!("{}/notifications", device_path(device_id));
@@ -583,5 +603,10 @@ mod tests {
         assert!(is_missing(&e));
         let e = glib::Error::new(gio::IOErrorEnum::TimedOut, "Timeout was reached");
         assert!(!is_missing(&e));
+        assert!(!is_definite_refusal(&e));
+        let e = glib::Error::new(gio::DBusError::InvalidArgs, "bad");
+        assert!(is_definite_refusal(&e));
+        let e = glib::Error::new(gio::DBusError::NoReply, "no reply");
+        assert!(!is_definite_refusal(&e));
     }
 }

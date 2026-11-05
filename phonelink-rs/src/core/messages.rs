@@ -54,8 +54,13 @@ pub enum Effect {
     /// `notifications.sendReply(reply_id, text)`: answer through the texting
     /// app's own notification, so the app (Google Messages) sends it, as RCS
     /// in an RCS thread (Phase 9 route A). If the call fails, the UI calls
-    /// [`Messages::notification_reply_failed`] to send it the usual way.
+    /// [`Messages::notification_reply_failed`].
     ReplyViaNotification { thread_id: i64, reply_id: String, text: String },
+    /// A notification reply got no clear answer (e.g. a D-Bus timeout): the
+    /// phone may already have sent it, so nothing is resent. The UI waits
+    /// briefly for the phone's echo ([`Messages::awaiting_echo`]), then
+    /// shows "may not have sent" with a retry button.
+    MaybeNotSent { thread_id: i64, text: String },
     /// `sendWithoutConversation(addresses, text)` — only for brand-new
     /// conversations; the phone silently drops it otherwise.
     SendNew { addresses: Vec<String>, text: String },
@@ -519,13 +524,27 @@ impl Messages {
         }
     }
 
-    /// `sendReply` failed: send it the usual way, and label it SMS.
-    pub fn notification_reply_failed(&mut self, thread_id: i64, text: &str) -> Vec<Effect> {
+    /// `sendReply` failed. Only a definite refusal (`refused`: the
+    /// notification or method is gone, or the arguments were rejected) is
+    /// resent the usual way and labeled SMS. Anything else, such as a
+    /// timeout, may have reached the phone already, and resending would send
+    /// the text twice.
+    pub fn notification_reply_failed(&mut self, thread_id: i64, text: &str, refused: bool) -> Vec<Effect> {
+        if !refused {
+            return vec![Effect::MaybeNotSent { thread_id, text: text.to_string() }];
+        }
         let key = normalize_text(text);
         if let Some(p) = self.pending_routes.iter_mut().rev().find(|p| p.0 == thread_id && p.1 == key) {
             p.2 = SendRoute::Sms;
         }
         vec![self.reply(thread_id, text, Vec::new())]
+    }
+
+    /// True while a text sent to this conversation has not come back from the
+    /// phone yet.
+    pub fn awaiting_echo(&self, thread_id: i64, text: &str) -> bool {
+        let key = normalize_text(text);
+        self.pending_routes.iter().any(|p| p.0 == thread_id && p.1 == key)
     }
 
     /// How a sent message (by uid) left this app, if it was sent from here.
@@ -953,10 +972,25 @@ mod tests {
         p.apply(&[incoming(1, 10, "3165551111", "Are you still coming tonight?", 100)]);
         p.m.note_notification(notif("n1", "+13165551111", "Are you still coming tonight?"));
         assert!(matches!(p.m.send(10, "On my way")[0], Effect::ReplyViaNotification { .. }));
-        let effects = p.m.notification_reply_failed(10, "On my way");
+        let effects = p.m.notification_reply_failed(10, "On my way", true);
         assert!(matches!(&effects[0], Effect::Reply { conversation_id: 10, text, .. } if text == "On my way"));
         p.merge(sent_echo(2, 10, "3165551111", "On my way", 200));
         assert_eq!(p.m.route_of(2), Some(SendRoute::Sms));
+    }
+
+    #[test]
+    fn a_timed_out_notification_reply_is_never_resent_on_its_own() {
+        let mut p = Panel::new();
+        p.apply(&[incoming(1, 10, "3165551111", "Are you still coming tonight?", 100)]);
+        p.m.note_notification(notif("n1", "+13165551111", "Are you still coming tonight?"));
+        p.m.send(10, "On my way");
+        let effects = p.m.notification_reply_failed(10, "On my way", false);
+        assert_eq!(effects, vec![Effect::MaybeNotSent { thread_id: 10, text: "On my way".into() }]);
+        assert!(p.m.awaiting_echo(10, "On my way"));
+        // It did go out: the echo arrives and keeps the notification route.
+        p.merge(sent_echo(2, 10, "3165551111", "On my way", 200));
+        assert!(!p.m.awaiting_echo(10, "On my way"));
+        assert_eq!(p.m.route_of(2), Some(SendRoute::Notification));
     }
 
     #[test]

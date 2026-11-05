@@ -292,6 +292,7 @@ impl MessagesPage {
                 // to the phone until compose is wired up and reviewed.
                 Effect::Reply { .. }
                 | Effect::ReplyViaNotification { .. }
+                | Effect::MaybeNotSent { .. }
                 | Effect::SendNew { .. }
                 | Effect::DeleteOnPhone { .. } => {
                     log::warn!("not wired up yet: {e:?}");

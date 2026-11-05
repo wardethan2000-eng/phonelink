@@ -293,7 +293,10 @@ same path Wear OS and Android Auto replies use.
   and no other chat's. For a 1:1, a number title must be that number, and a
   name title must equal the contact's name when the desktop knows the
   contact. Exactly one notification may qualify; anything else falls back to
-  SMS. If `sendReply` fails, `notification_reply_failed` resends it as SMS.
+  SMS. If `sendReply` is definitely refused (object, method or arguments
+  rejected), it is resent as SMS. On a timeout it is never resent
+  automatically, since the phone may already have sent it: the UI waits
+  for the echo, then offers "may not have sent" with a retry button.
   Sent bubbles are labeled from the route (`route_of(uid)`) as "SMS" or
   "via notification". The label changes to "RCS" only after the phone test
   passes.
