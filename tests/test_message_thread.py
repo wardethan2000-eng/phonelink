@@ -1,4 +1,5 @@
 import unittest
+from types import SimpleNamespace
 
 from phonelink.models import SmsMessage
 from phonelink.ui.message_thread import MessageThread, _message_markup
@@ -92,3 +93,54 @@ class MessageThreadMarkupTests(unittest.TestCase):
 
 if __name__ == "__main__":
     unittest.main()
+
+
+class ThreadWindowSyncTests(unittest.TestCase):
+    """MessageThread.sync decisions with the rendered window (no widgets)."""
+
+    def _thread(self, rendered):
+        from phonelink.ui import message_thread as mt
+        t = mt.MessageThread.__new__(mt.MessageThread)
+        t._thread_id = 1
+        t._rendered_uids = {m.uid for m in rendered}
+        t._last_rendered_date = max(m.date for m in rendered)
+        t._window_first_date = min(m.date for m in rendered)
+        t._earlier_button = SimpleButton()
+        t.rebuilt = 0
+        t.appended = []
+        t._contact_label = t._address_label = SimpleButton()
+        t._stack = SimpleNamespace(get_visible_child_name=lambda: "thread")
+        t.set_messages = lambda *a, **k: setattr(t, "rebuilt", t.rebuilt + 1)
+        t.append_message = lambda m: t.appended.append(m.uid)
+        return t
+
+    @staticmethod
+    def _msg(uid, date):
+        return SmsMessage(uid=uid, body="x", date=date, msg_type=1, thread_id=1)
+
+    def test_backfill_older_than_window_only_updates_count(self):
+        shown = [self._msg(10, 1000), self._msg(11, 2000)]
+        t = self._thread(shown)
+        older = [self._msg(i, i) for i in range(1, 6)]
+        t.sync(older + shown, "A", "1", 1)
+        self.assertEqual(t.rebuilt, 0)
+        self.assertEqual(t._earlier_button.label, "Show earlier messages (5)")
+
+    def test_new_message_is_appended(self):
+        shown = [self._msg(10, 1000), self._msg(11, 2000)]
+        t = self._thread(shown)
+        t.sync(shown + [self._msg(12, 3000)], "A", "1", 1)
+        self.assertEqual((t.rebuilt, t.appended), (0, [12]))
+
+    def test_message_inside_window_out_of_order_rebuilds(self):
+        shown = [self._msg(10, 1000), self._msg(11, 2000)]
+        t = self._thread(shown)
+        t.sync(shown + [self._msg(12, 1500)], "A", "1", 1)
+        self.assertEqual(t.rebuilt, 1)
+
+
+class SimpleButton:
+    label = ""
+
+    def set_label(self, text):
+        self.label = text

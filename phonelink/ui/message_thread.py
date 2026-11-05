@@ -44,6 +44,9 @@ THUMB_IMAGE_MAX_H = 360
 THUMB_IMAGE_MIN_LONG = 220        # placeholder floor for the longer side
 THUMB_IMAGE_UPSCALE_CAP = 2.2     # don't blow tiny thumbnails up past this
 ATTACHMENT_THUMBNAIL_MAX = 256    # at/under this the image is a preview, not full
+# Bubbles rendered per thread; older ones load on request.  Rendering a whole
+# 2,000-message thread (and fetching every full-size image in it) froze the app.
+THREAD_WINDOW = 150
 
 
 def full_attachment_cache_path(att: dict) -> Path | None:
@@ -484,6 +487,11 @@ class MessageThread(Gtk.Box):
         self._last_message = None  # track last message for smart timestamps
         self._rendered_uids: set[int] = set()  # uids currently shown as bubbles
         self._last_rendered_date = 0  # date of the newest rendered message
+        self._address = ""
+        self._all_messages = []  # the whole thread, oldest first
+        self._window_size = THREAD_WINDOW  # how many of the newest are rendered
+        self._window_first_date = 0  # date of the oldest rendered message
+        self._earlier_button = None
         self._auto_fetched: set[str] = set()  # attachments we've asked full-res for
         self.set_hexpand(True)
         self.set_vexpand(True)
@@ -674,9 +682,12 @@ class MessageThread(Gtk.Box):
         self._stack.set_visible_child_name("thread")
 
     def set_messages(self, messages, contact_name: str, address: str,
-                     thread_id: int):
+                     thread_id: int, *, keep_scroll: bool = False):
+        if thread_id != self._thread_id:
+            self._window_size = THREAD_WINDOW
         self._thread_id = thread_id
         self._contact_name = contact_name
+        self._address = address
         self._contact_label.set_label(contact_name or address or "Unknown")
         self._address_label.set_label(address if contact_name else "")
 
@@ -685,8 +696,11 @@ class MessageThread(Gtk.Box):
 
         self._clear_messages()
 
-        # Sort messages by date ascending
-        sorted_msgs = sorted(messages, key=lambda m: m.date)
+        # Sort messages by date ascending; render only the newest window.
+        self._all_messages = sorted(messages, key=lambda m: m.date)
+        sorted_msgs = self._all_messages[-self._window_size:]
+        self._earlier_button = None
+        self._add_earlier_button(len(self._all_messages) - len(sorted_msgs))
 
         # Insert messages with date separators and one default timestamp
         # at the end of each nearby time cluster.
@@ -712,12 +726,41 @@ class MessageThread(Gtk.Box):
         self._last_message = sorted_msgs[-1] if sorted_msgs else None
         self._rendered_uids = {m.uid for m in sorted_msgs if m.uid}
         self._last_rendered_date = sorted_msgs[-1].date if sorted_msgs else 0
+        self._window_first_date = sorted_msgs[0].date if sorted_msgs else 0
         self._stack.set_visible_child_name("thread")
 
         self._auto_fetch_full_images(sorted_msgs)
 
         # Scroll to bottom after layout
-        GLib.idle_add(self._scroll_to_bottom)
+        if not keep_scroll:
+            GLib.idle_add(self._scroll_to_bottom)
+
+    def _add_earlier_button(self, hidden: int):
+        if hidden <= 0:
+            return
+        btn = Gtk.Button(label=self._earlier_label(hidden))
+        btn.add_css_class("flat")
+        btn.set_halign(Gtk.Align.CENTER)
+        btn.set_margin_top(8)
+        btn.connect("clicked", self._on_show_earlier)
+        self._messages_box.append(btn)
+        self._earlier_button = btn
+
+    @staticmethod
+    def _earlier_label(hidden: int) -> str:
+        return f"Show earlier messages ({hidden})"
+
+    def _on_show_earlier(self, _btn):
+        adj = self._scroll.get_vadjustment()
+        from_bottom = adj.get_upper() - adj.get_value()
+        self._window_size += THREAD_WINDOW
+        self.set_messages(self._all_messages, self._contact_name, self._address,
+                          self._thread_id, keep_scroll=True)
+
+        def restore():
+            adj.set_value(max(0, adj.get_upper() - from_bottom))
+            return GLib.SOURCE_REMOVE
+        GLib.idle_add(restore)
 
     def sync(self, messages, contact_name: str, address: str, thread_id: int):
         """Reflect the latest messages with minimal work.
@@ -736,12 +779,27 @@ class MessageThread(Gtk.Box):
             return
 
         current_uids = {m.uid for m in messages if m.uid}
-        new_msgs = [m for m in messages if m.uid and m.uid not in self._rendered_uids]
+        # Messages older than the rendered window (history backfill) only
+        # change the "Show earlier" count; they never force a rebuild.
+        new_msgs = [m for m in messages
+                    if m.uid and m.uid not in self._rendered_uids
+                    and m.date >= self._window_first_date]
         removed = self._rendered_uids - current_uids
         out_of_order = any(m.date < self._last_rendered_date for m in new_msgs)
 
         if removed or out_of_order:
-            self.set_messages(messages, contact_name, address, thread_id)
+            self.set_messages(messages, contact_name, address, thread_id,
+                              keep_scroll=True)
+            return
+
+        self._all_messages = sorted(messages, key=lambda m: m.date)
+        hidden = sum(1 for m in self._all_messages if m.date < self._window_first_date)
+        if self._earlier_button is not None:
+            self._earlier_button.set_label(self._earlier_label(hidden))
+        elif hidden:
+            # Can only appear at the top of the box; a rebuild places it there.
+            self.set_messages(messages, contact_name, address, thread_id,
+                              keep_scroll=True)
             return
 
         for msg in sorted(new_msgs, key=lambda m: m.date):
@@ -802,6 +860,7 @@ class MessageThread(Gtk.Box):
                 )
 
     def _clear_messages(self):
+        self._earlier_button = None
         while True:
             child = self._messages_box.get_first_child()
             if child is None:

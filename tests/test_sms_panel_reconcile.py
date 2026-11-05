@@ -144,6 +144,10 @@ def init_sync_state(p):
     p._gap_fill_queue = []
     p._gap_fill_pending = {}
     p._gap_fill_source = None
+    p._gap_fill_pages = {}
+    p._signal_queue = []
+    p._signal_queue_lock = __import__("threading").Lock()
+    p._signal_drain_scheduled = False
 
 
 def tup(uid, thread_id, addrs, date, body="hi", mtype=1, read=1):
@@ -373,6 +377,65 @@ class PanelCatchUpTests(unittest.TestCase):
         self.assertIsNone(self.p._all_conversations_refresh_source)
         self.p.catch_up(min_interval=0)
         self.assertIsNotNone(self.p._all_conversations_refresh_source)
+
+    # ── paging back through a thread ──────────────────────────────
+
+    def _fill_page(self, uids, date0):
+        for i, uid in enumerate(uids):
+            self.p._merge_message(sms_panel._parse_message_tuple(
+                tup(uid, thread_id=10, addrs=["111"], date=date0 + i)))
+
+    def test_full_page_of_new_messages_pulls_the_next_older_page(self):
+        self.p._queue_gap_fill(10)
+        self.drain()
+        self.loaded(10)
+        self.p.client.calls.clear()
+        self._fill_page(range(1000, 1000 + sms_panel.GAP_FILL_MESSAGES), 5000)
+        self.p._check_gap_fill_page(10)
+        self.assertEqual(self.p.client.calls, [
+            ("request_thread_from_phone",
+             ("dev1", 10, sms_panel.GAP_FILL_MESSAGES, 5000)),
+        ])
+        # The second page is replayed from where the first ended.
+        self.p.client.calls.clear()
+        self.loaded(10)
+        n = sms_panel.GAP_FILL_MESSAGES
+        self.assertEqual(self.p.client.calls, [
+            ("request_conversation", ("dev1", 10, n - 10, 2 * n)),
+        ])
+
+    def test_page_that_reaches_known_messages_stops(self):
+        self.p._queue_gap_fill(10)
+        self.drain()
+        self.loaded(10)
+        self.p.client.calls.clear()
+        self._fill_page(range(1000, 1010), 5000)  # a short page: thread start
+        self.p._check_gap_fill_page(10)
+        self.assertEqual(self.p.client.calls, [])
+        self.assertNotIn(10, self.p._gap_fill_pages)
+
+    def test_paging_stops_at_the_page_limit(self):
+        self.p._queue_gap_fill(10)
+        self.drain()
+        self.p._gap_fill_pages[10]["pages"] = sms_panel.GAP_FILL_MAX_PAGES
+        self._fill_page(range(1000, 1000 + sms_panel.GAP_FILL_MESSAGES), 5000)
+        self.p.client.calls.clear()
+        self.p._check_gap_fill_page(10)
+        self.assertEqual(self.p.client.calls, [])
+
+    # ── incoming signals are merged in batches ─────────────────────
+
+    def test_signals_drain_in_batches(self):
+        handled = []
+        self.p._handle_signal_variant = handled.append
+        n = sms_panel.SIGNAL_BATCH_SIZE
+        self.p._signal_queue.extend(range(n + 5))
+        self.assertEqual(self.p._drain_signal_queue(), GLib.SOURCE_CONTINUE)
+        self.assertEqual(len(handled), n)
+        self.p._signal_drain_scheduled = True
+        self.assertEqual(self.p._drain_signal_queue(), GLib.SOURCE_REMOVE)
+        self.assertEqual(len(handled), n + 5)
+        self.assertFalse(self.p._signal_drain_scheduled)
 
     def test_catch_up_waits_for_the_phone(self):
         self.p._device.reachable = False

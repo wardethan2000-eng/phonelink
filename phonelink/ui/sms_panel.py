@@ -20,7 +20,9 @@ from phonelink.dbus_client import (
     IFACE_TELEPHONY,
 )
 from phonelink.contacts import (
+    _is_messaging_app,
     _normalize_phone,
+    _notification_message_text,
     load_contact_map, resolve_name, import_vcf_file,
     harvest_contacts_from_notifications,
     build_body_to_address_map,
@@ -28,6 +30,7 @@ from phonelink.contacts import (
     harvest_contact_from_telephony_signal,
     synced_vcard_count,
 )
+from phonelink.hidden_texts import FIX_COMMAND, HiddenTextDetector, body_matches
 from phonelink.models import Conversation, SmsMessage
 from phonelink import reconcile
 from phonelink.reconcile import ConversationIndex
@@ -54,9 +57,14 @@ _I_ATT = 9
 # arrives during sleep or a Wi-Fi drop has to be pulled.  A catch-up asks for
 # every thread's newest message; a gap fill asks for one thread's recent history.
 CATCH_UP_MIN_INTERVAL_SECONDS = 20
-GAP_FILL_MESSAGES = 50
+GAP_FILL_MESSAGES = 100       # one page; full pages keep paging further back
+GAP_FILL_MAX_PAGES = 10
+GAP_FILL_SETTLE_SECONDS = 3   # wait this long after a replay before judging the page
 GAP_FILL_SPACING_MS = 250
 GAP_FILL_TIMEOUT_SECONDS = 60
+# Incoming messages are merged this many at a time, yielding to the UI between
+# batches; a big pull (thousands of messages) otherwise freezes the window.
+SIGNAL_BATCH_SIZE = 200
 
 
 def _attachment_extension(mime_type: str) -> str:
@@ -176,6 +184,12 @@ class SmsPanel(Gtk.Box):
         self._gap_fill_queue: list[int] = []      # phone thread IDs to pull
         self._gap_fill_pending: dict[int, float] = {}  # asked of the phone, awaiting conversationLoaded
         self._gap_fill_source: int | None = None
+        self._gap_fill_pages: dict[int, dict] = {}  # thread → paging progress
+        self._signal_queue: list = []
+        self._signal_queue_lock = threading.Lock()
+        self._signal_drain_scheduled = False
+        self._hidden_texts = HiddenTextDetector()
+        self._hidden_texts_source: int | None = None
         self._conversation_refresh_source: int | None = None
         self._pending_refresh_force = False
         self._pending_show_thread_id: int | None = None
@@ -185,6 +199,15 @@ class SmsPanel(Gtk.Box):
         self._stack.set_vexpand(True)
         self._stack.set_hexpand(True)
         self._stack.set_transition_type(Gtk.StackTransitionType.CROSSFADE)
+
+        # Shown when the phone is hiding texts from KDE Connect (Android 17).
+        self._hidden_banner = Adw.Banner()
+        self._hidden_banner.set_title(
+            "Your phone is hiding some texts from Phone Link"
+        )
+        self._hidden_banner.set_button_label("Copy fix")
+        self._hidden_banner.connect("button-clicked", self._on_copy_hidden_texts_fix)
+        self.append(self._hidden_banner)
         self.append(self._stack)
 
         # Disconnected / empty status page
@@ -484,6 +507,7 @@ class SmsPanel(Gtk.Box):
             return GLib.SOURCE_REMOVE
         thread_id = self._gap_fill_queue.pop(0)
         self._gap_fill_pending[thread_id] = time.monotonic()
+        self._start_gap_fill_page(thread_id)
         self.client.submit(
             self.client.request_thread_from_phone,
             self._device.id, thread_id, GAP_FILL_MESSAGES,
@@ -498,6 +522,56 @@ class SmsPanel(Gtk.Box):
             GLib.source_remove(self._gap_fill_source)
             self._gap_fill_source = None
         self._gap_fill_queue.clear()
+        for page in self._gap_fill_pages.values():
+            if page.get("check"):
+                GLib.source_remove(page["check"])
+        self._gap_fill_pages.clear()
+
+    # A gap fill pages back through a thread until it reaches messages we
+    # already had: a busy thread can miss hundreds of texts while the laptop
+    # sleeps, far more than one page.
+
+    def _start_gap_fill_page(self, thread_id: int):
+        page = self._gap_fill_pages.get(thread_id)
+        if page is None:
+            page = self._gap_fill_pages[thread_id] = {"pages": 1, "check": None}
+        page.update(added=0, known=0, oldest=None)
+
+    def _note_gap_fill_message(self, msg: SmsMessage, added: bool):
+        page = self._gap_fill_pages.get(msg.thread_id)
+        if page is None:
+            return
+        page["added" if added else "known"] += 1
+        if page["oldest"] is None or msg.date < page["oldest"]:
+            page["oldest"] = msg.date
+
+    def _check_gap_fill_page(self, thread_id: int):
+        """After a page's replay settles: fetch the next older page, or stop."""
+        page = self._gap_fill_pages.get(thread_id)
+        if page is None:
+            return GLib.SOURCE_REMOVE
+        page["check"] = None
+        seen = page["added"] + page["known"]
+        more = (
+            self._device is not None
+            and self._device.reachable
+            and page["pages"] < GAP_FILL_MAX_PAGES
+            and page["oldest"] is not None
+            and seen >= GAP_FILL_MESSAGES * 0.9   # the page was full …
+            and page["added"] >= GAP_FILL_MESSAGES // 2  # … and mostly new to us
+        )
+        if not more:
+            del self._gap_fill_pages[thread_id]
+            return GLib.SOURCE_REMOVE
+        oldest = page["oldest"]
+        page["pages"] += 1
+        page.update(added=0, known=0, oldest=None)
+        self._gap_fill_pending[thread_id] = time.monotonic()
+        self.client.submit(
+            self.client.request_thread_from_phone,
+            self._device.id, thread_id, GAP_FILL_MESSAGES, oldest,
+        )
+        return GLib.SOURCE_REMOVE
         self._gap_fill_pending.clear()
 
     def _detect_self_number(self, raw_list):
@@ -598,9 +672,29 @@ class SmsPanel(Gtk.Box):
     def _on_dbus_conversation_signal(self, conn, sender, path, iface, sig, params):
         """Handle conversationCreated / conversationUpdated signals.
 
-        Signal payload is (v,) — a variant wrapping a message tuple.
+        Signal payload is (v,) — a variant wrapping a message tuple.  Signals
+        are queued and merged in batches (see :meth:`_drain_signal_queue`).
         """
-        GLib.idle_add(self._handle_signal_variant, params)
+        with self._signal_queue_lock:
+            self._signal_queue.append(params)
+            if self._signal_drain_scheduled:
+                return
+            self._signal_drain_scheduled = True
+        GLib.idle_add(self._drain_signal_queue)
+
+    def _drain_signal_queue(self):
+        """Merge up to SIGNAL_BATCH_SIZE queued messages in one store commit."""
+        with self._signal_queue_lock:
+            batch = self._signal_queue[:SIGNAL_BATCH_SIZE]
+            del self._signal_queue[:SIGNAL_BATCH_SIZE]
+        with self._store.batch():
+            for params in batch:
+                self._handle_signal_variant(params)
+        with self._signal_queue_lock:
+            if self._signal_queue:
+                return GLib.SOURCE_CONTINUE  # idle priority: the UI runs in between
+            self._signal_drain_scheduled = False
+        return GLib.SOURCE_REMOVE
 
     def _on_dbus_conversation_loaded(self, conn, sender, path, iface, sig, params):
         """A conversation finished loading — debounce and reload from cache."""
@@ -610,10 +704,20 @@ class SmsPanel(Gtk.Box):
             thread_id = None
         if thread_id in self._gap_fill_pending and self._device:
             del self._gap_fill_pending[thread_id]
+            page = self._gap_fill_pages.get(thread_id)
+            pages = page["pages"] if page else 1
+            # Replay just this page from the daemon's cache (newest-first indices).
+            start = max(0, GAP_FILL_MESSAGES * (pages - 1) - 10)
             self.client.submit(
                 self.client.request_conversation,
-                self._device.id, thread_id, 0, GAP_FILL_MESSAGES,
+                self._device.id, thread_id, start, GAP_FILL_MESSAGES * pages,
             )
+            if page is not None:
+                if page.get("check"):
+                    GLib.source_remove(page["check"])
+                page["check"] = GLib.timeout_add_seconds(
+                    GAP_FILL_SETTLE_SECONDS, self._check_gap_fill_page, thread_id
+                )
         # Cancel any pending reload and schedule a new one 500ms from now.
         # This prevents hammering reload when many signals fire in sequence.
         if hasattr(self, '_conv_loaded_timer') and self._conv_loaded_timer:
@@ -690,6 +794,7 @@ class SmsPanel(Gtk.Box):
     def _apply_notification_props(self, device_id, notif_id, props):
         if not self._device or self._device.id != device_id or not props:
             return
+        self._watch_for_hidden_text(props)
         result = match_contact_from_notification_props(
             props, self._conversations, self._contact_map
         )
@@ -701,6 +806,61 @@ class SmsPanel(Gtk.Box):
                 if _normalize_phone(conv.address) == norm_phone:
                     conv.display_name = name
             self._refresh_conversation_list()
+
+    # ── Texts the phone hides (Android 17 restricted messages) ─────
+
+    def _watch_for_hidden_text(self, props: dict):
+        if not _is_messaging_app(props.get("appName", "")):
+            return
+        if self._hidden_texts.note_notification(
+            _notification_message_text(props), time.time()
+        ):
+            self._schedule_hidden_text_check()
+
+    def _schedule_hidden_text_check(self):
+        if self._hidden_texts_source:
+            return
+        self._hidden_texts_source = GLib.timeout_add_seconds(
+            int(self._hidden_texts.settle_seconds) + 5, self._run_hidden_text_check
+        )
+
+    def _text_arrived(self, preview: str, posted_at: float) -> bool:
+        since_ms = (posted_at - 30 * 60) * 1000
+        for conv in self._conversations.values():
+            if (conv.last_date or 0) < since_ms:
+                continue
+            for msg in reversed(conv.messages):
+                if msg.date < since_ms:
+                    break
+                if body_matches(preview, msg.body or ""):
+                    return True
+        return False
+
+    def _run_hidden_text_check(self):
+        self._hidden_texts_source = None
+        if self._hidden_texts.check(time.time(), self._text_arrived):
+            self._update_hidden_texts_banner()
+        if self._hidden_texts.has_pending:
+            self._schedule_hidden_text_check()
+        return GLib.SOURCE_REMOVE
+
+    def _update_hidden_texts_banner(self):
+        banner = getattr(self, "_hidden_banner", None)
+        if banner is None:
+            return
+        if self._hidden_texts.warning:
+            banner.set_title("Your phone is hiding some texts from Phone Link")
+            banner.set_button_label("Copy fix")
+        banner.set_revealed(self._hidden_texts.warning)
+
+    def _on_copy_hidden_texts_fix(self, banner):
+        display = self.get_display()
+        if display is not None:
+            display.get_clipboard().set(FIX_COMMAND)
+        banner.set_title(
+            "Fix copied — plug in the phone (USB debugging on) and run it in a terminal"
+        )
+        banner.set_button_label("Copy again")
 
     def _send_text_reply(self, thread_id: int, text: str, attachments=None):
         """Send into an existing thread, off the main thread.
@@ -1126,6 +1286,8 @@ class SmsPanel(Gtk.Box):
         # received others in between that it never sent us.
         if result.is_newer and not result.created:
             self._queue_gap_fill(msg.thread_id)
+
+        self._note_gap_fill_message(msg, result.message_added)
 
         if self._device and result.message_added:
             self._store.upsert_message(self._device.id, conv.thread_id, msg)
