@@ -1,0 +1,885 @@
+//! The Messages tab's logic, without the widgets (port of the non-GTK parts
+//! of `phonelink/ui/sms_panel.py`).
+//!
+//! [`Messages`] owns the conversation index, read state, drafts and the
+//! catch-up machine. Each event method returns [`Effect`]s: D-Bus requests to
+//! send and UI updates to make. The UI layer runs them; nothing here blocks or
+//! touches GTK. The store and the hidden-conversation list are passed in so
+//! tests can use an in-memory store and a fake.
+
+use std::collections::{HashMap, HashSet};
+
+use super::contacts::{normalize_phone, resolve_name};
+use super::message::{RawMessage, parse_message};
+use super::models::{Conversation, SmsMessage};
+use super::reconcile::{self, ConversationIndex};
+use super::settings::Settings;
+use super::store::MessageStore;
+use super::sync::{self, CatchUp};
+
+/// Where locally deleted conversations are remembered (`settings.json`).
+pub trait HiddenStore {
+    fn hidden_until(&self, device_id: &str, key: &str) -> i64;
+    fn hide(&mut self, device_id: &str, key: &str, deleted_at: i64);
+    fn unhide(&mut self, device_id: &str, key: &str);
+}
+
+impl HiddenStore for Settings {
+    fn hidden_until(&self, device_id: &str, key: &str) -> i64 {
+        self.conversation_hidden_until(device_id, key)
+    }
+    fn hide(&mut self, device_id: &str, key: &str, deleted_at: i64) {
+        if let Err(e) = self.hide_conversation(device_id, key, deleted_at) {
+            log::warn!("saving a hidden conversation failed: {e}");
+        }
+    }
+    fn unhide(&mut self, device_id: &str, key: &str) {
+        if let Err(e) = self.unhide_conversation(device_id, key) {
+            log::warn!("unhiding a conversation failed: {e}");
+        }
+    }
+}
+
+#[derive(Debug, Clone, PartialEq)]
+pub enum Effect {
+    /// A catch-up / gap-fill request (see [`sync::Action`]).
+    Sync(sync::Action),
+    /// `markConversationAsRead(thread)` — absent in daemon 26.08; ignore
+    /// `UnknownMethod`.
+    MarkRead { thread_id: i64 },
+    /// `replyToConversation(conversation_id, text, attachments)` — the only
+    /// send the S25 reliably delivers.
+    Reply { conversation_id: i64, text: String, attachments: Vec<String> },
+    /// `sendWithoutConversation(addresses, text)` — only for brand-new
+    /// conversations; the phone silently drops it otherwise.
+    SendNew { addresses: Vec<String>, text: String },
+    /// `deleteConversation(thread)` on the phone.
+    DeleteOnPhone { thread_id: i64 },
+    RefreshList,
+    ShowThread(i64),
+    ShowEmpty,
+    Toast(&'static str),
+}
+
+pub const TOAST_NOT_CONNECTED: &str = "Can't send — your phone isn't connected right now";
+pub const TOAST_LOCAL_DELETE_ONLY: &str =
+    "Removed from Phone Link only; phone-side deletion is not available on this KDE Connect version";
+
+#[derive(Debug, Default)]
+pub struct Messages {
+    device_id: Option<String>,
+    reachable: bool,
+    pub index: ConversationIndex,
+    pub contact_map: HashMap<String, String>,
+    read_thread_ids: HashSet<i64>,
+    active: Option<i64>,
+    next_draft_id: i64,
+    pub catch_up: CatchUp,
+}
+
+/// Display name for a conversation from the contact map.
+pub fn name_for(contact_map: &HashMap<String, String>, addresses: &[String], address: &str) -> String {
+    if addresses.len() > 1 {
+        return addresses.iter().map(|a| resolve_name(contact_map, a)).collect::<Vec<_>>().join(", ");
+    }
+    let target = if !address.is_empty() { address } else { addresses.first().map_or("", String::as_str) };
+    resolve_name(contact_map, target)
+}
+
+/// Same number, allowing for country codes (last 10 digits).
+fn same_number(a_norm: &str, b_norm: &str) -> bool {
+    // By chars: `normalize_phone` keeps any Unicode digit, not only ASCII.
+    let last10 = |s: &str| s.chars().rev().take(10).collect::<String>();
+    a_norm == b_norm
+        || (a_norm.chars().count() >= 10 && b_norm.chars().count() >= 10 && last10(a_norm) == last10(b_norm))
+}
+
+impl Messages {
+    pub fn new() -> Self {
+        Self { next_draft_id: -1, ..Default::default() }
+    }
+
+    pub fn device_id(&self) -> Option<&str> {
+        self.device_id.as_deref()
+    }
+
+    pub fn active_thread(&self) -> Option<i64> {
+        self.active
+    }
+
+    /// A different device became active: forget everything from the last one.
+    pub fn reset_for_device(&mut self, device_id: Option<&str>, reachable: bool) {
+        self.device_id = device_id.map(str::to_string);
+        self.index.clear();
+        self.read_thread_ids.clear();
+        self.active = None;
+        self.catch_up.cancel();
+        self.set_reachable(reachable);
+    }
+
+    pub fn set_reachable(&mut self, reachable: bool) {
+        self.reachable = reachable;
+        self.catch_up.set_reachable(reachable && self.device_id.is_some());
+    }
+
+    fn conversation_identity(&self, addresses: &[String], fallback: &str) -> String {
+        reconcile::conversation_identity(addresses, fallback, &self.index.self_key)
+    }
+
+    fn should_keep_hidden(&self, hidden: &mut dyn HiddenStore, key: &str, message_date: i64) -> bool {
+        let Some(dev) = self.device_id.as_deref() else { return false };
+        if key.is_empty() {
+            return false;
+        }
+        let until = hidden.hidden_until(dev, key);
+        if until == 0 {
+            return false;
+        }
+        if message_date > until {
+            hidden.unhide(dev, key);
+            return false;
+        }
+        true
+    }
+
+    // ── loading ────────────────────────────────────────────────────
+
+    /// Show persisted history immediately, before the daemon responds.
+    pub fn load_cached(&mut self, store: &MessageStore) -> Vec<Effect> {
+        let Some(dev) = self.device_id.clone() else { return Vec::new() };
+        let mut cached: Vec<Conversation> = store.load_conversations(&dev).into_values().collect();
+        if cached.is_empty() {
+            return Vec::new();
+        }
+        // Deterministic order, collapsing legacy duplicate rows.
+        cached.sort_by_key(|c| c.thread_id);
+        self.index.clear();
+        for conv in cached {
+            self.index.register(conv);
+        }
+        self.refresh_names();
+        vec![Effect::RefreshList]
+    }
+
+    /// Re-resolve every display name (contacts changed).
+    pub fn refresh_names(&mut self) {
+        for conv in self.index.conversations.values_mut() {
+            conv.display_name = name_for(&self.contact_map, &conv.addresses, &conv.address);
+        }
+    }
+
+    /// The daemon's `activeConversations` reply (newest message per thread).
+    pub fn apply_active(&mut self, raw: &[RawMessage], store: &MessageStore, hidden: &mut dyn HiddenStore, now: f64) -> Vec<Effect> {
+        if self.device_id.is_none() {
+            return Vec::new();
+        }
+        let msgs: Vec<SmsMessage> = raw.iter().map(parse_message).collect();
+        self.detect_self_number(&msgs);
+        let mut out = Vec::new();
+        store.batch(|store| {
+            for msg in &msgs {
+                out.extend(self.merge_message(msg.clone(), store, hidden, now));
+            }
+        });
+        if !msgs.is_empty() {
+            out.push(Effect::RefreshList);
+        }
+        out
+    }
+
+    /// Learn the user's own number from multi-address threads; group
+    /// identities depend on it, so re-key when it changes.
+    fn detect_self_number(&mut self, msgs: &[SmsMessage]) {
+        let key_lists: Vec<Vec<String>> = msgs
+            .iter()
+            .map(|m| m.all_addresses.iter().map(|a| reconcile::phone_key(a)).collect())
+            .collect();
+        let contact_keys: Vec<&str> = self.contact_map.keys().map(String::as_str).collect();
+        let self_key = reconcile::detect_self_key(&key_lists, &contact_keys);
+        if self.index.set_self_key(&self_key) {
+            self.index.reindex();
+            if let Some(active) = self.active
+                && !self.index.conversations.contains_key(&active)
+            {
+                self.active = Some(self.index.primary_for(active));
+            }
+        }
+    }
+
+    // ── ingestion ──────────────────────────────────────────────────
+
+    /// Merge one message (a signal, or one row of a bulk reply). Call inside
+    /// `store.batch` when merging many.
+    pub fn merge_message(&mut self, msg: SmsMessage, store: &MessageStore, hidden: &mut dyn HiddenStore, now: f64) -> Vec<Effect> {
+        let mut out = Vec::new();
+        let all_addrs: Vec<String> = if !msg.all_addresses.is_empty() {
+            msg.all_addresses.clone()
+        } else if !msg.address.is_empty() {
+            vec![msg.address.clone()]
+        } else {
+            Vec::new()
+        };
+
+        // A locally deleted conversation stays hidden until a newer message
+        // arrives — only for a conversation not already showing.
+        if self.index.get(msg.thread_id).is_none() {
+            let identity = self.conversation_identity(&all_addrs, &msg.address);
+            if !self.index.identity_to_primary.contains_key(&identity)
+                && self.should_keep_hidden(hidden, &identity, msg.date)
+            {
+                return out;
+            }
+        }
+
+        let (thread_id, date, read, is_sent) = (msg.thread_id, msg.date, msg.read, msg.is_sent());
+        let stored = msg.clone();
+        let contact_map = &self.contact_map;
+        let resolver = |a: &[String], ad: &str| name_for(contact_map, a, ad);
+        let result = self.index.ingest(msg, Some(&all_addrs), &resolver);
+
+        // A newer latest message on a known thread means the phone may have
+        // received others in between that it never sent us.
+        if result.is_newer && !result.created {
+            self.catch_up.queue_gap_fill(thread_id, now);
+        }
+        self.catch_up.note_message(thread_id, date, result.message_added);
+
+        let dev = self.device_id.clone().unwrap_or_default();
+        if result.message_added {
+            store.upsert_message(&dev, result.primary, &stored);
+        }
+
+        let primary = result.primary;
+        if result.is_latest {
+            let active = self.active == Some(primary);
+            let was_opened = self.read_thread_ids.contains(&primary);
+            let reopen_unread = result.is_newer && !is_sent && read == 0;
+            if let Some(conv) = self.index.get_mut(primary) {
+                if active {
+                    conv.is_read = true;
+                } else if !was_opened {
+                    conv.is_read = read != 0;
+                } else if reopen_unread {
+                    // New incoming text on a chat opened earlier but not
+                    // being viewed now: unread again.
+                    conv.is_read = false;
+                }
+            }
+            if !active && was_opened && reopen_unread {
+                self.read_thread_ids.remove(&primary);
+            }
+        }
+        if let Some(conv) = self.index.get(primary) {
+            store.upsert_conversation(&dev, conv);
+        }
+        if self.active == Some(primary) {
+            out.push(Effect::ShowThread(primary));
+        }
+        out
+    }
+
+    /// `conversationRemoved` from the daemon.
+    pub fn remove_conversation(&mut self, thread_id: i64, store: &MessageStore) -> Vec<Effect> {
+        let mut removed = self.index.remove(thread_id);
+        if removed.is_empty() {
+            removed.push(thread_id);
+        }
+        self.forget(&removed, store)
+    }
+
+    fn forget(&mut self, removed: &[i64], store: &MessageStore) -> Vec<Effect> {
+        let mut out = Vec::new();
+        if let Some(dev) = self.device_id.as_deref() {
+            for &tid in removed {
+                store.delete_conversation(dev, tid);
+            }
+        }
+        for tid in removed {
+            self.read_thread_ids.remove(tid);
+        }
+        if self.active.is_some_and(|a| removed.contains(&a)) {
+            self.active = None;
+            out.push(Effect::ShowEmpty);
+        }
+        out.push(Effect::RefreshList);
+        out
+    }
+
+    /// Conversations to show (locally deleted ones filtered out), newest first.
+    pub fn visible(&self, hidden: &dyn HiddenStore) -> Vec<&Conversation> {
+        let dev = self.device_id.as_deref().unwrap_or("");
+        let is_hidden = |c: &Conversation| {
+            let key = self.conversation_identity(&c.addresses, &c.address);
+            if key.is_empty() || dev.is_empty() {
+                return false;
+            }
+            let until = hidden.hidden_until(dev, &key);
+            until != 0 && c.sort_key() <= until
+        };
+        let mut v = self.index.visible(Some(&is_hidden));
+        v.sort_by_key(|c| std::cmp::Reverse(c.sort_key()));
+        v
+    }
+
+    // ── user actions ───────────────────────────────────────────────
+
+    /// The user opened a conversation.
+    pub fn select(&mut self, thread_id: i64, store: &MessageStore, now: f64) -> Vec<Effect> {
+        let mut out = Vec::new();
+        if self.active == Some(thread_id) {
+            return out;
+        }
+        self.active = Some(thread_id);
+        let Some(conv) = self.index.get_mut(thread_id) else { return out };
+        self.read_thread_ids.insert(thread_id);
+        let was_unread = !conv.is_read;
+        conv.is_read = true;
+        if was_unread {
+            out.push(Effect::RefreshList);
+            if let Some(dev) = self.device_id.as_deref() {
+                store.upsert_conversation(dev, conv);
+            }
+        }
+        // Drafts don't exist on the phone.
+        if thread_id < 0 {
+            out.push(Effect::ShowThread(thread_id));
+            return out;
+        }
+        if was_unread && self.device_id.is_some() {
+            out.push(Effect::MarkRead { thread_id });
+        }
+        // Show cached messages now, then pull the thread (and any phone
+        // threads merged into it) so missed texts fill in.
+        out.push(Effect::ShowThread(thread_id));
+        let threads = self.conversation_threads(thread_id);
+        self.catch_up.queue_conversation_gap_fill(&threads, now);
+        out
+    }
+
+    /// The conversation's primary phone thread followed by merged ones.
+    pub fn conversation_threads(&self, thread_id: i64) -> Vec<i64> {
+        let primary = self.index.primary_for(thread_id);
+        let mut v = vec![primary];
+        v.extend(self.index.secondary_threads(primary));
+        v
+    }
+
+    /// Start a conversation from contact search: open the existing one for
+    /// that number, or create a draft (negative id).
+    ///
+    /// Parity note: like the Python, this can match a *group* whose first
+    /// address is the number; `find_thread_for_address` (used on send)
+    /// skips groups.
+    pub fn open_or_create(&mut self, address: &str, display_name: &str) -> Vec<Effect> {
+        if self.device_id.is_none() || !self.reachable {
+            return Vec::new();
+        }
+        let norm = normalize_phone(address);
+        let existing = self
+            .index
+            .conversations
+            .values()
+            .find(|c| same_number(&normalize_phone(&c.address), &norm))
+            .map(|c| c.thread_id);
+        if let Some(tid) = existing {
+            self.active = Some(tid);
+            self.read_thread_ids.insert(tid);
+            if let Some(c) = self.index.get_mut(tid) {
+                c.is_read = true;
+            }
+            return vec![Effect::RefreshList, Effect::ShowThread(tid)];
+        }
+        let draft_id = self.next_draft_id;
+        self.next_draft_id -= 1;
+        let mut conv = Conversation::new(draft_id);
+        conv.address = address.to_string();
+        conv.display_name = if display_name != address { display_name.to_string() } else { String::new() };
+        self.index.conversations.insert(draft_id, conv);
+        self.active = Some(draft_id);
+        vec![Effect::RefreshList, Effect::ShowThread(draft_id)]
+    }
+
+    /// An existing real 1:1 thread for a number.
+    pub fn find_thread_for_address(&self, address: &str) -> Option<i64> {
+        let norm = normalize_phone(address);
+        if norm.is_empty() {
+            return None;
+        }
+        self.index
+            .conversations
+            .values()
+            .filter(|c| c.thread_id >= 0 && !c.is_group())
+            .find(|c| same_number(&normalize_phone(&c.address), &norm))
+            .map(|c| c.thread_id)
+    }
+
+    /// Send from the compose bar.
+    pub fn send(&mut self, thread_id: i64, text: &str) -> Vec<Effect> {
+        if self.device_id.is_none() || !self.reachable {
+            return vec![Effect::Toast(TOAST_NOT_CONNECTED)];
+        }
+        if thread_id >= 0 {
+            return vec![self.reply(thread_id, text, Vec::new())];
+        }
+        // A draft: a real thread may have loaded since it was created.
+        let Some(draft) = self.index.conversations.get(&thread_id) else { return Vec::new() };
+        let address = draft.address.clone();
+        self.index.conversations.remove(&thread_id);
+        match self.find_thread_for_address(&address) {
+            Some(existing) => {
+                self.active = Some(existing);
+                self.read_thread_ids.insert(existing);
+                vec![self.reply(existing, text, Vec::new()), Effect::RefreshList, Effect::ShowThread(existing)]
+            }
+            None => {
+                self.active = None;
+                vec![
+                    Effect::SendNew { addresses: vec![address], text: text.to_string() },
+                    Effect::ShowEmpty,
+                    Effect::RefreshList,
+                ]
+            }
+        }
+    }
+
+    /// Reply into an existing thread, addressed by conversation id.
+    pub fn reply(&self, thread_id: i64, text: &str, attachments: Vec<String>) -> Effect {
+        Effect::Reply { conversation_id: self.index.primary_for(thread_id), text: text.to_string(), attachments }
+    }
+
+    /// Remember a conversation as deleted until a newer message arrives.
+    /// Returns its identity key ("" if it can't be hidden).
+    pub fn hide_locally(&self, thread_id: i64, hidden: &mut dyn HiddenStore, now_ms: i64) -> String {
+        let (Some(dev), Some(conv)) = (self.device_id.as_deref(), self.index.get(thread_id)) else {
+            return String::new();
+        };
+        if conv.thread_id < 0 {
+            return String::new();
+        }
+        let key = self.conversation_identity(&conv.addresses, &conv.address);
+        if key.is_empty() {
+            return key;
+        }
+        hidden.hide(dev, &key, now_ms.max(conv.last_date));
+        key
+    }
+
+    /// Drop a hidden conversation from memory and the store.
+    pub fn purge(&mut self, key: &str, store: &MessageStore) -> Vec<Effect> {
+        let Some(&primary) = self.index.identity_to_primary.get(key) else { return Vec::new() };
+        let removed = self.index.remove(primary);
+        if removed.is_empty() {
+            return Vec::new();
+        }
+        self.forget(&removed, store)
+    }
+
+    /// The user confirmed "Delete Conversation".
+    pub fn delete(
+        &mut self,
+        thread_id: i64,
+        can_delete_on_phone: bool,
+        store: &MessageStore,
+        hidden: &mut dyn HiddenStore,
+        now_ms: i64,
+    ) -> Vec<Effect> {
+        let mut out = Vec::new();
+        let key = self.hide_locally(thread_id, hidden, now_ms);
+        if can_delete_on_phone && thread_id >= 0 {
+            out.push(Effect::DeleteOnPhone { thread_id });
+        } else if thread_id >= 0 {
+            out.push(Effect::Toast(TOAST_LOCAL_DELETE_ONLY));
+        }
+        if key.is_empty() {
+            out.extend(self.remove_conversation(thread_id, store));
+        } else {
+            out.extend(self.purge(&key, store));
+        }
+        out
+    }
+
+    // ── catch-up plumbing ──────────────────────────────────────────
+
+    /// Run due catch-up work; the open conversation is gap-filled with every
+    /// full pull.
+    pub fn tick(&mut self, now: f64) -> Vec<Effect> {
+        let active = match self.active {
+            Some(a) if a >= 0 => self.conversation_threads(a),
+            _ => Vec::new(),
+        };
+        self.catch_up.tick(now, &active).into_iter().map(Effect::Sync).collect()
+    }
+
+    pub fn on_conversation_loaded(&mut self, thread_id: i64, now: f64) -> Vec<Effect> {
+        self.catch_up.on_conversation_loaded(thread_id, now).map(Effect::Sync).into_iter().collect()
+    }
+}
+
+#[cfg(test)]
+mod tests {
+    //! Ports of `tests/test_sms_panel_reconcile.py` (the panel glue).
+    use super::*;
+    use crate::core::sync::{Action, GAP_FILL_MAX_PAGES, GAP_FILL_MESSAGES};
+
+    #[derive(Default)]
+    struct FakeHidden(HashMap<(String, String), i64>);
+
+    impl HiddenStore for FakeHidden {
+        fn hidden_until(&self, d: &str, k: &str) -> i64 {
+            self.0.get(&(d.to_string(), k.to_string())).copied().unwrap_or(0)
+        }
+        fn hide(&mut self, d: &str, k: &str, at: i64) {
+            self.0.insert((d.to_string(), k.to_string()), at);
+        }
+        fn unhide(&mut self, d: &str, k: &str) {
+            self.0.remove(&(d.to_string(), k.to_string()));
+        }
+    }
+
+    struct Panel {
+        m: Messages,
+        store: MessageStore,
+        hidden: FakeHidden,
+    }
+
+    impl Panel {
+        fn new() -> Self {
+            let mut m = Messages::new();
+            m.reset_for_device(Some("dev1"), true);
+            Self { m, store: MessageStore::in_memory(), hidden: FakeHidden::default() }
+        }
+        fn apply(&mut self, rows: &[RawMessage]) -> Vec<Effect> {
+            self.m.apply_active(rows, &self.store, &mut self.hidden, 0.0)
+        }
+        fn merge(&mut self, row: RawMessage) -> Vec<Effect> {
+            self.m.merge_message(parse_message(&row), &self.store, &mut self.hidden, 0.0)
+        }
+        fn visible(&self) -> Vec<&Conversation> {
+            self.m.visible(&self.hidden)
+        }
+        /// Every sync request due within the next minute.
+        fn drain(&mut self) -> Vec<Action> {
+            let mut out = Vec::new();
+            while let Some(t) = self.m.catch_up.next_deadline() {
+                if t > 1e9 {
+                    break;
+                }
+                out.extend(self.m.tick(t).into_iter().map(|e| match e {
+                    Effect::Sync(a) => a,
+                    other => panic!("unexpected {other:?}"),
+                }));
+            }
+            out
+        }
+    }
+
+    fn tup(uid: i64, thread_id: i64, addrs: &[&str], date: i64) -> RawMessage {
+        RawMessage {
+            body: "hi".into(),
+            addresses: addrs.iter().map(|a| a.to_string()).collect(),
+            date,
+            msg_type: 1,
+            read: 1,
+            thread_id,
+            uid,
+            ..Default::default()
+        }
+    }
+
+    fn uids(c: &Conversation) -> HashSet<i64> {
+        c.messages.iter().map(|m| m.uid).collect()
+    }
+
+    // ── PanelReconcileTests ─────────────────────────────────────────
+
+    #[test]
+    fn test_sms_and_mms_threads_show_as_one_conversation() {
+        let mut p = Panel::new();
+        p.apply(&[tup(1, 10, &["+13165551212"], 100), tup(2, 20, &["3165551212"], 200)]);
+        let v = p.visible();
+        assert_eq!(v.len(), 1);
+        assert_eq!(uids(v[0]), HashSet::from([1, 2]));
+        for _ in 0..5 {
+            assert_eq!(p.visible().len(), 1);
+        }
+    }
+
+    #[test]
+    fn test_group_thread_not_merged_with_member() {
+        let mut p = Panel::new();
+        p.apply(&[tup(1, 10, &["3165551111"], 100), tup(2, 20, &["3165551111", "3165552222"], 200)]);
+        assert_eq!(p.visible().len(), 2);
+    }
+
+    #[test]
+    fn test_unread_incoming_message_marks_conversation_unread() {
+        let mut p = Panel::new();
+        let mut row = tup(1, 10, &["111"], 100);
+        row.read = 0;
+        p.apply(&[row]);
+        assert!(!p.visible()[0].is_read);
+    }
+
+    #[test]
+    fn test_opened_thread_stays_read_on_own_reply() {
+        let mut p = Panel::new();
+        p.apply(&[tup(1, 10, &["111"], 100)]);
+        let tid = p.visible()[0].thread_id;
+        p.m.active = Some(tid);
+        let mut sent = tup(2, 10, &["111"], 200);
+        sent.msg_type = 2;
+        p.merge(sent);
+        assert!(p.m.index.get(tid).unwrap().is_read);
+    }
+
+    #[test]
+    fn opened_then_left_chat_turns_unread_on_a_new_incoming_text() {
+        let mut p = Panel::new();
+        p.apply(&[tup(1, 10, &["111"], 100)]);
+        p.m.select(10, &p.store, 0.0);
+        p.m.active = None; // the user moved on
+        let mut row = tup(2, 10, &["111"], 200);
+        row.read = 0;
+        p.merge(row);
+        assert!(!p.m.index.get(10).unwrap().is_read);
+    }
+
+    #[test]
+    fn test_one_to_one_send_uses_reply_to_conversation() {
+        let mut p = Panel::new();
+        p.apply(&[tup(1, 10, &["+13165551212"], 100)]);
+        let tid = p.visible()[0].thread_id;
+        assert_eq!(
+            p.m.send(tid, "hi there"),
+            vec![Effect::Reply { conversation_id: tid, text: "hi there".into(), attachments: vec![] }]
+        );
+    }
+
+    #[test]
+    fn test_group_send_replies_in_thread() {
+        let mut p = Panel::new();
+        p.apply(&[tup(1, 20, &["3165551111", "3165552222"], 100)]);
+        let c = p.visible()[0];
+        assert!(c.is_group());
+        let tid = c.thread_id;
+        let effects = p.m.send(tid, "hi all");
+        assert!(matches!(effects[..], [Effect::Reply { conversation_id: 20, .. }]));
+    }
+
+    #[test]
+    fn send_while_disconnected_only_explains() {
+        let mut p = Panel::new();
+        p.apply(&[tup(1, 10, &["111"], 100)]);
+        p.m.set_reachable(false);
+        assert_eq!(p.m.send(10, "x"), vec![Effect::Toast(TOAST_NOT_CONNECTED)]);
+    }
+
+    #[test]
+    fn draft_send_uses_an_existing_thread_or_starts_a_new_one() {
+        let mut p = Panel::new();
+        p.apply(&[tup(1, 10, &["+13165551212"], 100)]);
+        // Created before the thread loaded? Simulate with an unknown number first.
+        p.m.open_or_create("3165559999", "New Person");
+        let draft = p.m.active_thread().unwrap();
+        assert!(draft < 0);
+        let effects = p.m.send(draft, "hello");
+        assert_eq!(effects[0], Effect::SendNew { addresses: vec!["3165559999".into()], text: "hello".into() });
+        assert!(p.m.index.get(draft).is_none());
+        // A number we already have a 1:1 thread with opens that thread.
+        let effects = p.m.open_or_create("316-555-1212", "");
+        assert_eq!(effects.last(), Some(&Effect::ShowThread(10)));
+    }
+
+    #[test]
+    fn test_hidden_conversation_stays_hidden_until_newer_message() {
+        let mut p = Panel::new();
+        let now = 1_800_000_000_000;
+        p.apply(&[tup(1, 10, &["111"], now - 10_000)]);
+        let tid = p.visible()[0].thread_id;
+        let key = p.m.hide_locally(tid, &mut p.hidden, now);
+        p.m.purge(&key, &p.store);
+        assert!(p.visible().is_empty());
+        // The same (older) message must not resurrect it.
+        p.apply(&[tup(1, 10, &["111"], now - 10_000)]);
+        assert!(p.visible().is_empty());
+        // A newer one brings it back.
+        p.apply(&[tup(3, 10, &["111"], now + 60_000)]);
+        assert_eq!(p.visible().len(), 1);
+    }
+
+    #[test]
+    fn delete_hides_and_asks_the_phone_when_it_can() {
+        let mut p = Panel::new();
+        p.apply(&[tup(1, 10, &["111"], 100)]);
+        p.m.select(10, &p.store, 0.0);
+        let effects = p.m.delete(10, true, &p.store, &mut p.hidden, 1_000);
+        assert!(effects.contains(&Effect::DeleteOnPhone { thread_id: 10 }));
+        assert!(effects.contains(&Effect::ShowEmpty));
+        assert!(p.visible().is_empty());
+        assert!(p.store.load_conversations("dev1").is_empty());
+        let effects = {
+            p.apply(&[tup(5, 11, &["222"], 100)]);
+            p.m.delete(11, false, &p.store, &mut p.hidden, 1_000)
+        };
+        assert!(effects.contains(&Effect::Toast(TOAST_LOCAL_DELETE_ONLY)));
+    }
+
+    #[test]
+    fn test_cached_load_collapses_split_threads_after_restart() {
+        let mut p = Panel::new();
+        p.apply(&[tup(1, 10, &["+13165551212"], 100), tup(2, 20, &["3165551212"], 200)]);
+        let mut fresh = Messages::new();
+        fresh.reset_for_device(Some("dev1"), true);
+        fresh.load_cached(&p.store);
+        let v = fresh.visible(&p.hidden);
+        assert_eq!(v.len(), 1);
+        assert_eq!(uids(v[0]), HashSet::from([1, 2]));
+    }
+
+    // ── PanelCatchUpTests ───────────────────────────────────────────
+
+    fn catch_up_panel() -> Panel {
+        let mut p = Panel::new();
+        p.apply(&[tup(1, 10, &["111"], 100)]);
+        p.m.catch_up.cancel();
+        p
+    }
+
+    /// Like the phone after a sleep: the thread's newest message is already
+    /// known, and the gap fill brings in older ones.
+    fn paging_panel() -> Panel {
+        let mut p = catch_up_panel();
+        p.merge(tup(2, 10, &["111"], 10_000_000));
+        p.m.catch_up.cancel();
+        p
+    }
+
+    fn phone(thread_id: i64, older_than: Option<i64>) -> Action {
+        Action::RequestFromPhone { thread_id, count: GAP_FILL_MESSAGES, older_than }
+    }
+
+    #[test]
+    fn test_newer_message_on_known_thread_pulls_the_thread() {
+        let mut p = catch_up_panel();
+        p.merge(tup(3, 10, &["111"], 300));
+        assert_eq!(p.drain(), vec![phone(10, None)]);
+    }
+
+    #[test]
+    fn test_older_or_new_thread_messages_do_not_pull() {
+        let mut p = catch_up_panel();
+        p.merge(tup(0, 10, &["111"], 50));
+        p.merge(tup(2, 99, &["222"], 500));
+        assert!(p.drain().is_empty());
+    }
+
+    #[test]
+    fn test_loaded_thread_is_replayed_once() {
+        let mut p = catch_up_panel();
+        p.m.catch_up.queue_gap_fill(10, 0.0);
+        p.drain();
+        let mut acts = p.m.on_conversation_loaded(77, 1.0);
+        acts.extend(p.m.on_conversation_loaded(10, 1.0));
+        acts.extend(p.m.on_conversation_loaded(10, 1.0));
+        assert_eq!(acts, vec![Effect::Sync(Action::ReplayFromDaemon { thread_id: 10, start: 0, end: GAP_FILL_MESSAGES })]);
+    }
+
+    #[test]
+    fn test_pending_thread_is_not_asked_twice() {
+        let mut p = catch_up_panel();
+        p.m.catch_up.queue_gap_fill(10, 0.0);
+        let first = p.drain();
+        p.m.catch_up.queue_gap_fill(10, 1.0);
+        let second = p.drain();
+        assert_eq!((first.len(), second.len()), (1, 0));
+    }
+
+    #[test]
+    fn test_opening_a_thread_pulls_it_even_when_cached() {
+        let mut p = catch_up_panel();
+        for uid in 100..130 {
+            p.merge(tup(uid, 10, &["111"], uid));
+        }
+        p.m.catch_up.cancel();
+        p.m.select(10, &p.store, 0.0);
+        assert_eq!(p.drain(), vec![phone(10, None)]);
+    }
+
+    #[test]
+    fn test_catch_up_pulls_everything_and_the_open_thread() {
+        let mut p = catch_up_panel();
+        p.m.active = Some(10);
+        p.m.catch_up.catch_up(0.0, 0.0, 0.0);
+        assert_eq!(p.drain(), vec![Action::RequestAllThreads, phone(10, None)]);
+    }
+
+    #[test]
+    fn test_catch_up_bursts_collapse() {
+        let mut p = catch_up_panel();
+        p.m.catch_up.catch_up(0.0, 0.0, 0.0);
+        p.drain();
+        p.m.catch_up.catch_up(1.0, 3.0, sync::CATCH_UP_MIN_INTERVAL_SECONDS);
+        assert_eq!(p.m.catch_up.next_deadline(), None);
+        p.m.catch_up.catch_up(1.0, 3.0, 0.0);
+        assert!(p.m.catch_up.next_deadline().is_some());
+    }
+
+    fn fill_page(p: &mut Panel, uids: std::ops::Range<i64>, date0: i64) {
+        for (i, uid) in uids.enumerate() {
+            p.merge(tup(uid, 10, &["111"], date0 + i as i64));
+        }
+    }
+
+    #[test]
+    fn test_full_page_of_new_messages_pulls_the_next_older_page() {
+        let mut p = paging_panel();
+        p.m.catch_up.queue_gap_fill(10, 0.0);
+        p.drain();
+        p.m.on_conversation_loaded(10, 1.0);
+        fill_page(&mut p, 1000..1000 + GAP_FILL_MESSAGES, 5000);
+        assert_eq!(p.drain(), vec![phone(10, Some(5000))]);
+        let n = GAP_FILL_MESSAGES;
+        assert_eq!(
+            p.m.on_conversation_loaded(10, 10.0),
+            vec![Effect::Sync(Action::ReplayFromDaemon { thread_id: 10, start: n - 10, end: 2 * n })]
+        );
+    }
+
+    #[test]
+    fn test_page_that_reaches_known_messages_stops() {
+        let mut p = paging_panel();
+        p.m.catch_up.queue_gap_fill(10, 0.0);
+        p.drain();
+        p.m.on_conversation_loaded(10, 1.0);
+        fill_page(&mut p, 1000..1010, 5000);
+        assert!(p.drain().is_empty());
+        assert_eq!(p.m.catch_up.next_deadline(), None);
+    }
+
+    #[test]
+    fn test_paging_stops_at_the_page_limit() {
+        let mut p = paging_panel();
+        p.m.catch_up.queue_gap_fill(10, 0.0);
+        p.drain();
+        let mut now = 1.0;
+        let mut pages = 1;
+        loop {
+            p.m.on_conversation_loaded(10, now);
+            fill_page(&mut p, pages * 1000..pages * 1000 + GAP_FILL_MESSAGES, 1_000_000 - pages * 1000);
+            if p.drain().is_empty() {
+                break;
+            }
+            pages += 1;
+            now += 10.0;
+        }
+        assert_eq!(pages, GAP_FILL_MAX_PAGES as i64);
+    }
+
+    #[test]
+    fn test_catch_up_waits_for_the_phone() {
+        let mut p = catch_up_panel();
+        p.m.set_reachable(false);
+        p.m.catch_up.catch_up(0.0, 0.0, 0.0);
+        assert_eq!(p.m.catch_up.next_deadline(), None);
+    }
+}
