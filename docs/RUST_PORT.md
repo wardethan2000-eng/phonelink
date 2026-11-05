@@ -154,6 +154,17 @@ Live results (laptop, daemon 26.08, 2026-11-05):
   `direction="out"`; a subclass repeats `org.kde.kdeconnect.daemon` as a second
   `<interface>` block, which is merged; methods with default arguments appear
   once per overload.
+- `sendClipboard` exists only with no arguments; that form sends the
+  desktop's current clipboard. The Python's `sendClipboard(s)` therefore
+  fails on 26.08. The port will put the text on the local clipboard and then
+  call `sendClipboard()` (Phase 4). Every signal's arguments are now listed
+  correctly: `reachableChanged (b)`, `battery.refreshed (bi)`,
+  `attachmentReceived (ss)`, `localCacheSynchronized (as)`,
+  `callReceived (sss)`, and `notification*` / `shareReceived` `(s)`.
+- Compared with the Python store (opened read-only, counts only): 342 thread rows = 342
+  phone threads. For the 20 newest conversations, every thread under 100
+  messages has the same count in both (1, 3, 7, 13). Larger threads are capped
+  at 100 by the dump's replay; the store has the full history. Phase 2 is done.
 - 342 phone threads merge into 326 conversations (47 groups). The dump finds
   no self number (it does not read contacts).
 - Bug carried over from Python: threads with no addresses all get identity `""`
