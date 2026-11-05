@@ -145,22 +145,3 @@ class SimpleButton:
     def set_label(self, text):
         self.label = text
 
-
-class ThreadFillPendingTests(unittest.TestCase):
-    def test_messages_still_being_filled_in_do_not_rebuild(self):
-        from phonelink.ui import message_thread as mt
-        msg = lambda uid, date: SmsMessage(uid=uid, body="x", date=date, msg_type=1, thread_id=1)
-        shown, pending = [msg(10, 1000), msg(11, 2000)], [msg(5, 500), msg(6, 600)]
-        t = mt.MessageThread.__new__(mt.MessageThread)
-        t._thread_id = 1
-        t._rendered_uids = {10, 11}
-        t._fill_pending = list(pending)
-        t._last_rendered_date, t._window_first_date = 2000, 500
-        t._earlier_button = SimpleButton()
-        t._contact_label = t._address_label = SimpleButton()
-        t._stack = SimpleNamespace(get_visible_child_name=lambda: "thread")
-        t.rebuilt = 0
-        t.set_messages = lambda *a, **k: setattr(t, "rebuilt", t.rebuilt + 1)
-        t.append_message = lambda m: None
-        t.sync(pending + shown, "A", "1", 1)
-        self.assertEqual(t.rebuilt, 0)
