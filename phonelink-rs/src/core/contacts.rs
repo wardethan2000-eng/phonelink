@@ -189,12 +189,11 @@ pub fn store_contact_photo_in(
         return false;
     }
     let target = dir.join(format!("{norm}{}", photo_suffix(content_type)));
-    if target.is_file() {
-        if let Ok(existing) = fs::read(&target) {
-            if existing == image_bytes {
-                return false;
-            }
-        }
+    if target.is_file()
+        && let Ok(existing) = fs::read(&target)
+        && existing == image_bytes
+    {
+        return false;
     }
     for existing in photos_with_prefix(dir, &norm) {
         if existing != target {

@@ -136,12 +136,11 @@ impl MessageStore {
     }
 
     fn open_connection(path: &str) -> Result<Connection, Box<dyn Error>> {
-        if path != ":memory:" {
-            if let Some(parent) = Path::new(path).parent() {
-                if !parent.as_os_str().is_empty() {
-                    std::fs::create_dir_all(parent)?;
-                }
-            }
+        if path != ":memory:"
+            && let Some(parent) = Path::new(path).parent()
+            && !parent.as_os_str().is_empty()
+        {
+            std::fs::create_dir_all(parent)?;
         }
         let conn = Connection::open(path)?;
         // journal_mode returns a row, so read it rather than execute().
@@ -233,23 +232,22 @@ impl MessageStore {
     /// batches coalesce into the outermost one (depth counter, as in Python).
     pub fn batch<R>(&self, f: impl FnOnce(&Self) -> R) -> R {
         let depth = self.batch_depth.get();
-        if depth == 0 {
-            if let Some(conn) = self.conn.as_ref() {
-                if let Err(e) = conn.execute_batch("BEGIN") {
-                    log::warn!("store.batch begin failed: {e}");
-                }
-            }
+        if depth == 0
+            && let Some(conn) = self.conn.as_ref()
+            && let Err(e) = conn.execute_batch("BEGIN")
+        {
+            log::warn!("store.batch begin failed: {e}");
         }
         self.batch_depth.set(depth + 1);
         let out = f(self);
         let depth = self.batch_depth.get().saturating_sub(1);
         self.batch_depth.set(depth);
-        if depth == 0 {
-            if let Some(conn) = self.conn.as_ref() {
-                match conn.execute_batch("COMMIT") {
-                    Ok(()) => self.commits.set(self.commits.get() + 1),
-                    Err(e) => log::warn!("store.batch commit failed: {e}"),
-                }
+        if depth == 0
+            && let Some(conn) = self.conn.as_ref()
+        {
+            match conn.execute_batch("COMMIT") {
+                Ok(()) => self.commits.set(self.commits.get() + 1),
+                Err(e) => log::warn!("store.batch commit failed: {e}"),
             }
         }
         out

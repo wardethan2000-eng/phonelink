@@ -168,7 +168,7 @@ where
 
     let contact_key_set: HashSet<String> = contact_keys.iter().map(|k| last_ten(k)).collect();
     // Stable sort: equal counts keep first-appearance order.
-    multi.sort_by(|a, b| b.1.cmp(&a.1));
+    multi.sort_by_key(|m| std::cmp::Reverse(m.1));
     for (num, count) in multi.into_iter().take(top) {
         if count < min_appearances {
             break;
@@ -245,7 +245,7 @@ impl ConversationIndex {
     pub fn visible(&self, is_hidden: Option<&dyn Fn(&Conversation) -> bool>) -> Vec<&Conversation> {
         match is_hidden {
             None => self.conversations.values().collect(),
-            Some(hidden) => self.conversations.values().filter(|c| !hidden(*c)).collect(),
+            Some(hidden) => self.conversations.values().filter(|c| !hidden(c)).collect(),
         }
     }
 

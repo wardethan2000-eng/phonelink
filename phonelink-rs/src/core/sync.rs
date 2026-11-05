@@ -111,10 +111,10 @@ impl CatchUp {
         if !self.reachable || self.catch_up_at.is_some() {
             return;
         }
-        if let Some(last) = self.last_catch_up {
-            if now - last < min_interval {
-                return;
-            }
+        if let Some(last) = self.last_catch_up
+            && now - last < min_interval
+        {
+            return;
         }
         self.catch_up_at = Some(now + delay);
     }
@@ -125,10 +125,10 @@ impl CatchUp {
         if thread_id < 0 || self.queue.contains(&thread_id) {
             return;
         }
-        if let Some(&asked) = self.pending.get(&thread_id) {
-            if now - asked < GAP_FILL_TIMEOUT_SECONDS {
-                return;
-            }
+        if let Some(&asked) = self.pending.get(&thread_id)
+            && now - asked < GAP_FILL_TIMEOUT_SECONDS
+        {
+            return;
         }
         self.queue.push_back(thread_id);
         if self.next_drain_at.is_none() {

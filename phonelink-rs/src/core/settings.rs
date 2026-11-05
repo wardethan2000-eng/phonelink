@@ -25,8 +25,12 @@ use std::sync::atomic::{AtomicU64, Ordering};
 use serde::Serialize;
 use serde_json::{Map, Value};
 
-pub const APPLICATION_ID: &str = "dev.phonelink.app";
-pub const DESKTOP_FILENAME: &str = "dev.phonelink.app.desktop";
+/// GitHub-verified id, as Flathub requires (Ethan, 2026-11-05). The Python
+/// app used `dev.phonelink.app`; its autostart entry is cleaned up as legacy.
+pub const APPLICATION_ID: &str = "io.github.wardethan2000_eng.phonelink";
+pub const DESKTOP_FILENAME: &str = "io.github.wardethan2000_eng.phonelink.desktop";
+/// Autostart entries written by earlier versions; replaced by ours.
+pub const LEGACY_DESKTOP_FILENAMES: [&str; 2] = ["dev.phonelink.app.desktop", "phonelink.desktop"];
 
 pub const MESSAGE_FONT_SCALE_MIN: f64 = 0.8;
 pub const MESSAGE_FONT_SCALE_MAX: f64 = 3.0;
@@ -217,7 +221,7 @@ fn clamp_scale(x: f64) -> f64 {
 pub struct Settings {
     settings_file: PathBuf,
     autostart_file: PathBuf,
-    legacy_autostart_file: PathBuf,
+    legacy_autostart_files: Vec<PathBuf>,
 
     color_scheme: String,
     open_on_startup: bool,
@@ -250,7 +254,7 @@ impl Settings {
     pub fn with_paths(settings_file: PathBuf, autostart_dir: PathBuf) -> Self {
         let mut s = Self {
             autostart_file: autostart_dir.join(DESKTOP_FILENAME),
-            legacy_autostart_file: autostart_dir.join("phonelink.desktop"),
+            legacy_autostart_files: LEGACY_DESKTOP_FILENAMES.iter().map(|n| autostart_dir.join(n)).collect(),
             settings_file,
             color_scheme: "system".to_string(),
             open_on_startup: false,
@@ -561,20 +565,26 @@ impl Settings {
         }
     }
 
+    fn remove_legacy_autostart(&self) -> io::Result<()> {
+        for f in &self.legacy_autostart_files {
+            Self::remove_ignoring_missing(f)?;
+        }
+        Ok(())
+    }
+
     fn apply_autostart(&self, enable: bool, exec: &str) -> io::Result<()> {
         if enable {
             atomic_write_text(&self.autostart_file, &desktop_entry_text(exec))?;
-            Self::remove_ignoring_missing(&self.legacy_autostart_file)
         } else {
             Self::remove_ignoring_missing(&self.autostart_file)?;
-            Self::remove_ignoring_missing(&self.legacy_autostart_file)
         }
+        self.remove_legacy_autostart()
     }
 
     /// Sync the in-memory state with whether the autostart file exists, and
     /// rewrite a stale entry (e.g. one pointing at the Python launcher).
     pub fn sync_autostart_state(&mut self, exec: &str) -> io::Result<()> {
-        let exists = self.autostart_file.exists() || self.legacy_autostart_file.exists();
+        let exists = self.autostart_file.exists() || self.legacy_autostart_files.iter().any(|f| f.exists());
         if exists != self.open_on_startup {
             self.open_on_startup = exists;
             self.save()?;
@@ -585,9 +595,7 @@ impl Settings {
             if current != desired {
                 atomic_write_text(&self.autostart_file, &desired)?;
             }
-            if self.legacy_autostart_file.exists() {
-                Self::remove_ignoring_missing(&self.legacy_autostart_file)?;
-            }
+            self.remove_legacy_autostart()?;
         }
         Ok(())
     }
@@ -758,5 +766,19 @@ mod tests {
         assert_eq!(v["future_key"], serde_json::json!({"a": [1]}));
         assert!(v.get("notifications_transport").is_none());
         assert_eq!(v["color_scheme"], "dark");
+    }
+
+    #[test]
+    fn python_autostart_entry_is_replaced_by_ours() {
+        let f = fixture();
+        let dir = f._dir.path().join("autostart");
+        fs::create_dir_all(&dir).unwrap();
+        fs::write(dir.join("dev.phonelink.app.desktop"), "[Desktop Entry]\nExec=python3 run.py\n").unwrap();
+        let mut s = Settings::with_paths(f.path.clone(), dir.clone());
+        s.sync_autostart_state("/opt/phonelink-rs").unwrap();
+        assert!(s.open_on_startup());
+        assert!(!dir.join("dev.phonelink.app.desktop").exists());
+        let entry = fs::read_to_string(dir.join(DESKTOP_FILENAME)).unwrap();
+        assert!(entry.contains("Exec=/opt/phonelink-rs"));
     }
 }

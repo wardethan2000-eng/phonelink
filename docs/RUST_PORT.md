@@ -140,7 +140,11 @@ are handled quietly.
 0. This note. 1. Core with ported tests. 2. D-Bus client + read-only
 `phonelink-rs --dump`. 3. Messages tab. 4. Notifications, clipboard,
 header/battery, ring, share. 5. Files tab. 6. Tray, settings, autostart,
-Google Contacts. 7. Side-by-side on the laptop, measure, switch autostart.
+Google Contacts. 7. Side-by-side on the laptop, measure, switch autostart. The two apps now
+   have different app ids, so GApplication no longer stops both running at once.
+   At startup the Rust app checks whether the session-bus name `dev.phonelink.app`
+   is owned (the Python app is running). If it is, it says so and exits, because
+   both would write the same store.
 8. Flatpak (issue #2; also the fix for #6). See below.
 
 ## Public commitments
@@ -178,12 +182,12 @@ go away.
   Open file/URL goes through OpenURI, and file choosing through FileChooser
   (`Gtk.FileDialog` already uses it). Google sign-in needs `--share=network`
   and opens the browser through OpenURI.
-- **App id (decision for Ethan):** Flathub requires an id tied to a domain or
-  code host you control. `dev.phonelink.app` would need the `phonelink.app`
-  domain. The GitHub-verified option is
-  `io.github.wardethan2000_eng.phonelink`. Changing the id changes the
-  single-instance name and the autostart entry, so decide before the first
-  public release.
+- **App id: `io.github.wardethan2000_eng.phonelink`** (decided 2026-11-05).
+  Flathub verifies it from the GitHub account, with no domain needed. The Rust app uses
+  it from day one (`core::settings::APPLICATION_ID`). The desktop file,
+  icons and metainfo are named after it. The Python app keeps
+  `dev.phonelink.app`. On first run the Rust app replaces the Python
+  autostart entry (`dev.phonelink.app.desktop`) with its own.
 - **Ship:** Flathub submission (manifest, metainfo with screenshots, OARS
   rating, desktop file, icons). A `.flatpak` bundle on GitHub releases in the
   meantime.
