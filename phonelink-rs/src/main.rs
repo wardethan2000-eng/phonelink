@@ -1,4 +1,22 @@
-fn main() {
+mod dump;
+
+use std::process::ExitCode;
+
+const USAGE: &str = "usage: phonelink-rs --dump [--dump-signatures]
+  --dump             read-only check against the running KDE Connect daemon:
+                     devices, battery, conversation and message counts
+  --dump-signatures  also the daemon's D-Bus surface and the type signature
+                     of each reply and signal (implies --dump)";
+
+fn main() -> ExitCode {
     env_logger::init();
-    eprintln!("phonelink-rs: core only so far (Phase 1); no UI yet");
+    let args: Vec<String> = std::env::args().skip(1).collect();
+    let signatures = args.iter().any(|a| a == "--dump-signatures");
+    let dump = signatures || args.iter().any(|a| a == "--dump");
+    if !dump || args.iter().any(|a| !a.starts_with("--dump")) {
+        eprintln!("{USAGE}");
+        return ExitCode::from(2);
+    }
+    let code = glib::MainContext::default().block_on(dump::run(signatures));
+    ExitCode::from(code as u8)
 }

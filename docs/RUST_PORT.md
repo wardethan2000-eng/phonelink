@@ -126,7 +126,7 @@ are handled quietly.
 |---|---|---|
 | 8 | `pip install .` fails (flat-layout auto-discovery; deprecated license table). Closed by the reporter, **not fixed** | Won't fix in Python (Ethan, 2026-11-05): the Rust app replaces it, and Python packaging goes with it. When the Rust app is public, tell the reporter (they were packaging it for Fedora); a Rust binary plus the Flatpak (#2) are the install routes |
 | 6 | Linux Mint 21.1: the window shows only controls, which do nothing | Likely cause, unverified: Mint 21 ships GTK 4.6 / Adw 1.1, and the app uses Adw 1.4 widgets (`OverlaySplitView`, `SwitchRow`). Rust app: check versions at startup and show a clear message; the Flatpak (#2) removes the dependency on distro versions. Ask the reporter for terminal output |
-| 2 | Distribute as a Flatpak | Becomes the main install route for the Rust app, on the GNOME runtime with `--talk-name=org.kde.kdeconnect` and access to the sftp mount. KDE Connect stays on the host. Comes after cutover |
+| 2 | Distribute as a Flatpak | **On hold (Ethan undecided).** If done, becomes the main install route for the Rust app, on the GNOME runtime with `--talk-name=org.kde.kdeconnect` and access to the sftp mount. KDE Connect stays on the host. Comes after cutover |
 | 1 | Use the phone as a desktop camera (reporter offers to help) | KDE Connect has no camera plugin. A feasible route is scrcpy's camera source plus v4l2loopback, which needs adb. A new feature, after the port; Ethan decides |
 
 ## Deferred / out of scope
@@ -145,16 +145,20 @@ Google Contacts. 7. Side-by-side on the laptop, measure, switch autostart. The t
    At startup the Rust app checks whether the session-bus name `dev.phonelink.app`
    is owned (the Python app is running). If it is, it says so and exits, because
    both would write the same store.
-8. Flatpak (issue #2; also the fix for #6). See below.
+8. Flatpak: **on hold** (Ethan, 2026-11-05: not sure he wants it). See below.
 
 ## Public commitments
 Things said in public that the project owes people. Close each one out when
 it is done.
 | Where | Said (date) | Owed |
 |---|---|---|
-| Issue #8 | 2026-11-05: rewriting in Rust; single binary, Flatpak planned; "I'll post here when it's ready" | A comment on #8 when the Rust app has a release (binary or Flatpak), with install steps, inviting the reporter to package it for Fedora |
+| Issue #8 | 2026-11-05: rewriting in Rust; single binary, Flatpak planned; "I'll post here when it's ready" | A comment on #8 when the Rust app has a release, with install steps, inviting the reporter to package it for Fedora. The 2026-11-05 comment said a Flatpak was planned. While it is on hold, don't repeat that, and correct it in the follow-up if it's still undecided |
 
-## Phase 8: Flatpak
+## Phase 8: Flatpak (ON HOLD)
+On hold since 2026-11-05: Ethan hasn't decided whether to ship a Flatpak. Don't
+start this work, and don't promise it in public, until he says so. The notes
+below are kept for if he does.
+
 Goal: one install that works on any distro with KDE Connect, whatever GTK and
 libadwaita the distro ships. That closes #2 and makes #6 (Mint 21 too old)
 go away.
