@@ -48,12 +48,21 @@ fn python_app_running() -> bool {
     .is_some_and(|(b,)| b)
 }
 
+const EXTRA_CSS: &str = "
+.message-image { border-radius: 18px; background-color: alpha(currentColor, 0.06); }
+.message-file-chip { padding: 6px 4px; }
+";
+
 fn load_css() {
     let provider = gtk::CssProvider::new();
     // The same stylesheet as the Python app, so both look identical.
     provider.load_from_data(include_str!("../../../phonelink/style.css"));
+    // Rust-only additions (pictures shown on their own, file chips).
+    let extra = gtk::CssProvider::new();
+    extra.load_from_data(EXTRA_CSS);
     if let Some(display) = gtk::gdk::Display::default() {
         gtk::style_context_add_provider_for_display(&display, &provider, gtk::STYLE_PROVIDER_PRIORITY_APPLICATION);
+        gtk::style_context_add_provider_for_display(&display, &extra, gtk::STYLE_PROVIDER_PRIORITY_APPLICATION);
     }
 }
 

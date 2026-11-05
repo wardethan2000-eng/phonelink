@@ -118,6 +118,13 @@ tree that has no `gtk` imports, so `cargo test` for core needs no display.
   shows its time. The send-route label stays visible on texts sent from the
   app. The Python showed "Received Tuesday 11:09 AM" under almost every
   bubble, plus a full date header.
+- 2026-11-05, pictures and files: a picture shows as itself, outside the
+  bubble and above any text, with rounded corners. It is the full-size file
+  (fetched automatically from the phone, once per picture per session), not
+  the small inline preview. There is no file-name row or buttons under it.
+  Hover shows Copy / Save / Open, right-click has the same, and a click opens
+  it. Other files are a compact chip inside the bubble: click opens (or
+  downloads), right-click has Open / Save as… (or Download from phone).
 
 ## Behavior that must carry over
 The handoff's eleven rules (hidden texts, catch-up + gap fill, signal

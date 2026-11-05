@@ -32,6 +32,10 @@ const DEVICE_XML: &str = r#"<node>
 <interface name="org.kde.kdeconnect.device.conversations">
   <method name="activeConversations"><arg type="av" direction="out"/></method>
   <method name="requestAllConversationThreads"/>
+  <method name="requestAttachmentFile">
+    <arg type="x" direction="in"/><arg type="s" direction="in"/>
+  </method>
+  <signal name="attachmentReceived"><arg type="s"/><arg type="s"/></signal>
   <method name="requestConversation">
     <arg type="x" direction="in"/><arg type="i" direction="in"/><arg type="i" direction="in"/>
   </method>
@@ -82,6 +86,20 @@ fn thumbnail_png() -> String {
     pb.fill(0xe5_a5_0a_ff); // amber, so it stands out from the sent-bubble color
     let bytes = pb.save_to_bufferv("png", &[]).unwrap();
     glib::base64_encode(&bytes).to_string()
+}
+
+/// The "full" photo: 1200×900, a different color from the thumbnail so the
+/// swap is visible. Written under $HOME/demo-downloads.
+fn full_picture(name: &str) -> std::path::PathBuf {
+    let dir = phonelink_rs::core::settings::home_dir().join("demo-downloads");
+    std::fs::create_dir_all(&dir).unwrap();
+    let file = dir.join(name);
+    let pb = gtk::gdk_pixbuf::Pixbuf::new(gtk::gdk_pixbuf::Colorspace::Rgb, false, 8, 1200, 900).unwrap();
+    pb.fill(0x26_a2_69_ff); // green
+    // A lighter band so it reads as a picture, not a block of color.
+    pb.new_subpixbuf(0, 600, 1200, 300).fill(0x8f_f0_a4_ff);
+    pb.savev(&file, "png", &[]).unwrap();
+    file
 }
 
 fn now_ms() -> i64 {
@@ -197,6 +215,17 @@ fn main() {
                     }
                     let loaded = (thread, msgs.len() as u64).to_variant();
                     conn.emit_signal(None, path, iface.unwrap(), "conversationLoaded", Some(&loaded)).unwrap();
+                }
+                "requestAttachmentFile" => {
+                    // The phone "sends" the full picture a moment later.
+                    let (_part, uid) = params.get::<(i64, String)>().unwrap();
+                    inv.return_value(None);
+                    let (conn, path, iface) = (conn.clone(), path.to_string(), iface.unwrap().to_string());
+                    glib::timeout_add_local_once(std::time::Duration::from_millis(800), move || {
+                        let file = full_picture(&uid);
+                        let p = (file.to_string_lossy().into_owned(), uid).to_variant();
+                        conn.emit_signal(None, &path, &iface, "attachmentReceived", Some(&p)).unwrap();
+                    });
                 }
                 _ => inv.return_value(None),
             })

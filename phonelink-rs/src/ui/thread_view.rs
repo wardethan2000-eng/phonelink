@@ -25,6 +25,7 @@ use gtk::prelude::*;
 use gtk::{gdk, gio, glib, pango};
 use regex::Regex;
 
+use crate::core::attachments::{existing_full_in, full_cache_dir, image_ext, is_image, sanitize_name};
 use crate::core::messages::SendRoute;
 use crate::core::models::{Attachment, Conversation, SmsMessage};
 
@@ -76,55 +77,11 @@ fn image_display(width: i32, height: i32, can_fetch_full: bool) -> (i32, i32, bo
     (w, h, !is_full && can_fetch_full)
 }
 
-fn attachment_ext(mime_type: &str) -> &'static str {
-    match mime_type.split(';').next().unwrap_or("").trim().to_ascii_lowercase().as_str() {
-        "image/jpeg" | "image/jpg" => ".jpg",
-        "image/png" => ".png",
-        "image/gif" => ".gif",
-        "image/webp" => ".webp",
-        "image/heic" => ".heic",
-        "image/heif" => ".heif",
-        _ => "",
-    }
-}
-
-/// Python `_sanitize_name`: alphanumerics, `-_.`; others become `_`.
-pub fn sanitize_name(text: &str) -> String {
-    let cleaned: String =
-        text.chars().map(|c| if c.is_alphanumeric() || matches!(c, '-' | '_' | '.') { c } else { '_' }).collect();
-    let trimmed = cleaned.trim_matches(|c| c == '.' || c == '_');
-    if trimmed.is_empty() { "attachment".into() } else { trimmed.to_string() }
-}
-
 fn attachment_name(att: &Attachment) -> String {
     let base = if att.file_name.is_empty() { "attachment" } else { &att.file_name };
     let name = sanitize_name(base);
-    let ext = attachment_ext(&att.mime_type);
+    let ext = image_ext(&att.mime_type);
     if ext.is_empty() || name.to_lowercase().ends_with(ext) { name } else { format!("{name}{ext}") }
-}
-
-/// `~/.cache/phonelink/attachments_full/<uid><ext>` (same as Python).
-pub fn full_attachment_cache_path(att: &Attachment) -> Option<PathBuf> {
-    let uid = if att.unique_identifier.trim().is_empty() {
-        if att.part_id == 0 { String::new() } else { att.part_id.to_string() }
-    } else {
-        att.unique_identifier.trim().to_string()
-    };
-    if uid.is_empty() {
-        return None;
-    }
-    let dir = glib::user_cache_dir().join("phonelink").join("attachments_full");
-    Some(dir.join(format!("{}{}", sanitize_name(&uid), attachment_ext(&att.mime_type))))
-}
-
-/// The full-resolution file, if we already have it.
-pub fn existing_full_attachment(att: &Attachment) -> Option<PathBuf> {
-    if let Some(p) = att.extra.get("fullPath").and_then(|v| v.as_str()).map(PathBuf::from)
-        && p.is_file()
-    {
-        return Some(p);
-    }
-    full_attachment_cache_path(att).filter(|p| p.is_file())
 }
 
 /// The inline file: a `file://` URI, a path, or base64 data written to
@@ -148,7 +105,7 @@ fn attachment_local_path(att: &Attachment) -> Option<PathBuf> {
         att.unique_identifier.clone()
     };
     let digest = glib::compute_checksum_for_string(glib::ChecksumType::Sha1, payload)?;
-    let target = dir.join(format!("{}-{}{}", sanitize_name(&uid), &digest[..12], attachment_ext(&att.mime_type)));
+    let target = dir.join(format!("{}-{}{}", sanitize_name(&uid), &digest[..12], image_ext(&att.mime_type)));
     if target.is_file() {
         return Some(target);
     }
@@ -321,7 +278,6 @@ impl Bubble {
         frame.set_margin_start(12);
         frame.set_margin_end(12);
         frame.add_css_class(if sent { "message-bubble-sent" } else { "message-bubble-received" });
-        widget.append(&frame);
 
         let (markup, has_links) = message_markup(&msg.body);
         let body = gtk::Label::new(None);
@@ -340,8 +296,16 @@ impl Bubble {
         if !msg.body.is_empty() {
             frame.append(&body);
         }
+        // Pictures show as themselves, above the text; other files are a
+        // chip inside the bubble.
         for att in &msg.attachments {
-            append_attachment(&frame, att, actions);
+            match image_widget(att, sent, actions) {
+                Some(w) => widget.append(&w),
+                None => frame.append(&file_chip(att, actions)),
+            }
+        }
+        if frame.first_child().is_some() {
+            widget.append(&frame);
         }
 
         let revealer = gtk::Revealer::new();
@@ -402,149 +366,245 @@ fn open_file(path: &Path) {
     }
 }
 
-fn append_attachment(frame: &gtk::Box, att: &Attachment, actions: &BubbleActions) {
-    let is_image = att.mime_type.starts_with("image");
-    let file_name = attachment_name(att);
-    let local = attachment_local_path(att);
-    let can_fetch_full = att.part_id != 0;
-    let full = if is_image { existing_full_attachment(att) } else { None };
-    let best = full.or(local);
+/// What a picture or file can do. Offered on hover (pictures), right-click,
+/// and click (open).
+#[derive(Clone, Copy)]
+enum FileAction {
+    Open,
+    CopyImage,
+    Save,
+    Download,
+}
 
-    if is_image && let Some(path) = best.clone() {
-        let picture = gtk::Picture::new();
-        picture.set_can_shrink(true);
-        picture.set_content_fit(gtk::ContentFit::Contain);
-        picture.set_halign(gtk::Align::Start);
-        picture.set_hexpand(false);
-        picture.add_css_class("message-attachment-image");
-        picture.set_cursor_from_name(Some("pointer"));
-        let awaiting = Rc::new(Cell::new(can_fetch_full));
+fn run_action(action: FileAction, widget: &gtk::Widget, path: Option<&Path>, att: &Attachment, actions: &BubbleActions) {
+    let name = attachment_name(att);
+    match (action, path) {
+        (FileAction::Open, Some(p)) => open_file(p),
+        (FileAction::CopyImage, Some(p)) => match gdk::Texture::from_filename(p) {
+            Ok(tex) => widget.clipboard().set_texture(&tex),
+            Err(e) => log::warn!("copy image: {e}"),
+        },
+        (FileAction::Save, Some(p)) => save_as(widget, p, &name),
+        (FileAction::Download, _) | (_, None) => (actions.download)(att.part_id, att.unique_identifier.clone(), name),
+    }
+}
 
-        let click = gtk::GestureClick::new();
-        {
-            let (awaiting, path, dl) = (awaiting.clone(), path.clone(), actions.download.clone());
-            let (pid, uid, name) = (att.part_id, att.unique_identifier.clone(), file_name.clone());
-            click.connect_released(move |_, _, _, _| {
-                if awaiting.get() {
-                    dl(pid, uid.clone(), name.clone()); // manual retry
-                } else {
-                    open_file(&path);
+/// A right-click menu at the pointer.
+fn context_menu(anchor: &gtk::Widget, x: f64, y: f64, items: &[(&'static str, FileAction)], run: Rc<dyn Fn(FileAction)>) {
+    let popover = gtk::Popover::new();
+    popover.set_has_arrow(false);
+    popover.set_parent(anchor);
+    popover.set_pointing_to(Some(&gdk::Rectangle::new(x as i32, y as i32, 1, 1)));
+    let menu = gtk::Box::new(gtk::Orientation::Vertical, 2);
+    for &(label, action) in items {
+        let b = gtk::Button::with_label(label);
+        b.add_css_class("flat");
+        if let Some(l) = b.child().and_downcast::<gtk::Label>() {
+            l.set_xalign(0.0);
+        }
+        let (run, pop) = (run.clone(), popover.clone());
+        b.connect_clicked(move |_| {
+            pop.popdown();
+            run(action);
+        });
+        menu.append(&b);
+    }
+    popover.set_child(Some(&menu));
+    // A popover must be unparented before its anchor goes away.
+    popover.connect_closed(|p| {
+        let p = p.clone();
+        glib::idle_add_local_once(move || p.unparent());
+    });
+    popover.popup();
+}
+
+/// An inline picture, shown full width of its own (no bubble, no buttons
+/// underneath). Hover shows Copy / Save / Open; right-click has the same;
+/// click opens it. While only the phone's small preview is here, the full
+/// file has been asked for and the picture redraws when it arrives.
+fn image_widget(att: &Attachment, sent: bool, actions: &BubbleActions) -> Option<gtk::Widget> {
+    if !is_image(att) {
+        return None;
+    }
+    let full = existing_full_in(&full_cache_dir(), att);
+    let have_full = full.is_some();
+    let path = full.or_else(|| attachment_local_path(att))?;
+    let can_fetch_full = att.part_id != 0 && !have_full;
+
+    let overlay = gtk::Overlay::new();
+    overlay.set_halign(if sent { gtk::Align::End } else { gtk::Align::Start });
+    overlay.set_margin_start(12);
+    overlay.set_margin_end(12);
+    overlay.set_margin_top(2);
+    overlay.set_margin_bottom(2);
+    let picture = gtk::Picture::new();
+    picture.set_can_shrink(true);
+    picture.set_content_fit(gtk::ContentFit::Cover);
+    picture.set_overflow(gtk::Overflow::Hidden);
+    picture.add_css_class("message-image");
+    picture.set_cursor_from_name(Some("pointer"));
+    overlay.set_child(Some(&picture));
+
+    let run: Rc<dyn Fn(FileAction)> = {
+        let (w, p, a, acts) = (overlay.clone().upcast::<gtk::Widget>(), path.clone(), att.clone(), actions.clone());
+        Rc::new(move |action| run_action(action, &w, Some(&p), &a, &acts))
+    };
+
+    // Hover buttons, top right.
+    let buttons = gtk::Box::new(gtk::Orientation::Horizontal, 4);
+    buttons.set_halign(gtk::Align::End);
+    buttons.set_valign(gtk::Align::Start);
+    buttons.set_margin_top(6);
+    buttons.set_margin_end(6);
+    buttons.set_visible(false);
+    for (icon, tip, action) in [
+        ("edit-copy-symbolic", "Copy image", FileAction::CopyImage),
+        ("document-save-symbolic", "Save image…", FileAction::Save),
+        ("view-fullscreen-symbolic", "Open", FileAction::Open),
+    ] {
+        let b = gtk::Button::from_icon_name(icon);
+        b.set_tooltip_text(Some(tip));
+        b.add_css_class("osd");
+        b.add_css_class("circular");
+        let run = run.clone();
+        b.connect_clicked(move |_| run(action));
+        buttons.append(&b);
+    }
+    overlay.add_overlay(&buttons);
+    let motion = gtk::EventControllerMotion::new();
+    {
+        let (show, hide) = (buttons.clone(), buttons.clone());
+        motion.connect_enter(move |_, _, _| show.set_visible(true));
+        motion.connect_leave(move |_| hide.set_visible(false));
+    }
+    overlay.add_controller(motion);
+
+    let left = gtk::GestureClick::new();
+    left.set_button(gdk::BUTTON_PRIMARY);
+    {
+        let run = run.clone();
+        left.connect_released(move |_, _, _, _| run(FileAction::Open));
+    }
+    picture.add_controller(left);
+    let right = gtk::GestureClick::new();
+    right.set_button(gdk::BUTTON_SECONDARY);
+    {
+        let (run, anchor) = (run.clone(), overlay.clone().upcast::<gtk::Widget>());
+        right.connect_pressed(move |g, _, x, y| {
+            g.set_state(gtk::EventSequenceState::Claimed);
+            context_menu(
+                &anchor,
+                x,
+                y,
+                &[("Open", FileAction::Open), ("Copy image", FileAction::CopyImage), ("Save image…", FileAction::Save)],
+                run.clone(),
+            );
+        });
+    }
+    overlay.add_controller(right);
+
+    let apply_size = {
+        let picture = picture.clone();
+        move |measured: Option<(i32, i32)>| {
+            let (w, h) = measured.unwrap_or((FULL_IMAGE_MAX_W as i32, FULL_IMAGE_MAX_H as i32));
+            let (dw, dh, waiting) = image_display(w, h, can_fetch_full);
+            picture.set_size_request(dw, dh);
+            if waiting {
+                picture.add_css_class("message-attachment-loading");
+                picture.set_tooltip_text(Some("Loading the full picture…"));
+            } else {
+                picture.remove_css_class("message-attachment-loading");
+                picture.set_tooltip_text(None);
+            }
+        }
+    };
+    let key = image_key(&path);
+    let (known, texture) = IMAGES.with_borrow_mut(|c| (c.sizes.get(&key).copied(), c.texture(&key)));
+    match known {
+        Some(measured) => apply_size(measured),
+        None => picture.set_size_request(THUMB_IMAGE_MAX_W as i32, THUMB_IMAGE_MAX_H as i32),
+    }
+    match texture {
+        Some(tex) => picture.set_paintable(Some(&tex)),
+        None => {
+            let picture = picture.clone();
+            glib::spawn_future_local(async move {
+                let p = path.clone();
+                let Ok(decoded) = gio::spawn_blocking(move || decode(&p, can_fetch_full)).await else { return };
+                IMAGES.with_borrow_mut(|c| c.sizes.insert(key.clone(), decoded.measured));
+                apply_size(decoded.measured);
+                if let Some((bytes, w, h, stride, alpha)) = decoded.pixels {
+                    let format = if alpha { gdk::MemoryFormat::R8g8b8a8 } else { gdk::MemoryFormat::R8g8b8 };
+                    let tex: gdk::Texture = gdk::MemoryTexture::new(w, h, format, &bytes, stride).upcast();
+                    IMAGES.with_borrow_mut(|c| c.remember(key, tex.clone()));
+                    picture.set_paintable(Some(&tex));
                 }
             });
         }
-        picture.add_controller(click);
-
-        let apply_size = {
-            let (picture, awaiting) = (picture.clone(), awaiting.clone());
-            move |measured: Option<(i32, i32)>| {
-                let (w, h) = measured.unwrap_or((FULL_IMAGE_MAX_W as i32, FULL_IMAGE_MAX_H as i32));
-                let (dw, dh, wait) = image_display(w, h, can_fetch_full);
-                let wait = (measured.is_none() && can_fetch_full) || wait;
-                awaiting.set(wait);
-                picture.set_size_request(dw, dh);
-                if wait {
-                    picture.add_css_class("message-attachment-loading");
-                    picture.set_tooltip_text(Some("Loading full image…"));
-                } else {
-                    picture.remove_css_class("message-attachment-loading");
-                    picture.set_tooltip_text(Some("Click to open image"));
-                }
-            }
-        };
-
-        let key = image_key(&path);
-        let (known, texture) = IMAGES.with_borrow_mut(|c| (c.sizes.get(&key).copied(), c.texture(&key)));
-        match known {
-            Some(measured) => apply_size(measured),
-            None => picture.set_size_request(THUMB_IMAGE_MAX_W as i32, THUMB_IMAGE_MAX_H as i32),
-        }
-        match texture {
-            Some(tex) => picture.set_paintable(Some(&tex)),
-            None => {
-                let picture = picture.clone();
-                glib::spawn_future_local(async move {
-                    let p = path.clone();
-                    let Ok(decoded) = gio::spawn_blocking(move || decode(&p, can_fetch_full)).await else { return };
-                    IMAGES.with_borrow_mut(|c| c.sizes.insert(key.clone(), decoded.measured));
-                    apply_size(decoded.measured);
-                    if let Some((bytes, w, h, stride, alpha)) = decoded.pixels {
-                        let format = if alpha { gdk::MemoryFormat::R8g8b8a8 } else { gdk::MemoryFormat::R8g8b8 };
-                        let tex: gdk::Texture = gdk::MemoryTexture::new(w, h, format, &bytes, stride).upcast();
-                        IMAGES.with_borrow_mut(|c| c.remember(key, tex.clone()));
-                        picture.set_paintable(Some(&tex));
-                    }
-                });
-            }
-        }
-        frame.append(&picture);
     }
-
-    let row = gtk::Box::new(gtk::Orientation::Horizontal, 6);
-    row.add_css_class("message-attachment-row");
-    let icon = gtk::Image::from_icon_name(if is_image { "image-x-generic-symbolic" } else { "mail-attachment-symbolic" });
-    icon.set_pixel_size(14);
-    row.append(&icon);
-    let label = gtk::Label::new(Some(&file_name));
-    label.add_css_class("caption");
-    label.set_hexpand(true);
-    label.set_halign(gtk::Align::Start);
-    label.set_ellipsize(pango::EllipsizeMode::End);
-    row.append(&label);
-
-    match best {
-        Some(path) => {
-            if is_image {
-                let copy = gtk::Button::with_label("Copy");
-                copy.add_css_class("flat");
-                let p = path.clone();
-                copy.connect_clicked(move |btn| {
-                    if let Ok(tex) = gdk::Texture::from_filename(&p) {
-                        btn.clipboard().set_texture(&tex);
-                    }
-                });
-                row.append(&copy);
-            }
-            let open = gtk::Button::with_label("Open");
-            open.add_css_class("flat");
-            let p = path.clone();
-            open.connect_clicked(move |_| open_file(&p));
-            row.append(&open);
-            let save = gtk::Button::with_label("Save");
-            save.add_css_class("flat");
-            let name = file_name.clone();
-            save.connect_clicked(move |btn| save_attachment(btn, &path, &name));
-            row.append(&save);
-        }
-        None if att.part_id != 0 => {
-            let dl = gtk::Button::with_label("Download");
-            dl.add_css_class("flat");
-            let (f, pid, uid, name) = (actions.download.clone(), att.part_id, att.unique_identifier.clone(), file_name);
-            dl.connect_clicked(move |_| f(pid, uid.clone(), name.clone()));
-            row.append(&dl);
-        }
-        None => {}
-    }
-    frame.append(&row);
+    Some(overlay.upcast())
 }
 
-/// Pick a folder, copy the file in, numbering it if the name is taken.
-fn save_attachment(btn: &gtk::Button, path: &Path, file_name: &str) {
+/// Any other file (or a picture we have no data for): a chip in the bubble.
+/// Click opens it (or asks the phone for it); right-click has Open / Save.
+fn file_chip(att: &Attachment, actions: &BubbleActions) -> gtk::Widget {
+    let path = if is_image(att) { existing_full_in(&full_cache_dir(), att) } else { None }
+        .or_else(|| attachment_local_path(att));
+    let row = gtk::Box::new(gtk::Orientation::Horizontal, 8);
+    row.add_css_class("message-file-chip");
+    row.set_cursor_from_name(Some("pointer"));
+    let icon = gtk::Image::from_icon_name(if is_image(att) { "image-x-generic-symbolic" } else { "mail-attachment-symbolic" });
+    icon.set_pixel_size(16);
+    row.append(&icon);
+    let label = gtk::Label::new(Some(&attachment_name(att)));
+    label.set_ellipsize(pango::EllipsizeMode::Middle);
+    label.set_max_width_chars(32);
+    label.set_halign(gtk::Align::Start);
+    row.append(&label);
+    if path.is_none() && att.part_id != 0 {
+        let hint = gtk::Label::new(Some("Click to download"));
+        hint.add_css_class("caption");
+        hint.add_css_class("dim-label");
+        row.append(&hint);
+    }
+    let run: Rc<dyn Fn(FileAction)> = {
+        let (w, p, a, acts) = (row.clone().upcast::<gtk::Widget>(), path.clone(), att.clone(), actions.clone());
+        Rc::new(move |action| run_action(action, &w, p.as_deref(), &a, &acts))
+    };
+    let left = gtk::GestureClick::new();
+    left.set_button(gdk::BUTTON_PRIMARY);
+    {
+        let (run, local) = (run.clone(), path.is_some());
+        left.connect_released(move |_, _, _, _| run(if local { FileAction::Open } else { FileAction::Download }));
+    }
+    row.add_controller(left);
+    let right = gtk::GestureClick::new();
+    right.set_button(gdk::BUTTON_SECONDARY);
+    {
+        let (run, anchor, local) = (run.clone(), row.clone().upcast::<gtk::Widget>(), path.is_some());
+        right.connect_pressed(move |g, _, x, y| {
+            g.set_state(gtk::EventSequenceState::Claimed);
+            let items: &[(&'static str, FileAction)] = if local {
+                &[("Open", FileAction::Open), ("Save as…", FileAction::Save)]
+            } else {
+                &[("Download from phone", FileAction::Download)]
+            };
+            context_menu(&anchor, x, y, items, run.clone());
+        });
+    }
+    row.add_controller(right);
+    row.upcast()
+}
+
+/// "Save as" with the attachment's name filled in.
+fn save_as(widget: &gtk::Widget, path: &Path, file_name: &str) {
     let dialog = gtk::FileDialog::new();
-    dialog.set_title("Save Attachment");
-    let root = btn.root().and_downcast::<gtk::Window>();
-    let (path, file_name) = (path.to_path_buf(), file_name.to_string());
-    dialog.select_folder(root.as_ref(), gio::Cancellable::NONE, move |res| {
-        let Some(folder) = res.ok().and_then(|f| f.path()) else { return };
-        let (stem, ext) = match file_name.rsplit_once('.') {
-            Some((s, e)) => (s.to_string(), format!(".{e}")),
-            None => (file_name.clone(), String::new()),
-        };
-        let mut target = folder.join(&file_name);
-        let mut n = 1;
-        while target.exists() {
-            target = folder.join(format!("{stem}_{n}{ext}"));
-            n += 1;
-        }
+    dialog.set_title("Save");
+    dialog.set_initial_name(Some(file_name));
+    let root = widget.root().and_downcast::<gtk::Window>();
+    let path = path.to_path_buf();
+    dialog.save(root.as_ref(), gio::Cancellable::NONE, move |res| {
+        let Some(target) = res.ok().and_then(|f| f.path()) else { return };
         if let Err(e) = std::fs::copy(&path, &target) {
             log::warn!("save attachment: {e}");
         }
@@ -819,6 +879,20 @@ impl ThreadView {
         if !keep_scroll {
             self.reveal_at_bottom();
         }
+    }
+
+    /// Redraw the open conversation in place (a full picture arrived),
+    /// keeping the scroll position.
+    pub fn redraw(self: &Rc<Self>, conv: &Conversation, route: &dyn Fn(i64) -> Option<SendRoute>) {
+        if self.state.borrow().thread_id != Some(conv.thread_id) {
+            return;
+        }
+        {
+            let mut st = self.state.borrow_mut();
+            st.all = sorted(&conv.messages);
+            st.routes = conv.messages.iter().filter_map(|m| route(m.uid).map(|r| (m.uid, r))).collect();
+        }
+        self.set_messages(true);
     }
 
     fn show_earlier(self: &Rc<Self>) {

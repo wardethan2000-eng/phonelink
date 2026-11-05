@@ -9,6 +9,7 @@
 
 use std::collections::{HashMap, HashSet};
 
+use super::attachments;
 use super::contacts::{is_messaging_app, looks_like_phone_number, normalize_phone, resolve_name};
 use super::hidden_texts::{body_matches, normalize_text};
 use super::message::{RawMessage, parse_message};
@@ -124,6 +125,8 @@ pub struct Messages {
     notifications: Vec<ReplyableNotification>,
     pending_routes: Vec<(i64, String, SendRoute)>,
     sent_routes: HashMap<i64, SendRoute>,
+    /// Attachments whose full file was asked for this session.
+    full_requested: HashSet<String>,
 }
 
 /// Display name for a conversation from the contact map.
@@ -166,6 +169,7 @@ impl Messages {
         self.notifications.clear();
         self.pending_routes.clear();
         self.sent_routes.clear();
+        self.full_requested.clear();
         self.set_reachable(reachable);
     }
 
@@ -550,6 +554,67 @@ impl Messages {
     /// How a sent message (by uid) left this app, if it was sent from here.
     pub fn route_of(&self, uid: i64) -> Option<SendRoute> {
         self.sent_routes.get(&uid).copied()
+    }
+
+    // ── full-resolution images ─────────────────────────────────────
+
+    /// Image attachments in a conversation that only have the thumbnail, to
+    /// ask the phone for (`requestAttachmentFile(part_id, unique_id)`). Each
+    /// is returned once per session, and none while the phone is away.
+    pub fn take_full_image_requests(&mut self, thread_id: i64, cache_dir: &std::path::Path) -> Vec<(i64, String)> {
+        if !self.reachable || thread_id < 0 {
+            return Vec::new();
+        }
+        let Some(conv) = self.index.get(thread_id) else { return Vec::new() };
+        let mut out = Vec::new();
+        for att in conv.messages.iter().flat_map(|m| &m.attachments) {
+            if !attachments::is_image(att) || att.part_id == 0 || attachments::existing_full_in(cache_dir, att).is_some() {
+                continue;
+            }
+            let key = attachments::attachment_key(att);
+            if self.full_requested.insert(key) {
+                out.push((att.part_id, att.unique_identifier.clone()));
+            }
+        }
+        out
+    }
+
+    /// The phone sent a file we asked for. If it is an inline image's full
+    /// version, copy it into the cache, record it on the message, persist,
+    /// and return the conversation to redraw. `None` for anything else (a
+    /// plain download: the caller says where it landed).
+    pub fn attachment_received(
+        &mut self,
+        file_path: &std::path::Path,
+        file_name: &str,
+        store: &MessageStore,
+        cache_dir: &std::path::Path,
+    ) -> Option<i64> {
+        if !file_path.is_file() {
+            return None;
+        }
+        let dev = self.device_id.clone()?;
+        for conv in self.index.conversations.values_mut() {
+            for msg in conv.messages.iter_mut() {
+                let Some(att) = msg
+                    .attachments
+                    .iter_mut()
+                    .find(|a| attachments::is_image(a) && attachments::received_matches(a, file_name))
+                else {
+                    continue;
+                };
+                let dest = attachments::full_cache_path_in(cache_dir, att)?;
+                let copied = std::fs::create_dir_all(cache_dir).and_then(|_| std::fs::copy(file_path, &dest));
+                if let Err(e) = copied {
+                    log::warn!("caching a full attachment failed: {e}");
+                    return None;
+                }
+                att.extra.insert("fullPath".into(), dest.to_string_lossy().into_owned().into());
+                store.upsert_message(&dev, conv.thread_id, msg);
+                return Some(conv.thread_id);
+            }
+        }
+        None
     }
 
     // ── notifications (send route A) ──────────────────────────────
@@ -991,6 +1056,57 @@ mod tests {
         p.merge(sent_echo(2, 10, "3165551111", "On my way", 200));
         assert!(!p.m.awaiting_echo(10, "On my way"));
         assert_eq!(p.m.route_of(2), Some(SendRoute::Notification));
+    }
+
+    // ── full-resolution images ─────────────────────────────────────
+
+    fn with_image(uid: i64, thread_id: i64, part: i64, unique: &str) -> RawMessage {
+        RawMessage {
+            attachments: vec![crate::core::message::RawAttachment {
+                part_id: part,
+                mime_type: "image/jpeg".into(),
+                payload: String::new(),
+                unique_identifier: unique.into(),
+            }],
+            ..tup(uid, thread_id, &["3165551111"], 100 + uid)
+        }
+    }
+
+    #[test]
+    fn full_images_are_asked_for_once_and_recorded_when_they_arrive() {
+        let dir = tempfile::tempdir().unwrap();
+        let cache = dir.path().join("full");
+        let mut p = Panel::new();
+        p.merge(with_image(1, 10, 7, "PART_7.jpg"));
+        p.merge(with_image(2, 10, 8, "PART_8.jpg"));
+        let asked = p.m.take_full_image_requests(10, &cache);
+        assert_eq!(asked, vec![(7, "PART_7.jpg".to_string()), (8, "PART_8.jpg".to_string())]);
+        assert!(p.m.take_full_image_requests(10, &cache).is_empty(), "asked twice");
+
+        // The phone sends PART_7 back.
+        let sent = dir.path().join("download.jpg");
+        std::fs::write(&sent, b"jpeg bytes").unwrap();
+        assert_eq!(p.m.attachment_received(&sent, "PART_7.jpg", &p.store, &cache), Some(10));
+        let att = &p.m.index.get(10).unwrap().messages.iter().find(|m| m.uid == 1).unwrap().attachments[0];
+        let full = crate::core::attachments::existing_full_in(&cache, att).unwrap();
+        assert_eq!(std::fs::read(full).unwrap(), b"jpeg bytes");
+        // Persisted with the path, as Python does.
+        let stored = p.store.load_conversations("dev1");
+        let msg = stored[&10].messages.iter().find(|m| m.uid == 1).unwrap().clone();
+        assert!(msg.attachments[0].extra.contains_key("fullPath"));
+        // An unrelated download is not an inline image.
+        assert_eq!(p.m.attachment_received(&sent, "notes.pdf", &p.store, &cache), None);
+    }
+
+    #[test]
+    fn no_full_image_requests_while_the_phone_is_away() {
+        let dir = tempfile::tempdir().unwrap();
+        let mut p = Panel::new();
+        p.merge(with_image(1, 10, 7, "PART_7.jpg"));
+        p.m.set_reachable(false);
+        assert!(p.m.take_full_image_requests(10, dir.path()).is_empty());
+        p.m.set_reachable(true);
+        assert_eq!(p.m.take_full_image_requests(10, dir.path()).len(), 1);
     }
 
     #[test]

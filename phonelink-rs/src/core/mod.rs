@@ -1,6 +1,7 @@
 //! Pure logic: no GTK, no D-Bus.
 
 pub mod compat;
+pub mod attachments;
 pub mod contacts;
 pub mod hidden_texts;
 pub mod message;

@@ -17,6 +17,7 @@ use glib::Variant;
 
 use super::conversation_list::ConversationList;
 use super::thread_view::{BubbleActions, ThreadView};
+use crate::core::attachments::full_cache_dir;
 use crate::core::contacts::load_contact_map;
 use crate::core::message::parse_message;
 use crate::core::messages::{Effect, Messages};
@@ -68,10 +69,17 @@ impl MessagesPage {
         let list = ConversationList::new();
         content.append(&list.widget);
         content.append(&gtk::Separator::new(gtk::Orientation::Vertical));
+        // Set once `this` exists (the action needs a weak reference to it).
+        let download_target: Rc<RefCell<Weak<MessagesPage>>> = Rc::default();
         let thread = ThreadView::new(BubbleActions {
-            // TODO(Phase 3): requestAttachmentFile + attachmentReceived, and
-            // the automatic full-image fetch.
-            download: Rc::new(|part, _uid, name| log::info!("download {name} (part {part}): not wired yet")),
+            download: {
+                let target = download_target.clone();
+                Rc::new(move |part, uid, name| {
+                    if let Some(page) = target.borrow().upgrade() {
+                        page.request_attachment(part, uid, name);
+                    }
+                })
+            },
         });
         // TODO(Phase 3 step 3): compose. Until then nothing can be sent.
         thread.entry.set_sensitive(false);
@@ -96,6 +104,7 @@ impl MessagesPage {
                 timer: None,
             }),
         });
+        *download_target.borrow_mut() = Rc::downgrade(&this);
         let weak = Rc::downgrade(&this);
         this.list.connect_selected(move |tid| {
             if let Some(this) = weak.upgrade() {
@@ -194,6 +203,14 @@ impl MessagesPage {
             let effects = this.inner.borrow_mut().m.on_conversation_loaded(tid, now());
             this.run(effects);
             this.reschedule();
+        }));
+        let weak = Rc::downgrade(self);
+        subs.push(signals::subscribe(bus, &path, IFACE_CONVERSATIONS, "attachmentReceived", move |p| {
+            // attachmentReceived(filePath s, fileName s)
+            let Some(this) = weak.upgrade() else { return };
+            if let Some((file_path, file_name)) = p.get::<(String, String)>() {
+                this.attachment_received(&file_path, &file_name);
+            }
         }));
         let weak = Rc::downgrade(self);
         subs.push(signals::subscribe(bus, &path, IFACE_CONVERSATIONS, "conversationRemoved", move |p| {
@@ -335,9 +352,53 @@ impl MessagesPage {
     }
 
     fn show_thread(&self, tid: i64) {
+        let requests = {
+            let mut guard = self.inner.borrow_mut();
+            let i = &mut *guard;
+            let Some(conv) = i.m.index.get(tid) else { return };
+            self.list.select_thread(conv.thread_id);
+            self.thread.sync(conv, &|uid| i.m.route_of(uid));
+            // Pictures here only as the phone's small preview: ask for the
+            // full files (once each).
+            i.m.take_full_image_requests(tid, &full_cache_dir())
+        };
+        for (part, uid) in requests {
+            self.with_device(move |c, d| async move {
+                c.request_attachment_file(&d, part, &uid).await;
+            });
+        }
+    }
+
+    /// The user asked for a file (Download, or a picture still loading).
+    fn request_attachment(&self, part_id: i64, unique_identifier: String, file_name: String) {
+        if part_id == 0 {
+            return;
+        }
+        log::info!("asking the phone for {file_name}");
+        self.with_device(move |c, d| async move {
+            if !c.request_attachment_file(&d, part_id, &unique_identifier).await {
+                log::warn!("could not request {file_name} from the phone");
+            }
+        });
+    }
+
+    fn attachment_received(&self, file_path: &str, file_name: &str) {
+        let tid = {
+            let mut guard = self.inner.borrow_mut();
+            let i = &mut *guard;
+            i.m.attachment_received(std::path::Path::new(file_path), file_name, &i.store, &full_cache_dir())
+        };
+        let Some(tid) = tid else {
+            // Not an inline picture: KDE Connect saved a download.
+            log::info!("the phone sent {file_name} ({file_path})");
+            return;
+        };
         let i = self.inner.borrow();
-        let Some(conv) = i.m.index.get(tid) else { return };
-        self.list.select_thread(conv.thread_id);
-        self.thread.sync(conv, &|uid| i.m.route_of(uid));
+        if let Some(active) = i.m.active_thread()
+            && i.m.index.primary_for(active) == i.m.index.primary_for(tid)
+            && let Some(conv) = i.m.index.get(active)
+        {
+            self.thread.redraw(conv, &|uid| i.m.route_of(uid));
+        }
     }
 }
