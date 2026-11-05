@@ -141,3 +141,51 @@ are handled quietly.
 `phonelink-rs --dump`. 3. Messages tab. 4. Notifications, clipboard,
 header/battery, ring, share. 5. Files tab. 6. Tray, settings, autostart,
 Google Contacts. 7. Side-by-side on the laptop, measure, switch autostart.
+8. Flatpak (issue #2; also the fix for #6). See below.
+
+## Public commitments
+Things said in public that the project owes people. Close each one out when
+it is done.
+| Where | Said (date) | Owed |
+|---|---|---|
+| Issue #8 | 2026-11-05: rewriting in Rust; single binary, Flatpak planned; "I'll post here when it's ready" | A comment on #8 when the Rust app has a release (binary or Flatpak), with install steps, inviting the reporter to package it for Fedora |
+
+## Phase 8: Flatpak
+Goal: one install that works on any distro with KDE Connect, whatever GTK and
+libadwaita the distro ships. That closes #2 and makes #6 (Mint 21 too old)
+go away.
+
+- **Runtime:** `org.gnome.Platform` at a version that ships at least GTK 4.22
+  and Adw 1.9, or lower the crate feature levels to match the runtime.
+  Build with `org.freedesktop.Sdk.Extension.rust-stable`. Crates are
+  vendored for offline builds (`flatpak-cargo-generator`).
+- **KDE Connect stays on the host.** The sandbox talks to it over the
+  session bus: `--talk-name=org.kde.kdeconnect`,
+  `--system-talk-name=org.freedesktop.login1` (resume from sleep), and for
+  the tray `--talk-name=org.kde.StatusNotifierWatcher` plus ownership of the
+  SNI name it registers.
+- **Files tab:** KDE Connect mounts the phone over sftp on the host. Find the
+  real mount path from `getMountPoint` on the laptop, then grant just that
+  (it is likely under `$XDG_RUNTIME_DIR`). Don't grant `--filesystem=home`.
+- **Data:** Flatpak redirects `~/.local/share` into `~/.var/app/<id>/`. To
+  keep the existing `messages.db`, `settings.json`, contacts and caches,
+  either grant those exact dirs (`--filesystem=~/.local/share/phonelink:create`
+  and the cache dir), or copy them over once on first run. Pick the first if
+  the Python app is still in use, the second otherwise. KDE Connect's synced
+  vCards (`~/.local/share/kpeoplevcard`) need read-only access.
+- **Portals instead of host access:** autostart goes through the Background
+  portal (`RequestBackground`), not a file written to `~/.config/autostart`.
+  Open file/URL goes through OpenURI, and file choosing through FileChooser
+  (`Gtk.FileDialog` already uses it). Google sign-in needs `--share=network`
+  and opens the browser through OpenURI.
+- **App id (decision for Ethan):** Flathub requires an id tied to a domain or
+  code host you control. `dev.phonelink.app` would need the `phonelink.app`
+  domain. The GitHub-verified option is
+  `io.github.wardethan2000_eng.phonelink`. Changing the id changes the
+  single-instance name and the autostart entry, so decide before the first
+  public release.
+- **Ship:** Flathub submission (manifest, metainfo with screenshots, OARS
+  rating, desktop file, icons). A `.flatpak` bundle on GitHub releases in the
+  meantime.
+- **Then:** keep the promise to #8, and reply on #2 and #6 (texts shown to
+  Ethan first).
