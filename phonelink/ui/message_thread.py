@@ -49,6 +49,11 @@ ATTACHMENT_THUMBNAIL_MAX = 256    # at/under this the image is a preview, not fu
 # Bubbles rendered per thread; older ones load on request.  Rendering a whole
 # 2,000-message thread (and fetching every full-size image in it) froze the app.
 THREAD_WINDOW = 150
+# Of those, this many (about a screenful) are built before the chat shows; the
+# rest are added above them in batches once it is on screen.
+THREAD_FIRST_PAINT = 40
+THREAD_FILL_BATCH = 30
+TIME_GAP_SECONDS = 900  # messages closer than this share one timestamp
 
 
 def full_attachment_cache_path(att: dict) -> Path | None:
@@ -565,6 +570,8 @@ class MessageThread(Gtk.Box):
         self._window_size = THREAD_WINDOW  # how many of the newest are rendered
         self._window_first_date = 0  # date of the oldest rendered message
         self._earlier_button = None
+        self._fill_source = None   # idle source adding older bubbles
+        self._fill_pending = []    # older window messages not built yet
         self._auto_fetched: set[str] = set()  # attachments we've asked full-res for
         self.set_hexpand(True)
         self.set_vexpand(True)
@@ -781,38 +788,81 @@ class MessageThread(Gtk.Box):
         self._earlier_button = None
         self._add_earlier_button(len(self._all_messages) - len(sorted_msgs))
 
-        # Insert messages with date separators and one default timestamp
-        # at the end of each nearby time cluster.
-        TIME_GAP_SECONDS = 900  # 15 minutes
-        last_date_str = ""
-        for i, msg in enumerate(sorted_msgs):
-            date_str = msg.timestamp.strftime("%A, %B %d, %Y")
-            if date_str != last_date_str:
-                self._messages_box.append(DateSeparator(date_str))
-                last_date_str = date_str
-
-            next_msg = sorted_msgs[i + 1] if i + 1 < len(sorted_msgs) else None
-            show_time = not self._messages_group_together(msg, next_msg, TIME_GAP_SECONDS)
-
-            self._messages_box.append(
-                MessageBubble(
-                    msg,
-                    show_time=show_time,
-                    on_download_attachment=self._request_attachment_download,
-                )
+        # Build the newest bubbles now; when the view sits at the bottom, the
+        # older part of the window follows in idle batches above them.
+        first = sorted_msgs if keep_scroll else sorted_msgs[-THREAD_FIRST_PAINT:]
+        for widget in self._build_message_widgets(first, None):
+            self._messages_box.append(widget)
+        self._fill_pending = sorted_msgs[:len(sorted_msgs) - len(first)]
+        if self._fill_pending:
+            self._fill_source = GLib.idle_add(
+                self._fill_older, priority=GLib.PRIORITY_LOW
             )
 
         self._last_message = sorted_msgs[-1] if sorted_msgs else None
-        self._rendered_uids = {m.uid for m in sorted_msgs if m.uid}
+        self._rendered_uids = {m.uid for m in first if m.uid}
         self._last_rendered_date = sorted_msgs[-1].date if sorted_msgs else 0
         self._window_first_date = sorted_msgs[0].date if sorted_msgs else 0
         self._stack.set_visible_child_name("thread")
 
-        self._auto_fetch_full_images(sorted_msgs)
+        self._auto_fetch_full_images(first)
 
         # Scroll to bottom after layout
         if not keep_scroll:
             GLib.idle_add(self._scroll_to_bottom)
+
+    def _build_message_widgets(self, msgs, next_after):
+        """Date separators and bubbles for ``msgs`` (oldest first), in order.
+
+        ``next_after`` is the message that follows the last one, if any, so the
+        last bubble's timestamp groups correctly with it.
+        """
+        widgets = []
+        last_date_str = ""
+        for i, msg in enumerate(msgs):
+            date_str = msg.timestamp.strftime("%A, %B %d, %Y")
+            if date_str != last_date_str:
+                widgets.append(DateSeparator(date_str))
+                last_date_str = date_str
+            next_msg = msgs[i + 1] if i + 1 < len(msgs) else next_after
+            widgets.append(MessageBubble(
+                msg,
+                show_time=not self._messages_group_together(
+                    msg, next_msg, TIME_GAP_SECONDS),
+                on_download_attachment=self._request_attachment_download,
+            ))
+        return widgets
+
+    def _fill_older(self):
+        """Idle: add the next older batch of the window above what is shown."""
+        if not self._fill_pending:
+            self._fill_source = None
+            return GLib.SOURCE_REMOVE
+        batch = self._fill_pending[-THREAD_FILL_BATCH:]
+        del self._fill_pending[-THREAD_FILL_BATCH:]
+        anchor = self._earlier_button  # None → insert at the very top
+        top = anchor.get_next_sibling() if anchor else self._messages_box.get_first_child()
+        next_after = None
+        node = top
+        while node is not None and not isinstance(node, MessageBubble):
+            node = node.get_next_sibling()
+        if node is not None:
+            next_after = node.message
+        # The shown part starts with its own day header; drop it if the batch
+        # ends on that same day so the header isn't repeated.
+        if (isinstance(top, DateSeparator) and next_after is not None
+                and batch[-1].timestamp.date() == next_after.timestamp.date()):
+            self._messages_box.remove(top)
+        sibling = anchor
+        for widget in self._build_message_widgets(batch, next_after):
+            self._messages_box.insert_child_after(widget, sibling)
+            sibling = widget
+        self._rendered_uids.update(m.uid for m in batch if m.uid)
+        self._auto_fetch_full_images(batch)
+        if self._fill_pending:
+            return GLib.SOURCE_CONTINUE
+        self._fill_source = None
+        return GLib.SOURCE_REMOVE
 
     def _add_earlier_button(self, hidden: int):
         if hidden <= 0:
@@ -860,8 +910,10 @@ class MessageThread(Gtk.Box):
         current_uids = {m.uid for m in messages if m.uid}
         # Messages older than the rendered window (history backfill) only
         # change the "Show earlier" count; they never force a rebuild.
+        pending = {m.uid for m in getattr(self, "_fill_pending", ()) if m.uid}
         new_msgs = [m for m in messages
                     if m.uid and m.uid not in self._rendered_uids
+                    and m.uid not in pending
                     and m.date >= self._window_first_date]
         removed = self._rendered_uids - current_uids
         out_of_order = any(m.date < self._last_rendered_date for m in new_msgs)
@@ -940,6 +992,10 @@ class MessageThread(Gtk.Box):
 
     def _clear_messages(self):
         self._earlier_button = None
+        if getattr(self, "_fill_source", None):
+            GLib.source_remove(self._fill_source)
+        self._fill_source = None
+        self._fill_pending = []
         while True:
             child = self._messages_box.get_first_child()
             if child is None:
