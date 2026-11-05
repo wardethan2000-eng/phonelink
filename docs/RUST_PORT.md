@@ -167,9 +167,11 @@ Live results (laptop, daemon 26.08, 2026-11-05):
   at 100 by the dump's replay; the store has the full history. Phase 2 is done.
 - 342 phone threads merge into 326 conversations (47 groups). The dump finds
   no self number (it does not read contacts).
-- Bug carried over from Python: threads with no addresses all get identity `""`
-  and merge into one conversation (seen: 2 phone threads). A fix would key
-  them by thread id; it waits for Ethan's OK because it changes the list.
+- Fixed in the port (Ethan approved 2026-11-05; Python unchanged): threads with no addresses all got identity `""`
+  and merged into one conversation (seen: 2 phone threads), and could not be
+  hidden. They are now keyed `thread:<id>` (`reconcile::conversation_key`).
+- UI feature levels: GTK 4.10 / Adw 1.4 (Ethan, 2026-11-05: wide reach), the
+  same minimum as the Python app and as `core::compat`.
 
 
 ## Reported GitHub issues (as of 2026-11-05)

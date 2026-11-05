@@ -117,6 +117,20 @@ pub fn conversation_identity<S: AsRef<str>>(
     keys.join("|")
 }
 
+/// The key a conversation is merged and hidden under: its participant
+/// identity, or `thread:<id>` when it has no addresses at all. (Python used
+/// `""` there, which merged every address-less phone thread into one
+/// conversation and made them impossible to hide.)
+pub fn conversation_key<S: AsRef<str>>(
+    addresses: &[S],
+    fallback_address: &str,
+    self_key: &str,
+    thread_id: i64,
+) -> String {
+    let identity = conversation_identity(addresses, fallback_address, self_key);
+    if identity.is_empty() { format!("thread:{thread_id}") } else { identity }
+}
+
 /// [`detect_self_key_with`] using Python's defaults (`min_appearances=3`, `top=5`).
 pub fn detect_self_key<L, K>(message_key_lists: L, contact_keys: &[&str]) -> String
 where
@@ -279,7 +293,7 @@ impl ConversationIndex {
             _ if !msg.address.is_empty() => vec![msg.address.clone()],
             _ => Vec::new(),
         };
-        let identity = conversation_identity(&raw_addrs, &msg.address, &self.self_key);
+        let identity = conversation_key(&raw_addrs, &msg.address, &self.self_key, msg.thread_id);
         let addrs = participant_addresses(&raw_addrs, &msg.address, &self.self_key);
 
         let mut created = false;
@@ -347,7 +361,7 @@ impl ConversationIndex {
     /// Recomputes the identity and merges into an existing conversation if one
     /// already claims it. Returns the surviving primary thread id.
     pub fn register(&mut self, mut conv: Conversation) -> i64 {
-        conv.identity = conversation_identity(&conv.addresses, &conv.address, &self.self_key);
+        conv.identity = conversation_key(&conv.addresses, &conv.address, &self.self_key, conv.thread_id);
         if conv.thread_ids.is_empty() {
             conv.thread_ids = vec![conv.thread_id];
         }
@@ -563,6 +577,21 @@ mod tests {
         assert_eq!(idx.secondary_threads(10), vec![20]);
         assert_eq!(conv.last_date, 200);
         assert_eq!(conv.last_message, "m2");
+    }
+
+    #[test]
+    fn test_threads_without_addresses_stay_separate() {
+        // Seen live: two address-less phone threads. Python merged them under
+        // identity "".
+        let mut idx = ConversationIndex::new();
+        put(&mut idx, msg(1, 719, &[], 100));
+        put(&mut idx, msg(2, 720, &[], 200));
+        put(&mut idx, msg(3, 719, &[], 300));
+        assert_eq!(idx.conversations.len(), 2);
+        assert_eq!(idx.get(719).unwrap().identity, "thread:719");
+        assert_eq!(uids(idx.get(719).unwrap()), HashSet::from([1, 3]));
+        assert_eq!(idx.primary_for(720), 720);
+        assert_eq!(conversation_key(&["3165551212"], "", "", 5), "3165551212");
     }
 
     #[test]

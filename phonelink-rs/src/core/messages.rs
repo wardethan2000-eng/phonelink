@@ -122,8 +122,8 @@ impl Messages {
         self.catch_up.set_reachable(reachable && self.device_id.is_some());
     }
 
-    fn conversation_identity(&self, addresses: &[String], fallback: &str) -> String {
-        reconcile::conversation_identity(addresses, fallback, &self.index.self_key)
+    fn conversation_key(&self, addresses: &[String], fallback: &str, thread_id: i64) -> String {
+        reconcile::conversation_key(addresses, fallback, &self.index.self_key, thread_id)
     }
 
     fn should_keep_hidden(&self, hidden: &mut dyn HiddenStore, key: &str, message_date: i64) -> bool {
@@ -223,7 +223,7 @@ impl Messages {
         // A locally deleted conversation stays hidden until a newer message
         // arrives — only for a conversation not already showing.
         if self.index.get(msg.thread_id).is_none() {
-            let identity = self.conversation_identity(&all_addrs, &msg.address);
+            let identity = self.conversation_key(&all_addrs, &msg.address, msg.thread_id);
             if !self.index.identity_to_primary.contains_key(&identity)
                 && self.should_keep_hidden(hidden, &identity, msg.date)
             {
@@ -309,7 +309,7 @@ impl Messages {
     pub fn visible(&self, hidden: &dyn HiddenStore) -> Vec<&Conversation> {
         let dev = self.device_id.as_deref().unwrap_or("");
         let is_hidden = |c: &Conversation| {
-            let key = self.conversation_identity(&c.addresses, &c.address);
+            let key = self.conversation_key(&c.addresses, &c.address, c.thread_id);
             if key.is_empty() || dev.is_empty() {
                 return false;
             }
@@ -456,7 +456,7 @@ impl Messages {
         if conv.thread_id < 0 {
             return String::new();
         }
-        let key = self.conversation_identity(&conv.addresses, &conv.address);
+        let key = self.conversation_key(&conv.addresses, &conv.address, conv.thread_id);
         if key.is_empty() {
             return key;
         }
@@ -705,6 +705,19 @@ mod tests {
         // A newer one brings it back.
         p.apply(&[tup(3, 10, &["111"], now + 60_000)]);
         assert_eq!(p.visible().len(), 1);
+    }
+
+    #[test]
+    fn address_less_threads_are_separate_and_can_be_hidden() {
+        let mut p = Panel::new();
+        let now = 1_800_000_000_000;
+        p.apply(&[tup(1, 719, &[], now - 10_000), tup(2, 720, &[], now - 5_000)]);
+        assert_eq!(p.visible().len(), 2);
+        let key = p.m.hide_locally(719, &mut p.hidden, now);
+        assert_eq!(key, "thread:719");
+        p.m.purge(&key, &p.store);
+        let left: Vec<i64> = p.visible().iter().map(|c| c.thread_id).collect();
+        assert_eq!(left, vec![720]);
     }
 
     #[test]
