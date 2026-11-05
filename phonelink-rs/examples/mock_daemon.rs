@@ -126,10 +126,12 @@ fn thread_messages(index: usize) -> Vec<Variant> {
     let base = now_ms() - (index as i64) * (index as i64) * 90 * 60_000;
     let mut out = Vec::new();
     if thread == LONG_THREAD {
-        // Older history, an hour apart, alternating sides, with a photo.
+        // Older history in bursts like real chats (5 texts a couple of
+        // minutes apart, then a few hours' gap), with a photo.
         let chatter = ["ok", "sounds good", "on my way", "see you there", "haha", "did you see that?", "yes", "tomorrow works"];
         for k in 0..LONG_THREAD_LEN {
-            let date = base - ((LONG_THREAD_LEN - k) as i64) * 60 * 60_000;
+            let (burst, within) = ((LONG_THREAD_LEN - k) as i64 / 5, (k % 5) as i64);
+            let date = base - burst * 5 * 60 * 60_000 - 10 * 60_000 + within * 2 * 60_000;
             let uid = 5000 + k as i32;
             let body = chatter[k % chatter.len()];
             let atts = if k == LONG_THREAD_LEN - 3 {

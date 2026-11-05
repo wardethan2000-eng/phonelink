@@ -111,6 +111,14 @@ tree that has no `gtk` imports, so `cargo test` for core needs no display.
 - `_tray.py` is not ported. It is a separate GTK3 + XApp tray process,
   used only when no StatusNotifierWatcher exists (Mint). Fedora has a watcher.
 
+## UI changes from the Python app (approved by Ethan)
+- 2026-11-05, thread view: no time under every bubble. Centered time lines
+  appear at each new day ("Tuesday · 11:09 AM") and after a gap of an hour
+  or more ("2:09 PM"). Only the newest bubble shows its time; tapping a bubble
+  shows its time. The send-route label stays visible on texts sent from the
+  app. The Python showed "Received Tuesday 11:09 AM" under almost every
+  bubble, plus a full date header.
+
 ## Behavior that must carry over
 The handoff's eleven rules (hidden texts, catch-up + gap fill, signal
 batching, the 60/100 thread window without visible scroll, off-thread image

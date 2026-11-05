@@ -30,8 +30,12 @@ use crate::core::models::{Attachment, Conversation, SmsMessage};
 
 pub const THREAD_WINDOW: usize = 60;
 pub const THREAD_WINDOW_STEP: usize = 100;
-/// Messages closer than this share one timestamp.
-const TIME_GAP_MS: i64 = 900 * 1000;
+/// A centered time line goes in wherever this much time passed between two
+/// messages (and at the start of each day). Per-bubble times are hidden
+/// except on the newest message; tap a bubble to see its time. (Ethan,
+/// 2026-11-05: a time and date on every bubble looked messy. Python showed
+/// one per bubble unless the next came within 15 minutes.)
+const TIME_LINE_GAP_MS: i64 = 60 * 60 * 1000;
 
 const FULL_IMAGE_MAX_W: f64 = 380.0;
 const FULL_IMAGE_MAX_H: f64 = 500.0;
@@ -193,13 +197,38 @@ pub fn message_markup(text: &str) -> (String, bool) {
     (out, true)
 }
 
-fn groups_with(current: &SmsMessage, next: Option<&SmsMessage>) -> bool {
-    let Some(next) = next else { return false };
-    current.timestamp().date_naive() == next.timestamp().date_naive() && (next.date - current.date).abs() < TIME_GAP_MS
+fn clock(ts: chrono::DateTime<chrono::Local>) -> String {
+    ts.format("%-I:%M %p").to_string()
 }
 
-fn date_header(m: &SmsMessage) -> String {
-    m.timestamp().format("%A, %B %d, %Y").to_string()
+/// "Today", "Yesterday", the weekday within a week, else the date (with the
+/// year only when it isn't this year).
+pub fn day_label(day: chrono::NaiveDate, today: chrono::NaiveDate) -> String {
+    use chrono::Datelike;
+    let age = (today - day).num_days();
+    match age {
+        0 => "Today".into(),
+        1 => "Yesterday".into(),
+        2..=6 => day.format("%A").to_string(),
+        _ if day.year() == today.year() => day.format("%A, %B %-d").to_string(),
+        _ => day.format("%A, %B %-d, %Y").to_string(),
+    }
+}
+
+/// The centered line to put before `m`, if any: the day and time at a new
+/// day, the time after an hour's gap.
+pub fn time_line(prev: Option<&SmsMessage>, m: &SmsMessage, today: chrono::NaiveDate) -> Option<String> {
+    let ts = m.timestamp();
+    match prev {
+        Some(p) if p.timestamp().date_naive() == ts.date_naive() => {
+            (m.date - p.date >= TIME_LINE_GAP_MS).then(|| clock(ts))
+        }
+        _ => Some(format!("{} · {}", day_label(ts.date_naive(), today), clock(ts))),
+    }
+}
+
+fn today() -> chrono::NaiveDate {
+    chrono::Local::now().date_naive()
 }
 
 // ── image decoding off the main thread ─────────────────────────────
@@ -318,11 +347,7 @@ impl Bubble {
         let revealer = gtk::Revealer::new();
         revealer.set_transition_type(gtk::RevealerTransitionType::SlideDown);
         revealer.set_transition_duration(160);
-        let mut label = format!("{} {}", if sent { "Sent" } else { "Received" }, msg.time_label());
-        if let Some(r) = route {
-            label.push_str(" · ");
-            label.push_str(r.label());
-        }
+        let label = format!("{} {}", if sent { "Sent" } else { "Received" }, clock(msg.timestamp()));
         let time = gtk::Label::new(Some(&label));
         time.set_halign(if sent { gtk::Align::End } else { gtk::Align::Start });
         time.add_css_class("dim-label");
@@ -332,6 +357,17 @@ impl Bubble {
         time.set_margin_end(if sent { 12 } else { 0 });
         revealer.set_child(Some(&time));
         widget.append(&revealer);
+        // How a text sent from this app left it: always shown, so a fallback
+        // to SMS is never hidden.
+        if let Some(r) = route {
+            let tag = gtk::Label::new(Some(r.label()));
+            tag.set_halign(gtk::Align::End);
+            tag.add_css_class("dim-label");
+            tag.add_css_class("caption");
+            tag.add_css_class("message-timestamp");
+            tag.set_margin_end(12);
+            widget.append(&tag);
+        }
 
         let bubble = Rc::new(Self { widget, revealer, message: msg.clone() });
         bubble.set_timestamp_visible(show_time);
@@ -762,14 +798,13 @@ impl ThreadView {
         }
 
         let mut bubbles = Vec::new();
-        let mut last_date = String::new();
+        let today = today();
         for (i, m) in shown.iter().enumerate() {
-            let header = date_header(m);
-            if header != last_date {
-                self.messages_box.append(&date_separator(&header));
-                last_date = header;
+            if let Some(line) = time_line(i.checked_sub(1).map(|j| &shown[j]), m, today) {
+                self.messages_box.append(&date_separator(&line));
             }
-            let b = Bubble::new(m, !groups_with(m, shown.get(i + 1)), routes.get(&m.uid).copied(), &self.actions);
+            let newest = i + 1 == shown.len();
+            let b = Bubble::new(m, newest, routes.get(&m.uid).copied(), &self.actions);
             self.messages_box.append(&b.widget);
             bubbles.push(b);
         }
@@ -828,19 +863,13 @@ impl ThreadView {
     }
 
     fn append_message(self: &Rc<Self>, m: &SmsMessage, route: Option<SendRoute>) {
-        let (prev, new_day) = {
-            let st = self.state.borrow();
-            let prev = st.bubbles.last().cloned();
-            let new_day = prev.as_ref().is_none_or(|b| b.message.timestamp().date_naive() != m.timestamp().date_naive());
-            (prev, new_day)
-        };
-        if let Some(prev) = &prev
-            && groups_with(&prev.message, Some(m))
-        {
+        let prev = self.state.borrow().bubbles.last().cloned();
+        // Only the newest bubble shows its time.
+        if let Some(prev) = &prev {
             prev.set_timestamp_visible(false);
         }
-        if new_day {
-            self.messages_box.append(&date_separator(&date_header(m)));
+        if let Some(line) = time_line(prev.as_ref().map(|b| &b.message), m, today()) {
+            self.messages_box.append(&date_separator(&line));
         }
         let b = Bubble::new(m, true, route, &self.actions);
         self.messages_box.append(&b.widget);
@@ -891,6 +920,29 @@ mod tests {
         assert_eq!(scaled_image_size(50, 50, false), (110, 110));
         assert_eq!(image_display(100, 75, true), (220, 165, true));
         assert!(!image_display(1000, 750, true).2);
+    }
+
+    #[test]
+    fn time_lines_only_at_new_days_and_long_gaps() {
+        use chrono::{Local, NaiveDate, TimeZone};
+        let at = |y, mo, d, h, mi| {
+            let ts = Local.with_ymd_and_hms(y, mo, d, h, mi, 0).unwrap();
+            SmsMessage { date: ts.timestamp_millis(), ..Default::default() }
+        };
+        let today = NaiveDate::from_ymd_opt(2026, 11, 5).unwrap();
+        let a = at(2026, 11, 3, 11, 9);
+        let b = at(2026, 11, 3, 11, 40);
+        let c = at(2026, 11, 3, 13, 5);
+        let d = at(2026, 11, 5, 9, 0);
+        assert_eq!(time_line(None, &a, today).as_deref(), Some("Tuesday · 11:09 AM"));
+        assert_eq!(time_line(Some(&a), &b, today), None);
+        assert_eq!(time_line(Some(&b), &c, today).as_deref(), Some("1:05 PM"));
+        assert_eq!(time_line(Some(&c), &d, today).as_deref(), Some("Today · 9:00 AM"));
+        let old = at(2026, 9, 1, 8, 0);
+        assert_eq!(time_line(None, &old, today).as_deref(), Some("Tuesday, September 1 · 8:00 AM"));
+        let older = at(2025, 12, 31, 23, 59);
+        assert_eq!(time_line(None, &older, today).as_deref(), Some("Wednesday, December 31, 2025 · 11:59 PM"));
+        assert_eq!(day_label(NaiveDate::from_ymd_opt(2026, 11, 4).unwrap(), today), "Yesterday");
     }
 
     #[test]
