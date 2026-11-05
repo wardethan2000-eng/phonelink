@@ -315,6 +315,13 @@ same path Wear OS and Android Auto replies use.
   Sent bubbles are labeled from the route (`route_of(uid)`) as "SMS" or
   "via notification". The label changes to "RCS" only after the phone test
   passes.
+- **Wired to the compose bar (Phase 3 step 3).** The page feeds it live
+  notifications (initial `activeNotifications`, then posted, updated and
+  removed). Tried on the build box against the demo daemon: a reply in the
+  chat with an answerable notification went out through `sendReply`, and
+  one in another chat through `replyToConversation`. Each was labeled from
+  the phone's echo. A text with a picture always goes through
+  `replyToConversation`.
 
 ### Route B: pair as a "Messages for web" device
 Google Messages for web is a paired device that talks to the phone through

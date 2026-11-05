@@ -64,7 +64,7 @@ pub enum Effect {
     MaybeNotSent { thread_id: i64, text: String },
     /// `sendWithoutConversation(addresses, text)` — only for brand-new
     /// conversations; the phone silently drops it otherwise.
-    SendNew { addresses: Vec<String>, text: String },
+    SendNew { addresses: Vec<String>, text: String, attachments: Vec<String> },
     /// `deleteConversation(thread)` on the phone.
     DeleteOnPhone { thread_id: i64 },
     RefreshList,
@@ -479,11 +479,21 @@ impl Messages {
 
     /// Send from the compose bar.
     pub fn send(&mut self, thread_id: i64, text: &str) -> Vec<Effect> {
+        self.send_with(thread_id, text, Vec::new())
+    }
+
+    /// Send text and/or attachments (local file paths, as Python passes
+    /// them). A text with attachments always goes the usual way: a
+    /// notification reply can only carry text.
+    pub fn send_with(&mut self, thread_id: i64, text: &str, attachments: Vec<String>) -> Vec<Effect> {
         if self.device_id.is_none() || !self.reachable {
             return vec![Effect::Toast(TOAST_NOT_CONNECTED)];
         }
+        if text.trim().is_empty() && attachments.is_empty() {
+            return Vec::new();
+        }
         if thread_id >= 0 {
-            return vec![self.send_existing(thread_id, text)];
+            return vec![self.send_existing(thread_id, text, attachments)];
         }
         // A draft: a real thread may have loaded since it was created.
         let Some(draft) = self.index.conversations.get(&thread_id) else { return Vec::new() };
@@ -493,12 +503,12 @@ impl Messages {
             Some(existing) => {
                 self.active = Some(existing);
                 self.read_thread_ids.insert(existing);
-                vec![self.send_existing(existing, text), Effect::RefreshList, Effect::ShowThread(existing)]
+                vec![self.send_existing(existing, text, attachments), Effect::RefreshList, Effect::ShowThread(existing)]
             }
             None => {
                 self.active = None;
                 vec![
-                    Effect::SendNew { addresses: vec![address], text: text.to_string() },
+                    Effect::SendNew { addresses: vec![address], text: text.to_string(), attachments },
                     Effect::ShowEmpty,
                     Effect::RefreshList,
                 ]
@@ -508,14 +518,15 @@ impl Messages {
 
     /// A text for an existing thread: through the texting app's notification
     /// when one clearly belongs to this conversation, else `replyToConversation`.
-    fn send_existing(&mut self, thread_id: i64, text: &str) -> Effect {
+    fn send_existing(&mut self, thread_id: i64, text: &str, attachments: Vec<String>) -> Effect {
         let primary = self.index.primary_for(thread_id);
-        let (route, effect) = match self.notification_for(primary) {
+        let notification = if attachments.is_empty() { self.notification_for(primary) } else { None };
+        let (route, effect) = match notification {
             Some(n) => (
                 SendRoute::Notification,
                 Effect::ReplyViaNotification { thread_id: primary, reply_id: n.reply_id.clone(), text: text.to_string() },
             ),
-            None => (SendRoute::Sms, self.reply(primary, text, Vec::new())),
+            None => (SendRoute::Sms, self.reply(primary, text, attachments)),
         };
         self.note_pending_route(primary, text, route);
         effect
@@ -927,7 +938,10 @@ mod tests {
         let draft = p.m.active_thread().unwrap();
         assert!(draft < 0);
         let effects = p.m.send(draft, "hello");
-        assert_eq!(effects[0], Effect::SendNew { addresses: vec!["3165559999".into()], text: "hello".into() });
+        assert_eq!(
+            effects[0],
+            Effect::SendNew { addresses: vec!["3165559999".into()], text: "hello".into(), attachments: vec![] }
+        );
         assert!(p.m.index.get(draft).is_none());
         // A number we already have a 1:1 thread with opens that thread.
         let effects = p.m.open_or_create("316-555-1212", "");
@@ -1041,6 +1055,20 @@ mod tests {
         assert!(matches!(&effects[0], Effect::Reply { conversation_id: 10, text, .. } if text == "On my way"));
         p.merge(sent_echo(2, 10, "3165551111", "On my way", 200));
         assert_eq!(p.m.route_of(2), Some(SendRoute::Sms));
+    }
+
+    #[test]
+    fn pictures_go_the_usual_way_and_empty_sends_do_nothing() {
+        let mut p = Panel::new();
+        p.apply(&[incoming(1, 10, "3165551111", "Are you still coming tonight?", 100)]);
+        p.m.note_notification(notif("n1", "+13165551111", "Are you still coming tonight?"));
+        let effects = p.m.send_with(10, "look", vec!["/tmp/a.png".into()]);
+        assert!(
+            matches!(&effects[0], Effect::Reply { attachments, .. } if attachments == &vec!["/tmp/a.png".to_string()])
+        );
+        assert!(p.m.send_with(10, "   ", vec![]).is_empty());
+        // A picture with no text is fine.
+        assert!(matches!(p.m.send_with(10, "", vec!["/tmp/b.png".into()])[0], Effect::Reply { .. }));
     }
 
     #[test]

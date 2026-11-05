@@ -32,6 +32,12 @@ const DEVICE_XML: &str = r#"<node>
 <interface name="org.kde.kdeconnect.device.conversations">
   <method name="activeConversations"><arg type="av" direction="out"/></method>
   <method name="requestAllConversationThreads"/>
+  <method name="replyToConversation">
+    <arg type="x" direction="in"/><arg type="s" direction="in"/><arg type="av" direction="in"/>
+  </method>
+  <method name="sendWithoutConversation">
+    <arg type="av" direction="in"/><arg type="s" direction="in"/><arg type="av" direction="in"/>
+  </method>
   <method name="requestAttachmentFile">
     <arg type="x" direction="in"/><arg type="s" direction="in"/>
   </method>
@@ -50,6 +56,25 @@ const SMS_XML: &str = r#"<node><interface name="org.kde.kdeconnect.device.sms">
     <arg type="x" direction="in"/><arg type="x" direction="in"/><arg type="x" direction="in"/>
   </method>
 </interface></node>"#;
+
+const NOTIFICATIONS_XML: &str = r#"<node><interface name="org.kde.kdeconnect.device.notifications">
+  <method name="activeNotifications"><arg type="as" direction="out"/></method>
+  <method name="sendReply"><arg type="s" direction="in"/><arg type="s" direction="in"/></method>
+  <signal name="notificationPosted"><arg type="s"/></signal>
+  <signal name="notificationRemoved"><arg type="s"/></signal>
+</interface></node>"#;
+
+const NOTIFICATION_XML: &str = r#"<node><interface name="org.kde.kdeconnect.device.notifications.notification">
+  <property name="appName" type="s" access="read"/>
+  <property name="title" type="s" access="read"/>
+  <property name="text" type="s" access="read"/>
+  <property name="ticker" type="s" access="read"/>
+  <property name="replyId" type="s" access="read"/>
+</interface></node>"#;
+
+/// One answerable "Messages" notification, for the newest text in thread 11,
+/// so a reply there goes the notification route.
+const DEMO_NOTIFICATION: &str = "demo1";
 
 const BATTERY_XML: &str = r#"<node><interface name="org.kde.kdeconnect.device.battery">
   <property name="charge" type="i" access="read"/>
@@ -100,6 +125,21 @@ fn full_picture(name: &str) -> std::path::PathBuf {
     pb.new_subpixbuf(0, 600, 1200, 300).fill(0x8f_f0_a4_ff);
     pb.savev(&file, "png", &[]).unwrap();
     file
+}
+
+static NEXT_SENT_UID: std::sync::atomic::AtomicI32 = std::sync::atomic::AtomicI32::new(90_000);
+
+/// What the phone does after sending: the sent text comes back as a
+/// conversationUpdated a moment later.
+fn echo_sent(conn: &gio::DBusConnection, thread: i64, text: String) {
+    let conn = conn.clone();
+    glib::timeout_add_local_once(std::time::Duration::from_millis(600), move || {
+        let i = THREADS.iter().position(|t| t.0 == thread).unwrap_or(0);
+        let uid = NEXT_SENT_UID.fetch_add(1, std::sync::atomic::Ordering::Relaxed);
+        let m = message(thread, uid, THREADS[i].1, &text, now_ms(), true, true);
+        let p = Variant::tuple_from_iter([Variant::from_variant(&m)]);
+        conn.emit_signal(None, &device_path(DEVICE), IFACE_CONVERSATIONS, "conversationUpdated", Some(&p)).unwrap();
+    });
 }
 
 fn now_ms() -> i64 {
@@ -216,6 +256,17 @@ fn main() {
                     let loaded = (thread, msgs.len() as u64).to_variant();
                     conn.emit_signal(None, path, iface.unwrap(), "conversationLoaded", Some(&loaded)).unwrap();
                 }
+                "replyToConversation" => {
+                    let thread = params.child_value(0).get::<i64>().unwrap();
+                    let text = params.child_value(1).get::<String>().unwrap();
+                    eprintln!("demo: replyToConversation({thread}, {} chars)", text.len());
+                    inv.return_value(None);
+                    echo_sent(&conn, thread, text);
+                }
+                "sendWithoutConversation" => {
+                    eprintln!("demo: sendWithoutConversation");
+                    inv.return_value(None);
+                }
                 "requestAttachmentFile" => {
                     // The phone "sends" the full picture a moment later.
                     let (_part, uid) = params.get::<(i64, String)>().unwrap();
@@ -245,6 +296,37 @@ fn main() {
             })
             .build()
             .unwrap();
+
+        let notes = gio::DBusNodeInfo::for_xml(NOTIFICATIONS_XML).unwrap();
+        conn.register_object(&format!("{path}/notifications"), &notes.lookup_interface(IFACE_NOTIFICATIONS).unwrap())
+            .method_call(|conn, _, path, iface, method, params, inv| match method {
+                "activeNotifications" => inv.return_value(Some(&(vec![DEMO_NOTIFICATION.to_string()],).to_variant())),
+                "sendReply" => {
+                    let (reply_id, text) = params.get::<(String, String)>().unwrap();
+                    eprintln!("demo: sendReply({reply_id}, {} chars)", text.len());
+                    inv.return_value(None);
+                    echo_sent(&conn, 11, text);
+                    let gone = (DEMO_NOTIFICATION,).to_variant();
+                    conn.emit_signal(None, path, iface.unwrap(), "notificationRemoved", Some(&gone)).unwrap();
+                }
+                _ => inv.return_value(None),
+            })
+            .build()
+            .unwrap();
+        let note = gio::DBusNodeInfo::for_xml(NOTIFICATION_XML).unwrap();
+        conn.register_object(
+            &format!("{path}/notifications/{DEMO_NOTIFICATION}"),
+            &note.lookup_interface(IFACE_NOTIFICATION).unwrap(),
+        )
+        .property(|_, _, _, _, prop| match prop {
+            "appName" => "Messages".to_variant(),
+            "title" => "+15555550101".to_variant(),
+            "text" => "Running 10 min late".to_variant(),
+            "replyId" => "demo-reply-1".to_variant(),
+            _ => "".to_variant(),
+        })
+        .build()
+        .unwrap();
 
         let bat = gio::DBusNodeInfo::for_xml(BATTERY_XML).unwrap();
         conn.register_object(&format!("{path}/battery"), &bat.lookup_interface(IFACE_BATTERY).unwrap())

@@ -20,13 +20,28 @@ use super::thread_view::{BubbleActions, ThreadView};
 use crate::core::attachments::full_cache_dir;
 use crate::core::contacts::load_contact_map;
 use crate::core::message::parse_message;
-use crate::core::messages::{Effect, Messages};
+use crate::core::contacts::notification_message_text;
+use crate::core::messages::{Effect, Messages, ReplyableNotification};
 use crate::core::models::Device;
 use crate::core::settings::Settings;
 use crate::core::store::MessageStore;
 use crate::core::sync::{self, Action, SIGNAL_BATCH_SIZE};
 use crate::dbus::signals::{self, Subscription};
-use crate::dbus::{Client, IFACE_CONVERSATIONS, device_path, variant};
+use crate::dbus::{Client, IFACE_CONVERSATIONS, IFACE_NOTIFICATIONS, device_path, variant};
+
+/// A notification's properties in the shape `core` reads.
+fn replyable(id: &str, props: &std::collections::BTreeMap<String, Variant>) -> ReplyableNotification {
+    let text_of = |k: &str| props.get(k).map(variant::string).unwrap_or_default();
+    let json: crate::core::contacts::Props =
+        ["appName", "title", "text", "ticker"].iter().map(|k| (k.to_string(), text_of(k).into())).collect();
+    ReplyableNotification {
+        public_id: id.to_string(),
+        app_name: text_of("appName"),
+        title: text_of("title"),
+        text: notification_message_text(&json),
+        reply_id: text_of("replyId"),
+    }
+}
 
 /// Monotonic seconds, as the controller expects.
 fn now() -> f64 {
@@ -46,7 +61,9 @@ struct Inner {
 }
 
 pub struct MessagesPage {
-    pub widget: gtk::Stack,
+    /// The page; toasts float over it.
+    pub widget: adw::ToastOverlay,
+    stack: gtk::Stack,
     list: Rc<ConversationList>,
     thread: Rc<ThreadView>,
     inner: RefCell<Inner>,
@@ -54,16 +71,18 @@ pub struct MessagesPage {
 
 impl MessagesPage {
     pub fn new(store: MessageStore, settings: Settings) -> Rc<Self> {
-        let widget = gtk::Stack::new();
-        widget.set_vexpand(true);
-        widget.set_hexpand(true);
-        widget.set_transition_type(gtk::StackTransitionType::Crossfade);
+        let stack = gtk::Stack::new();
+        stack.set_vexpand(true);
+        stack.set_hexpand(true);
+        stack.set_transition_type(gtk::StackTransitionType::Crossfade);
+        let widget = adw::ToastOverlay::new();
+        widget.set_child(Some(&stack));
 
         let status = adw::StatusPage::new();
         status.set_icon_name(Some("mail-unread-symbolic"));
         status.set_title("Messages");
         status.set_description(Some("No phone linked yet.\nPair your phone in KDE Connect to see your texts here."));
-        widget.add_named(&status, Some("status"));
+        stack.add_named(&status, Some("status"));
 
         let content = gtk::Box::new(gtk::Orientation::Horizontal, 0);
         let list = ConversationList::new();
@@ -81,16 +100,13 @@ impl MessagesPage {
                 })
             },
         });
-        // TODO(Phase 3 step 3): compose. Until then nothing can be sent.
-        thread.entry.set_sensitive(false);
-        thread.entry.set_placeholder_text(Some("Sending isn't connected yet"));
-        thread.send_button.set_sensitive(false);
         content.append(&thread.widget);
-        widget.add_named(&content, Some("content"));
-        widget.set_visible_child_name("status");
+        stack.add_named(&content, Some("content"));
+        stack.set_visible_child_name("status");
 
         let this = Rc::new(Self {
             widget,
+            stack,
             list,
             thread,
             inner: RefCell::new(Inner {
@@ -105,6 +121,11 @@ impl MessagesPage {
             }),
         });
         *download_target.borrow_mut() = Rc::downgrade(&this);
+        let weak = Rc::downgrade(&this);
+        this.thread.connect_send(move |tid, text, picture| {
+            let Some(this) = weak.upgrade() else { return false };
+            this.send(tid, text, picture)
+        });
         let weak = Rc::downgrade(&this);
         this.list.connect_selected(move |tid| {
             if let Some(this) = weak.upgrade() {
@@ -144,7 +165,7 @@ impl MessagesPage {
             i.subs.clear();
             i.queue.clear();
             i.m.reset_for_device(None, false);
-            self.widget.set_visible_child_name("status");
+            self.stack.set_visible_child_name("status");
             return;
         };
         let effects = {
@@ -156,14 +177,17 @@ impl MessagesPage {
             i.m.reset_for_device(Some(&dev.id), reachable);
             i.m.contact_map = load_contact_map(&dev.id, i.store.load_contacts());
             i.subs = self.subscribe(client, &dev.id);
+            i.subs.extend(self.subscribe_notifications(client, &dev.id));
             let mut effects = i.m.load_cached(&i.store);
             effects.push(Effect::RefreshList);
             i.m.catch_up.catch_up(now(), sync::CATCH_UP_STARTUP_DELAY_SECONDS, 0.0);
             effects
         };
-        self.widget.set_visible_child_name("content");
+        self.stack.set_visible_child_name("content");
         self.run(effects);
         self.reschedule();
+
+        self.load_notifications();
 
         // The daemon's cached newest-message-per-thread list.
         let (weak, client, id) = (Rc::downgrade(self), client.clone(), dev.id.clone());
@@ -264,6 +288,12 @@ impl MessagesPage {
             if !more {
                 i.draining = false;
             }
+            // As Python: the list is refreshed after every batch (new
+            // previews, times, order, unread).
+            let mut effects = effects;
+            if !batch.is_empty() {
+                effects.push(Effect::RefreshList);
+            }
             (effects, more)
         };
         self.run(effects);
@@ -306,16 +336,35 @@ impl MessagesPage {
                 }),
                 Effect::ShowThread(tid) => self.show_thread(tid),
                 Effect::ShowEmpty => self.thread.show_empty(),
-                Effect::Toast(text) => log::info!("toast: {text}"),
-                // TODO(Phase 3 step 3): sending and deleting. Nothing is sent
-                // to the phone until compose is wired up and reviewed.
-                Effect::Reply { .. }
-                | Effect::ReplyViaNotification { .. }
-                | Effect::MaybeNotSent { .. }
-                | Effect::SendNew { .. }
-                | Effect::DeleteOnPhone { .. } => {
-                    log::warn!("not wired up yet: {e:?}");
+                Effect::Toast(text) => self.toast(text),
+                Effect::Reply { conversation_id, text, attachments } => {
+                    let weak = Rc::downgrade(self);
+                    self.with_device(move |c, d| async move {
+                        if !c.reply_to_conversation(&d, conversation_id, &text, &attachments).await
+                            && let Some(this) = weak.upgrade()
+                        {
+                            this.toast("Couldn't send that text. Check the phone is connected and try again.");
+                        }
+                    });
                 }
+                Effect::ReplyViaNotification { thread_id, reply_id, text } => {
+                    let weak = Rc::downgrade(self);
+                    self.with_device(move |c, d| async move {
+                        let Err(e) = c.try_send_notification_reply_by_id(&d, &reply_id, &text).await else { return };
+                        let refused = crate::dbus::client::is_definite_refusal(&e);
+                        log::warn!("notification reply failed ({}): {}", if refused { "refused" } else { "unclear" }, e.message());
+                        let Some(this) = weak.upgrade() else { return };
+                        let effects = this.inner.borrow_mut().m.notification_reply_failed(thread_id, &text, refused);
+                        this.run(effects);
+                    });
+                }
+                Effect::MaybeNotSent { thread_id, text } => self.watch_for_echo(thread_id, text),
+                Effect::SendNew { addresses, text, attachments } => self.with_device(move |c, d| async move {
+                    c.send_sms(&d, &addresses, &text, &attachments).await;
+                }),
+                Effect::DeleteOnPhone { thread_id } => self.with_device(move |c, d| async move {
+                    c.delete_conversation(&d, thread_id).await;
+                }),
             }
         }
         if refresh {
@@ -349,6 +398,95 @@ impl MessagesPage {
         if let (Some(c), Some(d)) = (i.client.clone(), i.m.device_id().map(str::to_string)) {
             glib::spawn_future_local(f(c, d));
         }
+    }
+
+    fn toast(&self, text: &str) {
+        self.widget.add_toast(adw::Toast::new(text));
+    }
+
+    /// The compose bar's send. Returns whether it was taken.
+    fn send(self: &Rc<Self>, thread_id: i64, text: &str, picture: Option<&std::path::Path>) -> bool {
+        let attachments: Vec<String> = picture.map(|p| p.to_string_lossy().into_owned()).into_iter().collect();
+        let (effects, taken) = {
+            let mut i = self.inner.borrow_mut();
+            let effects = i.m.send_with(thread_id, text, attachments);
+            // Refused (phone away): keep the text so it can be sent later.
+            let taken = !effects.iter().any(|e| matches!(e, Effect::Toast(_))) && !effects.is_empty();
+            (effects, taken)
+        };
+        self.run(effects);
+        taken
+    }
+
+    /// A notification reply got no clear answer. Give the phone's echo a
+    /// moment; if it never comes, say so and offer to send it again (as SMS).
+    fn watch_for_echo(self: &Rc<Self>, thread_id: i64, text: String) {
+        let weak = Rc::downgrade(self);
+        glib::timeout_add_seconds_local_once(15, move || {
+            let Some(this) = weak.upgrade() else { return };
+            if !this.inner.borrow().m.awaiting_echo(thread_id, &text) {
+                return; // it went out after all
+            }
+            let toast = adw::Toast::new("That text may not have sent");
+            toast.set_button_label(Some("Send again"));
+            toast.set_timeout(0);
+            let weak = Rc::downgrade(&this);
+            toast.connect_button_clicked(move |_| {
+                if let Some(this) = weak.upgrade() {
+                    let effects = this.inner.borrow_mut().m.notification_reply_failed(thread_id, &text, true);
+                    this.run(effects);
+                }
+            });
+            this.widget.add_toast(toast);
+        });
+    }
+
+    // ── notifications (for replying through them) ─────────────────
+
+    fn subscribe_notifications(self: &Rc<Self>, client: &Client, device_id: &str) -> Vec<Subscription> {
+        let path = format!("{}/notifications", device_path(device_id));
+        let mut subs = Vec::new();
+        for name in ["notificationPosted", "notificationUpdated"] {
+            let weak = Rc::downgrade(self);
+            subs.push(signals::subscribe(client.bus(), &path, IFACE_NOTIFICATIONS, name, move |p| {
+                let (Some(this), Some(id)) = (weak.upgrade(), p.get::<(String,)>().map(|t| t.0)) else { return };
+                this.load_notification(id);
+            }));
+        }
+        let weak = Rc::downgrade(self);
+        subs.push(signals::subscribe(client.bus(), &path, IFACE_NOTIFICATIONS, "notificationRemoved", move |p| {
+            let (Some(this), Some(id)) = (weak.upgrade(), p.get::<(String,)>().map(|t| t.0)) else { return };
+            this.inner.borrow_mut().m.remove_notification(&id);
+        }));
+        let weak = Rc::downgrade(self);
+        subs.push(signals::subscribe(client.bus(), &path, IFACE_NOTIFICATIONS, "allNotificationsRemoved", move |_| {
+            if let Some(this) = weak.upgrade() {
+                this.inner.borrow_mut().m.clear_notifications();
+            }
+        }));
+        subs
+    }
+
+    fn load_notifications(self: &Rc<Self>) {
+        let weak = Rc::downgrade(self);
+        self.with_device(move |c, d| async move {
+            let all = c.fetch_active_notifications(&d).await;
+            let Some(this) = weak.upgrade() else { return };
+            let mut i = this.inner.borrow_mut();
+            for (id, props) in all {
+                i.m.note_notification(replyable(&id, &props));
+            }
+        });
+    }
+
+    fn load_notification(self: &Rc<Self>, id: String) {
+        let weak = Rc::downgrade(self);
+        self.with_device(move |c, d| async move {
+            let props = c.notification_properties(&d, &id).await;
+            if let Some(this) = weak.upgrade() {
+                this.inner.borrow_mut().m.note_notification(replyable(&id, &props));
+            }
+        });
     }
 
     fn show_thread(&self, tid: i64) {

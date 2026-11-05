@@ -259,6 +259,8 @@ pub struct BubbleActions {
 struct Bubble {
     widget: gtk::Box,
     revealer: gtk::Revealer,
+    /// The send route on its own, shown while the time is hidden.
+    route_tag: Option<gtk::Label>,
     message: SmsMessage,
 }
 
@@ -311,7 +313,11 @@ impl Bubble {
         let revealer = gtk::Revealer::new();
         revealer.set_transition_type(gtk::RevealerTransitionType::SlideDown);
         revealer.set_transition_duration(160);
-        let label = format!("{} {}", if sent { "Sent" } else { "Received" }, clock(msg.timestamp()));
+        let mut label = format!("{} {}", if sent { "Sent" } else { "Received" }, clock(msg.timestamp()));
+        if let Some(r) = route {
+            label.push_str(" · ");
+            label.push_str(r.label());
+        }
         let time = gtk::Label::new(Some(&label));
         time.set_halign(if sent { gtk::Align::End } else { gtk::Align::Start });
         time.add_css_class("dim-label");
@@ -321,9 +327,10 @@ impl Bubble {
         time.set_margin_end(if sent { 12 } else { 0 });
         revealer.set_child(Some(&time));
         widget.append(&revealer);
-        // How a text sent from this app left it: always shown, so a fallback
-        // to SMS is never hidden.
-        if let Some(r) = route {
+        // How a text sent from this app left it: always shown (with the time
+        // when that shows, else on its own), so a fallback to SMS is never
+        // hidden.
+        let route_tag = route.map(|r| {
             let tag = gtk::Label::new(Some(r.label()));
             tag.set_halign(gtk::Align::End);
             tag.add_css_class("dim-label");
@@ -331,9 +338,10 @@ impl Bubble {
             tag.add_css_class("message-timestamp");
             tag.set_margin_end(12);
             widget.append(&tag);
-        }
+            tag
+        });
 
-        let bubble = Rc::new(Self { widget, revealer, message: msg.clone() });
+        let bubble = Rc::new(Self { widget, revealer, route_tag, message: msg.clone() });
         bubble.set_timestamp_visible(show_time);
         if !has_links {
             // Tap a bubble to show or hide its time.
@@ -351,6 +359,9 @@ impl Bubble {
 
     fn set_timestamp_visible(&self, visible: bool) {
         self.revealer.set_reveal_child(visible);
+        if let Some(tag) = &self.route_tag {
+            tag.set_visible(!visible);
+        }
         if visible {
             self.widget.add_css_class("message-bubble-timestamp-visible");
         } else {
@@ -651,6 +662,12 @@ pub struct ThreadView {
     messages_box: gtk::Box,
     pub entry: gtk::Entry,
     pub send_button: gtk::Button,
+    preview_bar: gtk::Box,
+    preview_picture: gtk::Picture,
+    pending_image: RefCell<Option<PathBuf>>,
+    /// `(thread_id, text, picture)` → whether it was taken (then the compose
+    /// bar clears).
+    on_send: RefCell<Option<SendHandler>>,
     actions: BubbleActions,
     state: RefCell<State>,
 }
@@ -706,13 +723,48 @@ impl ThreadView {
         thread_box.append(&scroll);
 
         thread_box.append(&gtk::Separator::new(gtk::Orientation::Horizontal));
+
+        // A pasted picture waiting to go with the next send.
+        let preview_bar = gtk::Box::new(gtk::Orientation::Horizontal, 12);
+        preview_bar.set_margin_start(12);
+        preview_bar.set_margin_end(12);
+        preview_bar.set_margin_top(8);
+        preview_bar.add_css_class("compose-image-preview-card");
+        preview_bar.set_visible(false);
+        let preview_picture = gtk::Picture::new();
+        preview_picture.set_size_request(96, 96);
+        preview_picture.set_can_shrink(true);
+        preview_picture.set_content_fit(gtk::ContentFit::Cover);
+        preview_picture.set_overflow(gtk::Overflow::Hidden);
+        preview_picture.add_css_class("message-image");
+        preview_bar.append(&preview_picture);
+        let preview_text = gtk::Box::new(gtk::Orientation::Vertical, 4);
+        preview_text.set_valign(gtk::Align::Center);
+        preview_text.set_hexpand(true);
+        let preview_label = gtk::Label::new(Some("Picture pasted"));
+        preview_label.add_css_class("heading");
+        preview_label.set_xalign(0.0);
+        preview_text.append(&preview_label);
+        let preview_hint = gtk::Label::new(Some("It goes with your next message"));
+        preview_hint.add_css_class("dim-label");
+        preview_hint.add_css_class("caption");
+        preview_hint.set_xalign(0.0);
+        preview_text.append(&preview_hint);
+        preview_bar.append(&preview_text);
+        let preview_remove = gtk::Button::from_icon_name("edit-clear-symbolic");
+        preview_remove.add_css_class("flat");
+        preview_remove.set_valign(gtk::Align::Center);
+        preview_remove.set_tooltip_text(Some("Remove picture"));
+        preview_bar.append(&preview_remove);
+        thread_box.append(&preview_bar);
+
         let compose = gtk::Box::new(gtk::Orientation::Horizontal, 8);
         compose.set_margin_start(12);
         compose.set_margin_end(12);
         compose.set_margin_top(8);
         compose.set_margin_bottom(8);
         let entry = gtk::Entry::new();
-        entry.set_placeholder_text(Some("Type a message…"));
+        entry.set_placeholder_text(Some("Type a message…  (Ctrl+V pastes a picture)"));
         entry.set_hexpand(true);
         compose.append(&entry);
         let send_button = gtk::Button::from_icon_name("mail-send-symbolic");
@@ -728,11 +780,47 @@ impl ThreadView {
             address,
             scroll: scroll.clone(),
             messages_box,
-            entry,
-            send_button,
+            entry: entry.clone(),
+            send_button: send_button.clone(),
+            preview_bar,
+            preview_picture,
+            pending_image: RefCell::default(),
+            on_send: RefCell::default(),
             actions,
             state: RefCell::new(State { window: THREAD_WINDOW, pinned: true, ..Default::default() }),
         });
+
+        let weak = Rc::downgrade(&this);
+        entry.connect_activate(move |_| {
+            if let Some(this) = weak.upgrade() {
+                this.send();
+            }
+        });
+        let weak = Rc::downgrade(&this);
+        send_button.connect_clicked(move |_| {
+            if let Some(this) = weak.upgrade() {
+                this.send();
+            }
+        });
+        let weak = Rc::downgrade(&this);
+        preview_remove.connect_clicked(move |_| {
+            if let Some(this) = weak.upgrade() {
+                this.clear_pending_image(true);
+            }
+        });
+        // Ctrl+V / Shift+Insert with a picture on the clipboard attaches it.
+        let keys = gtk::EventControllerKey::new();
+        keys.set_propagation_phase(gtk::PropagationPhase::Capture);
+        let weak = Rc::downgrade(&this);
+        keys.connect_key_pressed(move |_, key, _, state| {
+            let paste = (state.contains(gdk::ModifierType::CONTROL_MASK) && matches!(key, gdk::Key::v | gdk::Key::V))
+                || (state.contains(gdk::ModifierType::SHIFT_MASK) && key == gdk::Key::Insert);
+            match (paste, weak.upgrade()) {
+                (true, Some(this)) if this.paste_picture() => glib::Propagation::Stop,
+                _ => glib::Propagation::Proceed,
+            }
+        });
+        this.entry.add_controller(keys);
 
         // Pinned to the bottom unless the user scrolled up; stay there while
         // content grows (images sizing in).
@@ -754,6 +842,86 @@ impl ThreadView {
             }
         });
         this
+    }
+
+    pub fn connect_send(&self, f: impl Fn(i64, &str, Option<&Path>) -> bool + 'static) {
+        *self.on_send.borrow_mut() = Some(Box::new(f));
+    }
+
+    fn send(&self) {
+        let Some(tid) = self.state.borrow().thread_id else { return };
+        let text = self.entry.text().trim().to_string();
+        let image = self.pending_image.borrow().clone();
+        if text.is_empty() && image.is_none() {
+            return;
+        }
+        let taken = self.on_send.borrow().as_ref().is_some_and(|f| f(tid, &text, image.as_deref()));
+        if taken {
+            self.entry.set_text("");
+            if let Some(path) = image {
+                // Keep the file until KDE Connect has read it, as Python did.
+                self.clear_pending_image(false);
+                glib::timeout_add_seconds_local_once(120, move || {
+                    let _ = std::fs::remove_file(path);
+                });
+            }
+        }
+    }
+
+    /// If the clipboard holds a picture (pixels, or an image file), make it
+    /// the pending attachment. Returns whether it looked like one.
+    fn paste_picture(self: &Rc<Self>) -> bool {
+        let clipboard = self.entry.clipboard();
+        let formats = clipboard.formats();
+        let has_texture = formats.contains_type(gdk::Texture::static_type())
+            || formats.mime_types().iter().any(|m| m.starts_with("image/"));
+        let weak = Rc::downgrade(self);
+        if has_texture {
+            clipboard.read_texture_async(gio::Cancellable::NONE, move |res| {
+                let (Some(this), Ok(Some(tex))) = (weak.upgrade(), res) else { return };
+                let dir = std::env::temp_dir().join("phonelink");
+                if std::fs::create_dir_all(&dir).is_err() {
+                    return;
+                }
+                let stamp = std::time::SystemTime::now()
+                    .duration_since(std::time::UNIX_EPOCH)
+                    .map_or(0, |d| d.as_millis());
+                let path = dir.join(format!("paste_{stamp}.png"));
+                if tex.save_to_png(&path).is_ok() {
+                    this.set_pending_image(path);
+                }
+            });
+            return true;
+        }
+        if formats.contain_mime_type("text/uri-list") {
+            clipboard.read_text_async(gio::Cancellable::NONE, move |res| {
+                let (Some(this), Ok(Some(text))) = (weak.upgrade(), res) else { return };
+                if let Some(path) = image_path_from_uri_list(&text) {
+                    this.set_pending_image(path);
+                }
+            });
+            return true;
+        }
+        false
+    }
+
+    fn set_pending_image(&self, path: PathBuf) {
+        self.clear_pending_image(true);
+        self.preview_picture.set_filename(Some(&path));
+        self.preview_bar.set_visible(true);
+        *self.pending_image.borrow_mut() = Some(path);
+    }
+
+    /// Drop the pending picture; `delete` removes a pasted temp file.
+    fn clear_pending_image(&self, delete: bool) {
+        if let Some(path) = self.pending_image.borrow_mut().take()
+            && delete
+            && path.starts_with(std::env::temp_dir().join("phonelink"))
+        {
+            let _ = std::fs::remove_file(path);
+        }
+        self.preview_picture.set_filename(None::<&Path>);
+        self.preview_bar.set_visible(false);
     }
 
     pub fn show_empty(&self) {
@@ -966,6 +1134,19 @@ impl ThreadView {
             self.messages_box.remove(&child);
         }
     }
+}
+
+type SendHandler = Box<dyn Fn(i64, &str, Option<&Path>) -> bool>;
+
+const IMAGE_FILE_EXTS: &[&str] = &["png", "jpg", "jpeg", "webp", "gif", "bmp", "tiff", "tif", "heic", "heif"];
+
+/// The first existing image file in a pasted `text/uri-list` (or plain paths).
+pub fn image_path_from_uri_list(text: &str) -> Option<PathBuf> {
+    text.lines().map(str::trim).filter(|l| !l.is_empty()).find_map(|line| {
+        let path = if line.starts_with("file://") { gio::File::for_uri(line).path()? } else { PathBuf::from(line) };
+        let ext = path.extension()?.to_str()?.to_ascii_lowercase();
+        (path.is_file() && IMAGE_FILE_EXTS.contains(&ext.as_str())).then_some(path)
+    })
 }
 
 fn earlier_label(hidden: usize) -> String {
