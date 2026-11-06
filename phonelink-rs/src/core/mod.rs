@@ -11,6 +11,7 @@ pub mod message;
 pub mod messages;
 pub mod models;
 pub mod notifications;
+pub mod phone_delete;
 pub mod reconcile;
 pub mod settings;
 pub mod shell;

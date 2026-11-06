@@ -503,9 +503,7 @@ impl MessagesPage {
                 Effect::SendNew { addresses, text, attachments } => self.with_device(move |c, d| async move {
                     c.send_sms(&d, &addresses, &text, &attachments).await;
                 }),
-                Effect::DeleteOnPhone { thread_id } => self.with_device(move |c, d| async move {
-                    c.delete_conversation(&d, thread_id).await;
-                }),
+                Effect::DeleteOnPhone { thread_id, addresses } => self.delete_on_phone(vec![(thread_id, addresses)]),
             }
         }
         if refresh {
@@ -624,6 +622,50 @@ impl MessagesPage {
         dialog.present();
     }
 
+    /// Delete chats on the phone: KDE Connect when the daemon can, else
+    /// Google Messages.
+    fn delete_on_phone(self: &Rc<Self>, chats: Vec<(i64, Vec<String>)>) {
+        let this = self.clone();
+        glib::spawn_future_local(async move {
+            let (client, device) = {
+                let i = this.inner.borrow();
+                (i.client.clone(), i.m.device_id().map(str::to_string))
+            };
+            if let (Some(c), Some(d)) = (&client, &device)
+                && c.supports_conversation_deletion(d).await
+            {
+                for (thread_id, _) in &chats {
+                    c.delete_conversation(d, *thread_id).await;
+                }
+                return;
+            }
+            this.delete_on_google(chats);
+        });
+    }
+
+    /// Run the Google Messages helper off the main thread, then say how it went.
+    fn delete_on_google(self: &Rc<Self>, chats: Vec<(i64, Vec<String>)>) {
+        if !crate::core::phone_delete::available() {
+            self.toast("Removed from Phone Link only: Google Messages isn't paired on this computer");
+            return;
+        }
+        let weak = Rc::downgrade(self);
+        let members: Vec<Vec<String>> = chats.into_iter().map(|(_, a)| a).collect();
+        glib::spawn_future_local(async move {
+            let done = gio::spawn_blocking(move || crate::core::phone_delete::delete_chats(&members)).await;
+            let Some(this) = weak.upgrade() else { return };
+            match done {
+                Ok(result) => {
+                    if let Err(e) = &result {
+                        log::warn!("delete on phone: {e}");
+                    }
+                    this.toast(&crate::core::phone_delete::summary(&result));
+                }
+                Err(_) => this.toast("Removed from Phone Link only: the Google Messages helper crashed"),
+            }
+        });
+    }
+
     /// Confirm, then delete one or several chats (here, and on the phone
     /// when the daemon can).
     fn delete_dialog(self: &Rc<Self>, thread_ids: Vec<i64>) {
@@ -635,10 +677,12 @@ impl MessagesPage {
         glib::spawn_future_local(async move {
             let device = this.inner.borrow().m.device_id().map(str::to_string);
             let any_real = thread_ids.iter().any(|t| *t >= 0);
-            let can_delete_on_phone = match (&client, &device) {
+            let kde_deletes = match (&client, &device) {
                 (Some(c), Some(d)) if any_real => c.supports_conversation_deletion(d).await,
                 _ => false,
             };
+            let google_deletes = any_real && !kde_deletes && crate::core::phone_delete::available();
+            let can_delete_on_phone = kde_deletes || google_deletes;
             let (heading, mut body) = if let [thread_id] = thread_ids.as_slice() {
                 let i = this.inner.borrow();
                 let name = i.m.index
@@ -650,13 +694,18 @@ impl MessagesPage {
                 let n = thread_ids.len();
                 (format!("Delete {n} Conversations"), format!("Remove these {n} conversations from Phone Link?"))
             };
-            body.push_str(if can_delete_on_phone {
+            body.push_str(if google_deletes {
+                "\n\nThis also deletes them from your phone (Google Messages). It can't be undone."
+            } else if kde_deletes {
                 "\n\nPhone Link will also ask your phone to delete them there."
             } else {
-                "\n\nYour current KDE Connect build does not expose remote SMS deletion, so this will remove them only from Phone Link."
+                "\n\nThis removes them from Phone Link only: phone-side deletion needs Google Messages paired (gmcli) and the phonelink-gm helper."
             });
             if thread_ids.len() == 1 {
-                body = body.replace("delete them there", "delete it there").replace("remove them only", "remove it only");
+                body = body
+                    .replace("deletes them from", "deletes it from")
+                    .replace("delete them there", "delete it there")
+                    .replace("removes them from", "removes it from");
             }
             let dialog = adw::MessageDialog::new(this.parent_window().as_ref(), Some(&heading), Some(&body));
             dialog.add_responses(&[("cancel", "Cancel"), ("delete", "Delete")]);
@@ -677,6 +726,19 @@ impl MessagesPage {
                             effects.extend(i.m.delete(tid, can_delete_on_phone, store, &mut *i.settings.borrow_mut(), now_ms));
                         }
                     });
+                    // Google deletes go to the helper in one run (it connects
+                    // once), not one per chat.
+                    let mut to_phone = Vec::new();
+                    effects.retain(|e| match e {
+                        Effect::DeleteOnPhone { thread_id, addresses } if google_deletes => {
+                            to_phone.push((*thread_id, addresses.clone()));
+                            false
+                        }
+                        _ => true,
+                    });
+                    if !to_phone.is_empty() {
+                        this.delete_on_google(to_phone);
+                    }
                     // One "only from Phone Link" note, not one per chat.
                     let mut toasted = false;
                     effects.retain(|e| !matches!(e, Effect::Toast(_)) || !std::mem::replace(&mut toasted, true));

@@ -9,3 +9,6 @@ build/
 .venv/
 venv/
 /target/
+
+# built Google Messages helper
+/phonelink-gm/phonelink-gm

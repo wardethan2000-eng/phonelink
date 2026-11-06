@@ -208,10 +208,11 @@ impl GoogleSync {
         }
     }
 
-    /// A contact renamed in Phone Link: update (or create) it in Google,
-    /// silently, when an account is connected.
+    /// A contact renamed in Phone Link: update (or create) it in Google, so
+    /// the phone gets it; without an account, say it stayed local.
     pub fn push_rename(&self, address: &str, name: &str) {
         if !self.is_connected() {
+            (self.toast)(&format!("Saved {name} in Phone Link only; connect Google Contacts in Settings to update your phone too"));
             return;
         }
         let label = Some(self.settings.borrow().google_account_label().trim().to_string())

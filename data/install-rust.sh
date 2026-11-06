@@ -5,6 +5,9 @@
 # io.github.wardethan2000_eng.phonelink. It does not touch autostart: turn on
 # "Open on Login" in the app's Settings, which replaces the Python entry.
 # The Python app stays installed and runnable.
+# If phonelink-gm/phonelink-gm is built (deleting chats on the phone through
+# Google Messages; build it with `go build` in phonelink-gm/), it is installed
+# next to the app.
 set -euo pipefail
 
 SCRIPT_DIR="$(cd "$(dirname "$0")" && pwd)"
@@ -14,6 +17,11 @@ BIN="$HOME/.local/bin/phonelink-rs"
 
 mkdir -p "$HOME/.local/bin" "$HOME/.local/share/applications"
 install -m 755 "$SRC" "$BIN.new" && mv -f "$BIN.new" "$BIN"
+GM="$SCRIPT_DIR/../phonelink-gm/phonelink-gm"
+if [ -f "$GM" ]; then
+    install -m 755 "$GM" "$HOME/.local/bin/phonelink-gm.new" && mv -f "$HOME/.local/bin/phonelink-gm.new" "$HOME/.local/bin/phonelink-gm"
+    echo "Installed $HOME/.local/bin/phonelink-gm (delete chats on the phone)."
+fi
 
 cat > "$HOME/.local/share/applications/$APP_ID.desktop" <<DESKTOP
 [Desktop Entry]

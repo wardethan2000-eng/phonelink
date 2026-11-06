@@ -65,8 +65,9 @@ pub enum Effect {
     /// `sendWithoutConversation(addresses, text)` — only for brand-new
     /// conversations; the phone silently drops it otherwise.
     SendNew { addresses: Vec<String>, text: String, attachments: Vec<String> },
-    /// `deleteConversation(thread)` on the phone.
-    DeleteOnPhone { thread_id: i64 },
+    /// Delete on the phone: KDE Connect's `deleteConversation(thread)` when
+    /// the daemon has it, else Google Messages by the chat's members.
+    DeleteOnPhone { thread_id: i64, addresses: Vec<String> },
     RefreshList,
     ShowThread(i64),
     ShowEmpty,
@@ -846,9 +847,14 @@ impl Messages {
         now_ms: i64,
     ) -> Vec<Effect> {
         let mut out = Vec::new();
+        let addresses = self
+            .index
+            .get(thread_id)
+            .map(|c| if c.addresses.is_empty() { vec![c.address.clone()] } else { c.addresses.clone() })
+            .unwrap_or_default();
         let key = self.hide_locally(thread_id, hidden, now_ms);
         if can_delete_on_phone && thread_id >= 0 {
-            out.push(Effect::DeleteOnPhone { thread_id });
+            out.push(Effect::DeleteOnPhone { thread_id, addresses });
         } else if thread_id >= 0 {
             out.push(Effect::Toast(TOAST_LOCAL_DELETE_ONLY));
         }
@@ -1329,7 +1335,7 @@ mod tests {
         p.apply(&[tup(1, 10, &["111"], 100)]);
         p.m.select(10, &p.store, 0.0);
         let effects = p.m.delete(10, true, &p.store, &mut p.hidden, 1_000);
-        assert!(effects.contains(&Effect::DeleteOnPhone { thread_id: 10 }));
+        assert!(effects.iter().any(|e| matches!(e, Effect::DeleteOnPhone { thread_id: 10, addresses } if !addresses.is_empty())));
         assert!(effects.contains(&Effect::ShowEmpty));
         assert!(p.visible().is_empty());
         assert!(p.store.load_conversations("dev1").is_empty());
