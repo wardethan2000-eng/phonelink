@@ -94,6 +94,9 @@ struct Inner {
     full_pumping: bool,
     /// A full picture arrived: redraw once things settle.
     redraw_pending: Option<glib::SourceId>,
+    /// Threads we just asked the daemon to replay (their conversationLoaded
+    /// is ours, not news), with when.
+    recent_requests: std::collections::HashMap<i64, f64>,
 }
 
 pub struct MessagesPage {
@@ -182,6 +185,7 @@ impl MessagesPage {
                 full_queue: VecDeque::new(),
                 full_pumping: false,
                 redraw_pending: None,
+                recent_requests: Default::default(),
             }),
         });
         *download_target.borrow_mut() = Rc::downgrade(&this);
@@ -333,8 +337,21 @@ impl MessagesPage {
         subs.push(signals::subscribe(bus, &path, IFACE_CONVERSATIONS, "conversationLoaded", move |p| {
             let (Some(this), Some(tid)) = (weak.upgrade(), variant::first_int(p)) else { return };
             let effects = this.inner.borrow_mut().m.on_conversation_loaded(tid, now());
+            // Our own request (a gap fill, or its replay) finishing: the
+            // messages come as signals, so there is nothing to reload. A
+            // reload here re-queued gap fills and looped every 5–20 s on the
+            // laptop (run 3).
+            let ours = !effects.is_empty() || {
+                let mut i = this.inner.borrow_mut();
+                let t = now();
+                i.recent_requests.retain(|_, at| t - *at < 60.0);
+                i.recent_requests.remove(&tid).is_some()
+            };
             this.run(effects);
             this.reschedule();
+            if ours {
+                return;
+            }
             // As Python: a debounced reload of the daemon's list and the
             // notification names, 500 ms after the last load.
             if let Some(old) = this.inner.borrow_mut().loaded_reload.take() {
@@ -516,10 +533,13 @@ impl MessagesPage {
             Action::RequestFromPhone { thread_id, count, older_than } => self.with_device(move |c, d| async move {
                 c.request_thread_from_phone(&d, thread_id, count, older_than.unwrap_or(-1)).await;
             }),
-            Action::ReplayFromDaemon { thread_id, start, end } => self.with_device(move |c, d| async move {
+            Action::ReplayFromDaemon { thread_id, start, end } => {
+                self.inner.borrow_mut().recent_requests.insert(thread_id, now());
+                self.with_device(move |c, d| async move {
                 let clamp = |n: i64| i32::try_from(n).unwrap_or(i32::MAX);
                 c.request_conversation(&d, thread_id, clamp(start), clamp(end)).await;
-            }),
+                })
+            }
         }
     }
 

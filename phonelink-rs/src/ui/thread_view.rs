@@ -48,6 +48,9 @@ const THUMB_IMAGE_UPSCALE_CAP: f64 = 2.2;
 const ATTACHMENT_THUMBNAIL_MAX: i32 = 256;
 const IMAGE_DECODE_SCALE: i32 = 2;
 const IMAGE_CACHE_MAX: usize = 64;
+/// ...and at most this many bytes of pixels (64 full photos at 2× display
+/// size would be ~190 MB).
+const IMAGE_CACHE_MAX_BYTES: usize = 64 * 1024 * 1024;
 /// Opening a chat lays out this many of the newest bubbles at once; the rest
 /// of the window is added above in batches of [`BUILD_BATCH`], one per idle
 /// callback, so no frame waits on 60 bubbles (laptop, 2026-11-06: 80–155 ms
@@ -243,7 +246,12 @@ impl ImageCache {
     fn remember(&mut self, key: ImageKey, tex: gdk::Texture) {
         self.textures.retain(|(k, _)| *k != key);
         self.textures.push_back((key, tex));
-        while self.textures.len() > IMAGE_CACHE_MAX {
+        let bytes = |c: &VecDeque<(ImageKey, gdk::Texture)>| {
+            c.iter().map(|(_, t)| t.width() as usize * t.height() as usize * 4).sum::<usize>()
+        };
+        while self.textures.len() > IMAGE_CACHE_MAX
+            || (self.textures.len() > 1 && bytes(&self.textures) > IMAGE_CACHE_MAX_BYTES)
+        {
             self.textures.pop_front();
         }
     }
