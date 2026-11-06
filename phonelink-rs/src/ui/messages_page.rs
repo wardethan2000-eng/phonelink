@@ -99,6 +99,8 @@ pub struct MessagesPage {
     hidden_banner: adw::Banner,
     /// The window's notifications (one subscription for the whole app).
     notifications: Rc<NotificationsModel>,
+    /// The window's toast overlay, once set; until then, the page's own.
+    toasts: RefCell<Option<adw::ToastOverlay>>,
     inner: RefCell<Inner>,
 }
 
@@ -153,6 +155,7 @@ impl MessagesPage {
             list,
             thread,
             notifications: notifications.clone(),
+            toasts: RefCell::default(),
             inner: RefCell::new(Inner {
                 m: Messages::new(),
                 store,
@@ -169,11 +172,11 @@ impl MessagesPage {
             }),
         });
         *download_target.borrow_mut() = Rc::downgrade(&this);
-        let saved_scale = this.inner.borrow().settings.message_font_scale();
+        let saved_scale = this.inner.borrow().settings.borrow().message_font_scale();
         let weak = Rc::downgrade(&this);
         this.thread.set_zoom(saved_scale, move |scale| {
             if let Some(this) = weak.upgrade()
-                && let Err(e) = this.inner.borrow_mut().settings.set_message_font_scale(scale)
+                && let Err(e) = this.inner.borrow().settings.borrow_mut().set_message_font_scale(scale)
             {
                 log::warn!("saving the text size failed: {e}");
             }
@@ -286,7 +289,7 @@ impl MessagesPage {
                 if i.m.device_id() != Some(id.as_str()) {
                     return;
                 }
-                i.m.apply_active(&raw, &i.store, &mut i.settings.borrow_mut(), now())
+                i.m.apply_active(&raw, &i.store, &mut *i.settings.borrow_mut(), now())
             };
             log::info!("activeConversations: {} entries, {} parsed", entries.len(), raw.len());
             this.run(effects);
@@ -468,7 +471,7 @@ impl MessagesPage {
         }
         if refresh {
             let i = self.inner.borrow();
-            self.list.set_conversations(&i.m.visible(&i.settings.borrow()));
+            self.list.set_conversations(&i.m.visible(&*i.settings.borrow()));
         }
     }
 
@@ -589,7 +592,7 @@ impl MessagesPage {
                 let effects = {
                     let mut guard = this.inner.borrow_mut();
                     let i = &mut *guard;
-                    let mut effects = i.m.delete(thread_id, can_delete_on_phone, &i.store, &mut i.settings.borrow_mut(), now_ms);
+                    let mut effects = i.m.delete(thread_id, can_delete_on_phone, &i.store, &mut *i.settings.borrow_mut(), now_ms);
                     effects.push(Effect::ShowEmpty);
                     effects
                 };
@@ -741,8 +744,21 @@ impl MessagesPage {
         count
     }
 
+    /// Show this page's toasts on the window's overlay, so they queue with
+    /// the window's own instead of stacking on top of them.
+    pub fn use_toasts(&self, overlay: &adw::ToastOverlay) {
+        *self.toasts.borrow_mut() = Some(overlay.clone());
+    }
+
+    fn add_toast(&self, toast: adw::Toast) {
+        match self.toasts.borrow().as_ref() {
+            Some(overlay) => overlay.add_toast(toast),
+            None => self.widget.add_toast(toast),
+        }
+    }
+
     fn toast(&self, text: &str) {
-        self.widget.add_toast(adw::Toast::new(text));
+        self.add_toast(adw::Toast::new(text));
     }
 
     /// The compose bar's send. Returns whether it was taken.
@@ -778,7 +794,7 @@ impl MessagesPage {
                     this.run(effects);
                 }
             });
-            this.widget.add_toast(toast);
+            this.add_toast(toast);
         });
     }
 

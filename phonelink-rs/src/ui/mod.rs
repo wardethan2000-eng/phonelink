@@ -53,6 +53,13 @@ fn python_app_running() -> bool {
     .is_some_and(|(b,)| b)
 }
 
+/// `ListBox::remove_all` needs GTK 4.12; the app supports 4.10.
+pub fn clear_list_box(list: &gtk::ListBox) {
+    while let Some(child) = list.first_child() {
+        list.remove(&child);
+    }
+}
+
 const EXTRA_CSS: &str = "
 .message-image { border-radius: 18px; background-color: alpha(currentColor, 0.06); }
 .message-file-chip { padding: 6px 4px; }

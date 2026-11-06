@@ -197,6 +197,7 @@ impl Window {
 
         let notifications = NotificationsModel::new();
         let messages = MessagesPage::new(MessageStore::open_default(), settings.clone(), notifications.clone());
+        messages.use_toasts(&toasts);
         let page = stack.add_titled(&messages.widget, Some("sms"), "Messages");
         page.set_icon_name(Some("mail-unread-symbolic"));
         let clipboard = ClipboardPage::new(toast.clone());
@@ -466,7 +467,7 @@ impl Window {
         let multi = paired.len() > 1;
         self.header.device_arrow.set_visible(multi);
         self.header.device_btn.set_sensitive(multi);
-        self.header.device_list.remove_all();
+        super::clear_list_box(&self.header.device_list);
         let active = self.device.borrow().as_ref().map(|d| d.id.clone());
         let mut rows = Vec::new();
         for dev in paired {

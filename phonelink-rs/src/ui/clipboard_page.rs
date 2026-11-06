@@ -109,7 +109,7 @@ impl ClipboardPage {
         clear.connect_clicked(move |_| {
             if let Some(this) = weak.upgrade() {
                 this.history.borrow_mut().clear();
-                this.list_box.remove_all();
+                super::clear_list_box(&this.list_box);
             }
         });
         this

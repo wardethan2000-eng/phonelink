@@ -189,6 +189,43 @@ Live results (laptop, daemon 26.08, 2026-11-05):
   same minimum as the Python app and as `core::compat`.
 
 
+## Phase 4 status (window shell, notifications, clipboard, ring, share)
+Branch `rust-phase4` (worktree), merged into `rust-port` when done.
+- [x] Shared notifications: `ui/notifications_model.rs`, owned by the window,
+  subscribes once and fans out to Messages (Route A, hidden texts, names) and
+  the sidebar. Messages no longer subscribes itself.
+- [x] Shared settings: `Rc<RefCell<Settings>>` owned by the window. The
+  message store stays inside Messages until something else needs it (Phase 6,
+  Google Contacts).
+- [x] Window toasts: one `ToastOverlay` over the body (3 s). Messages sends
+  its toasts there too (`use_toasts`), so they queue instead of stacking.
+- [x] Shell: min size 640×420; device switcher popover (paired devices, check
+  on the active one, arrow + clickable only with two or more); active-device
+  pick with the `devices[0]` fallback (`core::shell`); coalesced refreshes
+  (one in flight + one queued); 120 s watchdog (also retries the session bus);
+  resume pull 8 s after `PrepareForSleep(false)`; pull on window show (120 s
+  limit) and on `reachableChanged(true)`; saved color scheme at startup; icon
+  fallbacks (`ui/icons.rs`); app icon bundled into the binary as a GResource
+  (`build.rs`, from `data/icons`); daemon missing at startup shows the setup
+  page (the name watch reports "vanished" at once).
+- [x] Notifications sidebar: `OverlaySplitView` at the end, 300 px, hidden,
+  header toggle kept in sync, Ctrl+N. List, expand, dismiss, dismiss all,
+  refresh, per-app filter, in-place diffed rows (`core::notifications`).
+  Python bug fixed: a reply to a notification that is gone (or refused) now
+  keeps the text and says so, instead of clearing the box silently.
+- [x] Clipboard tab: 2 s desktop-clipboard poll (10 s stuck reset), 50
+  entries, copy back, clear. "Send Clipboard to Phone" calls the argument-less
+  `sendClipboard()` (26.08), falling back to `sendClipboard(s)` on older
+  daemons. The "phone" source and `clipboardChanged` are gone: 26.08 has no
+  such signal, and KDE Connect puts the phone's clipboard on the desktop
+  clipboard, where the poll sees it.
+- [x] Header actions: Find Phone (toasts), settings gear (a placeholder page
+  with Back until Phase 6).
+- [x] Share: drop a file anywhere on the tabs; "Continue on PC" opens http(s)
+  links from `shareReceived`.
+- Not here: close-to-tray (Phase 6; close quits for now), the Files tab's
+  pull on reconnect/resume/show (Phase 5).
+
 ## Reported GitHub issues (as of 2026-11-05)
 | # | Issue | Plan |
 |---|---|---|

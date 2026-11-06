@@ -59,7 +59,7 @@ impl NotificationList {
             return Vec::new();
         }
         let mut out: Vec<&Notification> =
-            self.items.values().filter(|n| !ignored_apps.iter().any(|a| *a == n.app_name)).collect();
+            self.items.values().filter(|n| !ignored_apps.contains(&n.app_name)).collect();
         out.sort_by(|a, b| b.timestamp.total_cmp(&a.timestamp).then_with(|| a.public_id.cmp(&b.public_id)));
         out
     }
