@@ -10,10 +10,13 @@ use adw::prelude::*;
 
 use super::clipboard_page::ClipboardPage;
 use super::files_page::FilesPage;
+use super::google_sync::GoogleSync;
 use super::icons;
 use super::messages_page::MessagesPage;
 use super::notifications_model::NotificationsModel;
 use super::notifications_panel::NotificationsPanel;
+use super::settings_page::{self, SettingsPage};
+use super::tray::{self, Tray};
 use crate::core::models::Device;
 use crate::core::settings::Settings;
 use crate::core::shell::{self, RefreshGate};
@@ -78,6 +81,13 @@ pub struct Window {
     clipboard: Rc<ClipboardPage>,
     notif_panel: Rc<NotificationsPanel>,
     notifications: Rc<NotificationsModel>,
+    settings_page: Rc<SettingsPage>,
+    google: Rc<GoogleSync>,
+    /// The tray icon, when a StatusNotifierWatcher took it. Without one,
+    /// closing the window quits (else the window would be stranded).
+    tray: RefCell<Option<Tray>>,
+    tray_shown: Cell<bool>,
+    quitting: Cell<bool>,
     client: RefCell<Option<Client>>,
     device: RefCell<Option<Device>>,
     devices: RefCell<Vec<Device>>,
@@ -92,21 +102,12 @@ pub struct Window {
     watch: RefCell<Option<NameWatch>>,
 }
 
-fn apply_color_scheme(scheme: &str) {
-    let scheme = match scheme {
-        "light" => adw::ColorScheme::ForceLight,
-        "dark" => adw::ColorScheme::ForceDark,
-        _ => adw::ColorScheme::Default,
-    };
-    adw::StyleManager::default().set_color_scheme(scheme);
-}
-
 impl Window {
     pub fn new(app: &adw::Application) -> Rc<Self> {
         icons::register_app_icon();
         let mut settings = Settings::new();
         settings.load();
-        apply_color_scheme(settings.color_scheme());
+        settings_page::apply_color_scheme(settings.color_scheme());
         let settings = Rc::new(RefCell::new(settings));
 
         let window = adw::ApplicationWindow::new(app);
@@ -227,7 +228,28 @@ impl Window {
         body.set_vexpand(true);
         body.set_transition_type(gtk::StackTransitionType::Crossfade);
         body.add_named(&split, Some("main"));
-        body.add_named(&settings_stub(&body), Some("settings"));
+        let google = GoogleSync::new(settings.clone(), window.upcast_ref(), toast.clone());
+        google.set_messages(&messages);
+        messages.set_google(google.clone());
+        let settings_page = {
+            let body = body.downgrade();
+            let panel = Rc::downgrade(&notif_panel);
+            SettingsPage::new(
+                settings.clone(),
+                google.clone(),
+                move || {
+                    if let Some(b) = body.upgrade() {
+                        b.set_visible_child_name("main");
+                    }
+                },
+                Rc::new(move || {
+                    if let Some(p) = panel.upgrade() {
+                        p.refilter();
+                    }
+                }),
+            )
+        };
+        body.add_named(&settings_page.widget, Some("settings"));
         body.add_named(&adw::StatusPage::new(), Some("status"));
         toasts.set_child(Some(&body));
         toasts.set_vexpand(true);
@@ -258,6 +280,11 @@ impl Window {
             clipboard,
             notif_panel,
             notifications,
+            settings_page,
+            google,
+            tray: RefCell::default(),
+            tray_shown: Cell::new(false),
+            quitting: Cell::new(false),
             client: RefCell::default(),
             device: RefCell::default(),
             devices: RefCell::default(),
@@ -280,6 +307,7 @@ impl Window {
         let weak = Rc::downgrade(&this);
         settings_btn.connect_clicked(move |_| {
             if let Some(this) = weak.upgrade() {
+                this.settings_page.refresh_google_status();
                 this.body.set_visible_child_name("settings");
             }
         });
@@ -310,8 +338,49 @@ impl Window {
             }
             glib::ControlFlow::Continue
         });
+        this.start_tray(app);
+        // Close hides to the tray; without a tray (or from the tray's Quit) it quits.
+        let weak = Rc::downgrade(&this);
+        this.window.connect_close_request(move |w| {
+            let Some(this) = weak.upgrade() else { return glib::Propagation::Proceed };
+            if this.tray_shown.get() && !this.quitting.get() {
+                w.set_visible(false);
+                return glib::Propagation::Stop;
+            }
+            glib::Propagation::Proceed
+        });
         this.start();
         this
+    }
+
+    fn start_tray(self: &Rc<Self>, app: &adw::Application) {
+        let Some(conn) = app.dbus_connection() else { return };
+        let weak = Rc::downgrade(self);
+        let toggle: Rc<dyn Fn()> = Rc::new(move || {
+            let Some(this) = weak.upgrade() else { return };
+            if this.window.is_visible() {
+                this.window.set_visible(false);
+            } else {
+                this.window.present();
+            }
+        });
+        let (weak, app_weak) = (Rc::downgrade(self), app.downgrade());
+        let quit: Rc<dyn Fn()> = Rc::new(move || {
+            if let Some(this) = weak.upgrade() {
+                this.quitting.set(true);
+                this.tray.borrow_mut().take();
+            }
+            if let Some(app) = app_weak.upgrade() {
+                app.quit();
+            }
+        });
+        let weak = Rc::downgrade(self);
+        let shown: Rc<dyn Fn(bool)> = Rc::new(move |on| {
+            if let Some(this) = weak.upgrade() {
+                this.tray_shown.set(on);
+            }
+        });
+        *self.tray.borrow_mut() = tray::start(&conn, toggle, quit, shown);
     }
 
     fn toast(&self, text: &str) {
@@ -463,6 +532,9 @@ impl Window {
         self.messages.set_device(client, dev.as_ref());
         self.notifications.set_device(client, dev.as_ref(), became_reachable);
         self.notif_panel.set_device(dev.as_ref());
+        if dev.as_ref().is_some_and(|d| d.reachable) && (changed || became_reachable) {
+            self.google.maybe_background();
+        }
         self.files.set_device(client, dev.as_ref());
         self.clipboard.set_device(client, dev.as_ref());
     }
@@ -626,30 +698,4 @@ impl Window {
         });
         self.window.add_controller(keys);
     }
-}
-
-/// Placeholder until the settings panel lands (Phase 6).
-fn settings_stub(body: &gtk::Stack) -> gtk::Box {
-    let b = gtk::Box::new(gtk::Orientation::Vertical, 0);
-    let bar = gtk::Box::new(gtk::Orientation::Horizontal, 0);
-    bar.set_margin_start(6);
-    bar.set_margin_top(6);
-    let back = gtk::Button::from_icon_name("go-previous-symbolic");
-    back.set_tooltip_text(Some("Back"));
-    back.add_css_class("flat");
-    let body = body.downgrade();
-    back.connect_clicked(move |_| {
-        if let Some(body) = body.upgrade() {
-            body.set_visible_child_name("main");
-        }
-    });
-    bar.append(&back);
-    b.append(&bar);
-    let page = adw::StatusPage::new();
-    page.set_icon_name(Some("emblem-system-symbolic"));
-    page.set_title("Preferences");
-    page.set_description(Some("Settings aren't in this version of Phone Link yet."));
-    page.set_vexpand(true);
-    b.append(&page);
-    b
 }

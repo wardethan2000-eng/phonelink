@@ -4,12 +4,15 @@
 pub mod clipboard_page;
 pub mod conversation_list;
 pub mod files_page;
+pub mod google_sync;
 pub mod icons;
 pub mod messages_page;
 pub mod notifications_model;
 pub mod notifications_panel;
 pub mod perf;
+pub mod settings_page;
 pub mod thread_view;
+pub mod tray;
 pub mod window;
 
 use adw::prelude::*;
@@ -126,7 +129,8 @@ pub fn run() -> glib::ExitCode {
     let app = adw::Application::builder().application_id(APPLICATION_ID).build();
     app.connect_startup(|_| load_css());
     app.connect_activate(|app| {
-        if let Some(w) = app.active_window() {
+        // A second launch (or the window hidden to the tray) shows it again.
+        if let Some(w) = app.active_window().or_else(|| app.windows().into_iter().next()) {
             w.present();
             return;
         }
