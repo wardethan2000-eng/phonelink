@@ -15,7 +15,7 @@ use std::time::{Duration, Instant};
 use adw::prelude::*;
 use glib::Variant;
 
-use super::conversation_list::ConversationList;
+use super::conversation_list::{ConversationList, ListEvent};
 use super::thread_view::{BubbleActions, ThreadView};
 use crate::core::attachments::full_cache_dir;
 use crate::core::contacts::load_contact_map;
@@ -28,6 +28,24 @@ use crate::core::store::MessageStore;
 use crate::core::sync::{self, Action, SIGNAL_BATCH_SIZE};
 use crate::dbus::signals::{self, Subscription};
 use crate::dbus::{Client, IFACE_CONVERSATIONS, IFACE_NOTIFICATIONS, device_path, variant};
+
+fn epoch_now() -> f64 {
+    std::time::SystemTime::now().duration_since(std::time::UNIX_EPOCH).map_or(0.0, |d| d.as_secs_f64())
+}
+
+/// Notification properties as `core::contacts::Props` (strings and flags).
+fn as_props(props: &std::collections::BTreeMap<String, Variant>) -> crate::core::contacts::Props {
+    props
+        .iter()
+        .map(|(k, v)| {
+            let value = match v.get::<bool>() {
+                Some(b) => serde_json::Value::Bool(b),
+                None => serde_json::Value::from(variant::string(v)),
+            };
+            (k.clone(), value)
+        })
+        .collect()
+}
 
 /// A notification's properties in the shape `core` reads.
 fn replyable(id: &str, props: &std::collections::BTreeMap<String, Variant>) -> ReplyableNotification {
@@ -58,6 +76,7 @@ struct Inner {
     queue: VecDeque<Variant>,
     draining: bool,
     timer: Option<glib::SourceId>,
+    hidden_check: Option<glib::SourceId>,
 }
 
 pub struct MessagesPage {
@@ -66,6 +85,8 @@ pub struct MessagesPage {
     stack: gtk::Stack,
     list: Rc<ConversationList>,
     thread: Rc<ThreadView>,
+    /// "Your phone is hiding some texts" (rule 1).
+    hidden_banner: adw::Banner,
     inner: RefCell<Inner>,
 }
 
@@ -75,8 +96,17 @@ impl MessagesPage {
         stack.set_vexpand(true);
         stack.set_hexpand(true);
         stack.set_transition_type(gtk::StackTransitionType::Crossfade);
+        let hidden_banner = adw::Banner::new("Your phone is hiding some texts from Phone Link");
+        hidden_banner.set_button_label(Some("Copy fix"));
+        hidden_banner.connect_button_clicked(|b| {
+            b.clipboard().set_text(crate::core::hidden_texts::FIX_COMMAND);
+            b.set_title("Fix copied: run it in a terminal with the phone plugged in (adb)");
+        });
+        let column = gtk::Box::new(gtk::Orientation::Vertical, 0);
+        column.append(&hidden_banner);
+        column.append(&stack);
         let widget = adw::ToastOverlay::new();
-        widget.set_child(Some(&stack));
+        widget.set_child(Some(&column));
 
         let status = adw::StatusPage::new();
         status.set_icon_name(Some("mail-unread-symbolic"));
@@ -107,6 +137,7 @@ impl MessagesPage {
         let this = Rc::new(Self {
             widget,
             stack,
+            hidden_banner,
             list,
             thread,
             inner: RefCell::new(Inner {
@@ -118,9 +149,16 @@ impl MessagesPage {
                 queue: VecDeque::new(),
                 draining: false,
                 timer: None,
+                hidden_check: None,
             }),
         });
         *download_target.borrow_mut() = Rc::downgrade(&this);
+        let weak = Rc::downgrade(&this);
+        this.list.connect_event(move |e| {
+            if let Some(this) = weak.upgrade() {
+                this.list_event(e);
+            }
+        });
         let weak = Rc::downgrade(&this);
         this.thread.connect_send(move |tid, text, picture| {
             let Some(this) = weak.upgrade() else { return false };
@@ -176,6 +214,7 @@ impl MessagesPage {
             i.client = Some(client.clone());
             i.m.reset_for_device(Some(&dev.id), reachable);
             i.m.contact_map = load_contact_map(&dev.id, i.store.load_contacts());
+            self.list.set_contacts(i.m.contact_map.clone());
             i.subs = self.subscribe(client, &dev.id);
             i.subs.extend(self.subscribe_notifications(client, &dev.id));
             let mut effects = i.m.load_cached(&i.store);
@@ -400,6 +439,146 @@ impl MessagesPage {
         }
     }
 
+    fn list_event(self: &Rc<Self>, e: ListEvent) {
+        match e {
+            ListEvent::Start { address, name } => {
+                let effects = self.inner.borrow_mut().m.open_or_create(&address, &name);
+                if effects.is_empty() {
+                    self.toast(crate::core::messages::TOAST_NOT_CONNECTED);
+                }
+                self.run(effects);
+            }
+            ListEvent::Rename { thread_id, address } => self.rename_dialog(thread_id, address),
+            ListEvent::Delete { thread_id } => self.delete_dialog(thread_id),
+            ListEvent::ImportContacts => self.import_dialog(),
+        }
+    }
+
+    fn parent_window(&self) -> Option<gtk::Window> {
+        self.widget.root().and_downcast::<gtk::Window>()
+    }
+
+    fn rename_dialog(self: &Rc<Self>, thread_id: i64, address: String) {
+        let current = {
+            let i = self.inner.borrow();
+            i.m.index.get(thread_id).map(|c| c.display_name.clone()).unwrap_or_default()
+        };
+        let dialog = adw::MessageDialog::new(
+            self.parent_window().as_ref(),
+            Some("Set Contact Name"),
+            Some(&format!("Enter a name for {address}:")),
+        );
+        dialog.add_responses(&[("cancel", "Cancel"), ("save", "Save")]);
+        dialog.set_response_appearance("save", adw::ResponseAppearance::Suggested);
+        dialog.set_default_response(Some("save"));
+        let entry = gtk::Entry::new();
+        entry.set_text(if current == address { "" } else { &current });
+        entry.set_placeholder_text(Some("Contact name"));
+        entry.set_activates_default(true);
+        dialog.set_extra_child(Some(&entry));
+        let weak = Rc::downgrade(self);
+        dialog.connect_response(None, move |_, response| {
+            if response != "save" {
+                return;
+            }
+            let Some(this) = weak.upgrade() else { return };
+            let effects = {
+                let mut guard = this.inner.borrow_mut();
+                let i = &mut *guard;
+                i.m.rename_contact(&address, &entry.text(), &i.store)
+            };
+            // TODO(Phase 6): also update Google Contacts when connected, as Python.
+            this.list.set_contacts(this.inner.borrow().m.contact_map.clone());
+            this.run(effects);
+        });
+        dialog.present();
+    }
+
+    fn delete_dialog(self: &Rc<Self>, thread_id: i64) {
+        let this = self.clone();
+        let client = self.inner.borrow().client.clone();
+        glib::spawn_future_local(async move {
+            let device = this.inner.borrow().m.device_id().map(str::to_string);
+            let can_delete_on_phone = match (&client, &device) {
+                (Some(c), Some(d)) if thread_id >= 0 => c.supports_conversation_deletion(d).await,
+                _ => false,
+            };
+            let name = {
+                let i = this.inner.borrow();
+                i.m.index
+                    .get(thread_id)
+                    .map(|c| if c.display_name.is_empty() { c.address.clone() } else { c.display_name.clone() })
+                    .unwrap_or_else(|| format!("Thread {thread_id}"))
+            };
+            let mut body = format!("Remove the conversation with {name} from Phone Link?");
+            body.push_str(if can_delete_on_phone {
+                "\n\nPhone Link will also ask your phone to delete it there."
+            } else {
+                "\n\nYour current KDE Connect build does not expose remote SMS deletion, so this will remove it only from Phone Link."
+            });
+            let dialog = adw::MessageDialog::new(this.parent_window().as_ref(), Some("Delete Conversation"), Some(&body));
+            dialog.add_responses(&[("cancel", "Cancel"), ("delete", "Delete")]);
+            dialog.set_response_appearance("delete", adw::ResponseAppearance::Destructive);
+            let weak = Rc::downgrade(&this);
+            dialog.connect_response(None, move |_, response| {
+                if response != "delete" {
+                    return;
+                }
+                let Some(this) = weak.upgrade() else { return };
+                let now_ms = chrono::Utc::now().timestamp_millis();
+                let effects = {
+                    let mut guard = this.inner.borrow_mut();
+                    let i = &mut *guard;
+                    let mut effects = i.m.delete(thread_id, can_delete_on_phone, &i.store, &mut i.settings, now_ms);
+                    effects.push(Effect::ShowEmpty);
+                    effects
+                };
+                this.run(effects);
+            });
+            dialog.present();
+        });
+    }
+
+    /// Import contacts from a VCF or Google Contacts CSV file.
+    /// TODO(Phase 6): the "Import Google Contacts" choice, as Python.
+    fn import_dialog(self: &Rc<Self>) {
+        let dialog = gtk::FileDialog::new();
+        dialog.set_title("Import Contacts");
+        let filter = gtk::FileFilter::new();
+        filter.set_name(Some("Contact files (*.vcf, *.csv)"));
+        for pat in ["*.vcf", "*.VCF", "*.csv", "*.CSV"] {
+            filter.add_pattern(pat);
+        }
+        let filters = gio::ListStore::new::<gtk::FileFilter>();
+        filters.append(&filter);
+        dialog.set_filters(Some(&filters));
+        let weak = Rc::downgrade(self);
+        dialog.open(self.parent_window().as_ref(), gio::Cancellable::NONE, move |res| {
+            let (Some(this), Some(path)) = (weak.upgrade(), res.ok().and_then(|f| f.path())) else { return };
+            let mut found = std::collections::HashMap::new();
+            let is_csv = path.extension().is_some_and(|e| e.eq_ignore_ascii_case("csv"));
+            let count = if is_csv {
+                crate::core::contacts::import_google_csv(&path, &mut found)
+            } else {
+                crate::core::contacts::import_vcf_file(&path, &mut found)
+            };
+            {
+                let mut guard = this.inner.borrow_mut();
+                let i = &mut *guard;
+                i.store.batch(|store| {
+                    for (phone, name) in &found {
+                        store.save_contact(phone, name);
+                    }
+                });
+                i.m.contact_map.extend(found);
+                i.m.refresh_names();
+            }
+            this.list.set_contacts(this.inner.borrow().m.contact_map.clone());
+            this.run(vec![Effect::RefreshList]);
+            this.toast(&format!("Imported {count} contacts"));
+        });
+    }
+
     fn toast(&self, text: &str) {
         self.widget.add_toast(adw::Toast::new(text));
     }
@@ -472,10 +651,18 @@ impl MessagesPage {
         self.with_device(move |c, d| async move {
             let all = c.fetch_active_notifications(&d).await;
             let Some(this) = weak.upgrade() else { return };
-            let mut i = this.inner.borrow_mut();
-            for (id, props) in all {
-                i.m.note_notification(replyable(&id, &props));
+            let mut effects = Vec::new();
+            {
+                let mut guard = this.inner.borrow_mut();
+                let i = &mut *guard;
+                for (id, props) in all {
+                    i.m.note_notification(replyable(&id, &props));
+                    // Already on the phone at startup: names only, not the
+                    // hidden-texts watch.
+                    effects.extend(i.m.notification_seen(&as_props(&props), epoch_now(), &i.store, false).1);
+                }
             }
+            this.run(effects);
         });
     }
 
@@ -483,10 +670,46 @@ impl MessagesPage {
         let weak = Rc::downgrade(self);
         self.with_device(move |c, d| async move {
             let props = c.notification_properties(&d, &id).await;
-            if let Some(this) = weak.upgrade() {
-                this.inner.borrow_mut().m.note_notification(replyable(&id, &props));
+            let Some(this) = weak.upgrade() else { return };
+            let (schedule, effects) = {
+                let mut guard = this.inner.borrow_mut();
+                let i = &mut *guard;
+                i.m.note_notification(replyable(&id, &props));
+                i.m.notification_seen(&as_props(&props), epoch_now(), &i.store, true)
+            };
+            this.run(effects);
+            if schedule {
+                this.schedule_hidden_check();
             }
         });
+    }
+
+    /// Judge texting notifications once they're old enough.
+    fn schedule_hidden_check(self: &Rc<Self>) {
+        if self.inner.borrow().hidden_check.is_some() {
+            return;
+        }
+        let delay = self.inner.borrow().m.hidden_texts.settle_seconds as u32 + 5;
+        let weak = Rc::downgrade(self);
+        let id = glib::timeout_add_seconds_local_once(delay, move || {
+            let Some(this) = weak.upgrade() else { return };
+            let (changed, warning, pending) = {
+                let mut i = this.inner.borrow_mut();
+                i.hidden_check = None;
+                let changed = i.m.check_hidden_texts(epoch_now());
+                (changed, i.m.hidden_texts.warning, i.m.hidden_texts.has_pending())
+            };
+            if changed {
+                if warning {
+                    this.hidden_banner.set_title("Your phone is hiding some texts from Phone Link");
+                }
+                this.hidden_banner.set_revealed(warning);
+            }
+            if pending {
+                this.schedule_hidden_check();
+            }
+        });
+        self.inner.borrow_mut().hidden_check = Some(id);
     }
 
     fn show_thread(&self, tid: i64) {

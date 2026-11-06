@@ -10,7 +10,7 @@ use std::cell::RefCell;
 use std::collections::HashMap;
 use std::rc::Rc;
 
-use gtk::pango;
+use gtk::{glib, pango};
 use gtk::prelude::*;
 
 use crate::core::contacts::contact_photo_path;
@@ -194,6 +194,9 @@ struct State {
     /// Thread ids in list order (index = row position).
     order: Vec<i64>,
     search: String,
+    /// For contact suggestions while searching.
+    contacts: HashMap<String, String>,
+    conversation_phones: Vec<String>,
     /// Set while the list is being rearranged, so moves don't count as clicks.
     rebuilding: bool,
     last_emitted: Option<i64>,
@@ -201,11 +204,26 @@ struct State {
 
 type SelectedHandler = Box<dyn Fn(i64)>;
 
+/// Everything else the list asks of the page.
+pub enum ListEvent {
+    /// Start (or open) a chat with a suggested contact or typed number.
+    Start { address: String, name: String },
+    Rename { thread_id: i64, address: String },
+    Delete { thread_id: i64 },
+    ImportContacts,
+}
+
+type EventHandler = Rc<dyn Fn(ListEvent)>;
+
 pub struct ConversationList {
     pub widget: gtk::Box,
     listbox: gtk::ListBox,
     state: RefCell<State>,
     on_selected: RefCell<Option<SelectedHandler>>,
+    on_event: RefCell<Option<EventHandler>>,
+    search_entry: gtk::SearchEntry,
+    contacts_header: gtk::Label,
+    contacts_list: gtk::ListBox,
 }
 
 impl ConversationList {
@@ -223,8 +241,12 @@ impl ConversationList {
         search.set_placeholder_text(Some("Search conversations or contacts…"));
         search.set_hexpand(true);
         search_box.append(&search);
-        // TODO(Phase 3): new-message and contact-sync buttons, contact
-        // suggestions, right-click rename/delete.
+        let new_btn = gtk::Button::from_icon_name("list-add-symbolic");
+        new_btn.set_tooltip_text(Some("New message"));
+        search_box.append(&new_btn);
+        let import_btn = gtk::Button::from_icon_name("system-users-symbolic");
+        import_btn.set_tooltip_text(Some("Import contacts"));
+        search_box.append(&import_btn);
         widget.append(&search_box);
 
         let scrolled = gtk::ScrolledWindow::new();
@@ -236,14 +258,74 @@ impl ConversationList {
         listbox.set_selection_mode(gtk::SelectionMode::Single);
         listbox.set_activate_on_single_click(true);
         listbox.set_placeholder(Some(&placeholder()));
-        scrolled.set_child(Some(&listbox));
+        let scroll_box = gtk::Box::new(gtk::Orientation::Vertical, 0);
+        scroll_box.append(&listbox);
+        // Contacts to start a chat with, shown while searching.
+        let contacts_header = gtk::Label::new(Some("Contacts"));
+        contacts_header.set_halign(gtk::Align::Start);
+        contacts_header.set_margin_start(12);
+        contacts_header.set_margin_top(12);
+        contacts_header.set_margin_bottom(4);
+        contacts_header.add_css_class("heading");
+        contacts_header.add_css_class("dim-label");
+        contacts_header.set_visible(false);
+        scroll_box.append(&contacts_header);
+        let contacts_list = gtk::ListBox::new();
+        contacts_list.set_selection_mode(gtk::SelectionMode::None);
+        contacts_list.set_activate_on_single_click(true);
+        scroll_box.append(&contacts_list);
+        scrolled.set_child(Some(&scroll_box));
 
         let this = Rc::new(Self {
             widget,
             listbox: listbox.clone(),
             state: RefCell::default(),
             on_selected: RefCell::default(),
+            on_event: RefCell::default(),
+            search_entry: search.clone(),
+            contacts_header,
+            contacts_list: contacts_list.clone(),
         });
+        let focus = search.clone();
+        new_btn.connect_clicked(move |_| {
+            focus.grab_focus();
+        });
+        let weak = Rc::downgrade(&this);
+        import_btn.connect_clicked(move |_| {
+            if let Some(this) = weak.upgrade() {
+                this.emit(ListEvent::ImportContacts);
+            }
+        });
+        let weak = Rc::downgrade(&this);
+        contacts_list.connect_row_activated(move |_, row| {
+            let Some(this) = weak.upgrade() else { return };
+            let (name, address) = {
+                let st = this.state.borrow();
+                let s = crate::core::contacts::contact_suggestions(&st.search, &st.contacts, &st.conversation_phones);
+                match usize::try_from(row.index()).ok().and_then(|i| s.get(i).cloned()) {
+                    Some(x) => x,
+                    None => return,
+                }
+            };
+            this.search_entry.set_text("");
+            this.emit(ListEvent::Start { address, name });
+        });
+        // Right-click a conversation: rename its number, or delete it.
+        let right = gtk::GestureClick::new();
+        right.set_button(gtk::gdk::BUTTON_SECONDARY);
+        let weak = Rc::downgrade(&this);
+        right.connect_pressed(move |g, _, x, y| {
+            let Some(this) = weak.upgrade() else { return };
+            let Some(row) = this.listbox.row_at_y(y as i32) else { return };
+            let Some(tid) = usize::try_from(row.index()).ok().and_then(|i| this.state.borrow().order.get(i).copied())
+            else {
+                return;
+            };
+            g.set_state(gtk::EventSequenceState::Claimed);
+            this.listbox.select_row(Some(&row));
+            this.row_menu(&row, tid, x, y);
+        });
+        listbox.add_controller(right);
 
         let weak = Rc::downgrade(&this);
         listbox.connect_row_selected(move |_, row| {
@@ -270,6 +352,74 @@ impl ConversationList {
         *self.on_selected.borrow_mut() = Some(Box::new(f));
     }
 
+    pub fn connect_event(&self, f: impl Fn(ListEvent) + 'static) {
+        *self.on_event.borrow_mut() = Some(Rc::new(f));
+    }
+
+    fn emit(&self, e: ListEvent) {
+        let handler = self.on_event.borrow().clone();
+        if let Some(f) = handler {
+            f(e);
+        }
+    }
+
+    fn row_menu(self: &Rc<Self>, row: &gtk::ListBoxRow, thread_id: i64, x: f64, y: f64) {
+        let address = self.state.borrow().rows.get(&thread_id).map(|r| r.summary.address.clone()).unwrap_or_default();
+        let popover = gtk::Popover::new();
+        popover.set_has_arrow(true);
+        popover.set_parent(&self.listbox);
+        popover.set_pointing_to(Some(&gtk::gdk::Rectangle::new(x as i32, y as i32, 1, 1)));
+        let menu = gtk::Box::new(gtk::Orientation::Vertical, 2);
+        let rename = gtk::Button::with_label("Set contact name");
+        rename.add_css_class("flat");
+        let delete = gtk::Button::with_label("Delete conversation");
+        delete.add_css_class("flat");
+        delete.add_css_class("destructive-action");
+        menu.append(&rename);
+        menu.append(&delete);
+        popover.set_child(Some(&menu));
+        let (weak, pop) = (Rc::downgrade(self), popover.clone());
+        rename.connect_clicked(move |_| {
+            pop.popdown();
+            if let Some(this) = weak.upgrade() {
+                this.emit(ListEvent::Rename { thread_id, address: address.clone() });
+            }
+        });
+        let (weak, pop) = (Rc::downgrade(self), popover.clone());
+        delete.connect_clicked(move |_| {
+            pop.popdown();
+            if let Some(this) = weak.upgrade() {
+                this.emit(ListEvent::Delete { thread_id });
+            }
+        });
+        popover.connect_closed(|p| {
+            let p = p.clone();
+            glib::idle_add_local_once(move || p.unparent());
+        });
+        let _ = row;
+        popover.popup();
+    }
+
+    /// The contact names used for suggestions.
+    pub fn set_contacts(&self, contacts: HashMap<String, String>) {
+        self.state.borrow_mut().contacts = contacts;
+        self.update_suggestions();
+    }
+
+    fn update_suggestions(&self) {
+        while let Some(row) = self.contacts_list.row_at_index(0) {
+            self.contacts_list.remove(&row);
+        }
+        let suggestions = {
+            let st = self.state.borrow();
+            crate::core::contacts::contact_suggestions(&st.search, &st.contacts, &st.conversation_phones)
+        };
+        self.contacts_header.set_visible(!suggestions.is_empty());
+        for (name, phone) in suggestions {
+            self.contacts_list.append(&suggestion_row(&name, &phone));
+        }
+    }
+
     fn row_chosen(&self, row: &gtk::ListBoxRow) {
         let tid = {
             // Busy means the list itself is moving rows (GTK emits
@@ -291,11 +441,20 @@ impl ConversationList {
     }
 
     fn set_search(&self, needle: &str) {
-        let mut st = self.state.borrow_mut();
-        st.search = needle.to_string();
-        for row in st.rows.values() {
-            row.row.set_visible(row.summary.matches(needle));
+        // "No conversations yet" is wrong while a search just has no match.
+        if needle.is_empty() {
+            self.listbox.set_placeholder(Some(&placeholder()));
+        } else {
+            self.listbox.set_placeholder(None::<&gtk::Widget>);
         }
+        {
+            let mut st = self.state.borrow_mut();
+            st.search = needle.to_string();
+            for row in st.rows.values() {
+                row.row.set_visible(row.summary.matches(needle));
+            }
+        }
+        self.update_suggestions();
     }
 
     /// Show `conversations` (any order; sorted newest first here), updating
@@ -320,6 +479,11 @@ impl ConversationList {
             }
         }
         st.order.retain(|t| wanted.contains(t));
+        st.conversation_phones = convs
+            .iter()
+            .map(|c| crate::core::contacts::normalize_phone(&c.address))
+            .filter(|n| !n.is_empty())
+            .collect();
 
         for (pos, c) in convs.iter().enumerate() {
             let tid = c.thread_id;
@@ -364,6 +528,11 @@ impl ConversationList {
             self.listbox.select_row(Some(&row.row));
         }
         st.rebuilding = false;
+        let searching = !st.search.is_empty();
+        drop(guard);
+        if searching {
+            self.update_suggestions();
+        }
     }
 
     /// Select a row without telling the listener (the caller already knows).
@@ -377,6 +546,35 @@ impl ConversationList {
             st.last_emitted = Some(thread_id);
         }
     }
+}
+
+fn suggestion_row(name: &str, phone: &str) -> gtk::ListBoxRow {
+    let row = gtk::ListBoxRow::new();
+    let b = gtk::Box::new(gtk::Orientation::Horizontal, 12);
+    b.set_margin_top(8);
+    b.set_margin_bottom(8);
+    b.set_margin_start(12);
+    b.set_margin_end(12);
+    b.append(&build_avatar(name, phone, false, 1));
+    let col = gtk::Box::new(gtk::Orientation::Vertical, 2);
+    col.set_hexpand(true);
+    let n = gtk::Label::new(Some(if name.is_empty() { phone } else { name }));
+    n.set_halign(gtk::Align::Start);
+    n.set_ellipsize(pango::EllipsizeMode::End);
+    n.set_max_width_chars(20);
+    col.append(&n);
+    let p = gtk::Label::new(Some(phone));
+    p.set_halign(gtk::Align::Start);
+    p.add_css_class("dim-label");
+    p.add_css_class("caption");
+    col.append(&p);
+    b.append(&col);
+    let icon = gtk::Image::from_icon_name("mail-send-symbolic");
+    icon.set_opacity(0.4);
+    icon.set_valign(gtk::Align::Center);
+    b.append(&icon);
+    row.set_child(Some(&b));
+    row
 }
 
 fn placeholder() -> gtk::Box {

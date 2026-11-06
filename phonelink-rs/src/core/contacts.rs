@@ -163,6 +163,70 @@ pub fn notification_message_text(props: &Props) -> String {
     ticker
 }
 
+// ── Contact suggestions (conversation-list search) ────────────────
+
+/// Same number, allowing for a country code (last 10 digits).
+fn same_phone(a: &str, b: &str) -> bool {
+    a == b || (a.len() >= 10 && b.len() >= 10 && a[a.len() - 10..] == b[b.len() - 10..])
+}
+
+/// Contacts to offer while searching the conversation list, to start a new
+/// chat: a typed number (3+ digits), then contacts whose name or number
+/// matches, skipping numbers that already have a conversation; deduplicated
+/// by the last 10 digits, at most 25. Port of
+/// `ConversationList._update_contact_suggestions`.
+///
+/// `search` is lower-cased; `conversation_phones` are normalized numbers.
+pub fn contact_suggestions(
+    search: &str,
+    contact_map: &HashMap<String, String>,
+    conversation_phones: &[String],
+) -> Vec<(String, String)> {
+    if search.is_empty() {
+        return Vec::new();
+    }
+    let has_conversation = |norm: &str| conversation_phones.iter().any(|c| same_phone(c, norm));
+    let mut out: Vec<(String, String)> = Vec::new();
+
+    let typed: String = search.chars().filter(|c| c.is_ascii_digit() || *c == '+').collect();
+    if typed.len() >= 3 {
+        let norm = normalize_phone(&typed);
+        if !has_conversation(&norm) {
+            let mut display = contact_map.get(&norm).cloned().unwrap_or_else(|| typed.clone());
+            if display == typed && norm.len() >= 10 {
+                // Python: first match by insertion order; here by sorted key,
+                // so the result is stable.
+                let mut keys: Vec<&String> = contact_map.keys().collect();
+                keys.sort();
+                if let Some(k) = keys.into_iter().find(|k| k.len() >= 10 && k[k.len() - 10..] == norm[norm.len() - 10..]) {
+                    display = contact_map[k].clone();
+                }
+            }
+            out.push((display, typed));
+        }
+    }
+
+    let mut by_name: Vec<(&String, &String)> = contact_map.iter().collect();
+    by_name.sort_by(|a, b| a.1.to_lowercase().cmp(&b.1.to_lowercase()).then(a.0.cmp(b.0)));
+    for (phone, name) in by_name {
+        if has_conversation(phone) {
+            continue;
+        }
+        if name.to_lowercase().contains(search) || phone.contains(search) {
+            out.push((name.clone(), phone.clone()));
+        }
+    }
+
+    let mut seen = std::collections::HashSet::new();
+    out.retain(|(_, phone)| {
+        let norm = normalize_phone(phone);
+        let key = if norm.len() >= 10 { norm[norm.len() - 10..].to_string() } else { norm };
+        seen.insert(key)
+    });
+    out.truncate(25);
+    out
+}
+
 // ── Photos ─────────────────────────────────────────────────────────
 
 fn photos_with_prefix(dir: &Path, norm: &str) -> Vec<PathBuf> {
@@ -857,6 +921,23 @@ pub fn harvest_contact_from_telephony_signal(
 
 #[cfg(test)]
 mod tests {
+
+    #[test]
+    fn suggestions_offer_typed_numbers_and_contacts_without_a_chat() {
+        let mut map = HashMap::new();
+        map.insert("13165551111".to_string(), "Alex Smith".to_string());
+        map.insert("3165552222".to_string(), "Sam Lee".to_string());
+        map.insert("3165553333".to_string(), "Alexis Ray".to_string());
+        let chats = vec!["3165553333".to_string()];
+        // Alexis already has a chat, so only Alex is offered.
+        assert_eq!(contact_suggestions("alex", &map, &chats), vec![("Alex Smith".into(), "13165551111".into())]);
+        // A typed number: a known one shows its name, an unknown one itself.
+        assert_eq!(contact_suggestions("3165551111", &map, &chats)[0], ("Alex Smith".into(), "3165551111".into()));
+        assert_eq!(contact_suggestions("555 0199", &map, &chats)[0], ("5550199".into(), "5550199".into()));
+        // A number with a chat is not offered.
+        assert!(contact_suggestions("3165553333", &map, &chats).is_empty());
+        assert!(contact_suggestions("", &map, &chats).is_empty());
+    }
     use super::*;
 
     fn entries(name: &str, phones: &[&str]) -> Vec<(String, Vec<String>)> {

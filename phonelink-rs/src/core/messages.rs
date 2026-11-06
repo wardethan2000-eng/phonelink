@@ -11,7 +11,7 @@ use std::collections::{HashMap, HashSet};
 
 use super::attachments;
 use super::contacts::{is_messaging_app, looks_like_phone_number, normalize_phone, resolve_name};
-use super::hidden_texts::{body_matches, normalize_text};
+use super::hidden_texts::{HiddenTextDetector, body_matches, normalize_text};
 use super::message::{RawMessage, parse_message};
 use super::models::{Conversation, SmsMessage};
 use super::reconcile::{self, ConversationIndex};
@@ -127,6 +127,8 @@ pub struct Messages {
     sent_routes: HashMap<i64, SendRoute>,
     /// Attachments whose full file was asked for this session.
     full_requested: HashSet<String>,
+    /// Android 17 hiding texts from KDE Connect (port brief, rule 1).
+    pub hidden_texts: HiddenTextDetector,
 }
 
 /// Display name for a conversation from the contact map.
@@ -565,6 +567,80 @@ impl Messages {
     /// How a sent message (by uid) left this app, if it was sent from here.
     pub fn route_of(&self, uid: i64) -> Option<SendRoute> {
         self.sent_routes.get(&uid).copied()
+    }
+
+    /// Name a number (right-click "Set contact name"): saved to the local
+    /// contacts, used everywhere at once.
+    pub fn rename_contact(&mut self, address: &str, name: &str, store: &MessageStore) -> Vec<Effect> {
+        let norm = normalize_phone(address);
+        let name = name.trim();
+        if norm.is_empty() || name.is_empty() {
+            return Vec::new();
+        }
+        store.save_contact(&norm, name);
+        self.contact_map.insert(norm, name.to_string());
+        self.refresh_names();
+        let mut out = vec![Effect::RefreshList];
+        if let Some(active) = self.active {
+            out.push(Effect::ShowThread(active));
+        }
+        out
+    }
+
+    // ── notifications: hidden texts and contact names ─────────────
+
+    /// Any notification from the phone. A newly posted texting-app one
+    /// (`watch_hidden`) is watched for the text it announces (if it never arrives, the phone is hiding texts),
+    /// and may teach us a contact name, which is saved. Returns whether a
+    /// hidden-texts check should be scheduled, and effects.
+    pub fn notification_seen(
+        &mut self,
+        props: &super::contacts::Props,
+        now_epoch: f64,
+        store: &MessageStore,
+        watch_hidden: bool,
+    ) -> (bool, Vec<Effect>) {
+        let app = props.get("appName").and_then(|v| v.as_str()).unwrap_or("");
+        let schedule = watch_hidden
+            && is_messaging_app(app)
+            && self.hidden_texts.note_notification(&super::contacts::notification_message_text(props), now_epoch);
+        let mut out = Vec::new();
+        if let Some((norm, name)) =
+            super::contacts::match_contact_from_notification_props(props, self.index.conversations.values(), &self.contact_map)
+        {
+            store.save_contact(&norm, &name);
+            self.contact_map.insert(norm, name);
+            self.refresh_names();
+            out.push(Effect::RefreshList);
+        }
+        (schedule, out)
+    }
+
+    /// Did a text quoting `preview` arrive since 30 minutes before the
+    /// notification (`posted_at`, epoch seconds)?
+    pub fn text_arrived(&self, preview: &str, posted_at: f64) -> bool {
+        let since_ms = ((posted_at - 30.0 * 60.0) * 1000.0) as i64;
+        self.index
+            .conversations
+            .values()
+            .filter(|c| c.last_date >= since_ms)
+            .flat_map(|c| &c.messages)
+            .any(|m| m.date >= since_ms && body_matches(preview, &m.body))
+    }
+
+    /// Judge the notifications old enough. Returns whether the warning
+    /// changed (show or hide the banner).
+    pub fn check_hidden_texts(&mut self, now_epoch: f64) -> bool {
+        let mut detector = std::mem::take(&mut self.hidden_texts);
+        let changed = detector.check(now_epoch, |preview, at| self.text_arrived(preview, at));
+        self.hidden_texts = detector;
+        changed
+    }
+
+    /// Normalized numbers that already have a conversation (for contact
+    /// suggestions).
+    pub fn conversation_phones(&self) -> Vec<String> {
+        self.index.conversations.values().map(|c| normalize_phone(&c.address)).filter(|n| !n.is_empty()).collect()
     }
 
     // ── full-resolution images ─────────────────────────────────────
@@ -1135,6 +1211,51 @@ mod tests {
         assert!(p.m.take_full_image_requests(10, dir.path()).is_empty());
         p.m.set_reachable(true);
         assert_eq!(p.m.take_full_image_requests(10, dir.path()).len(), 1);
+    }
+
+    #[test]
+    fn renaming_a_number_names_its_chats_and_is_saved() {
+        let mut p = Panel::new();
+        p.apply(&[tup(1, 10, &["+13165551111"], 100)]);
+        let effects = p.m.rename_contact("+1 316 555 1111", " Alex ", &p.store);
+        assert_eq!(effects, vec![Effect::RefreshList]);
+        assert_eq!(p.m.index.get(10).unwrap().display_name, "Alex");
+        assert_eq!(p.store.load_contacts().get("13165551111").map(String::as_str), Some("Alex"));
+        assert!(p.m.rename_contact("+13165551111", "  ", &p.store).is_empty());
+    }
+
+    fn messages_notification(title: &str, text: &str) -> crate::core::contacts::Props {
+        [("appName", "Messages"), ("title", title), ("text", text), ("ticker", "")]
+            .into_iter()
+            .map(|(k, v)| (k.to_string(), serde_json::Value::from(v)))
+            .collect()
+    }
+
+    #[test]
+    fn texts_that_never_arrive_raise_the_hidden_texts_warning() {
+        let mut p = Panel::new();
+        let t0 = 1_800_000_000.0;
+        let date_ms = (t0 * 1000.0) as i64;
+        p.apply(&[incoming(1, 10, "3165551111", "This one did arrive fine", date_ms)]);
+        // A notification whose text arrived: no warning.
+        let (schedule, _) = p.m.notification_seen(&messages_notification("Alex", "This one did arrive fine"), t0, &p.store, true);
+        assert!(schedule);
+        // Two that never arrive.
+        p.m.notification_seen(&messages_notification("Sam", "Where are you right now?"), t0 + 10.0, &p.store, true);
+        p.m.notification_seen(&messages_notification("Sam", "Hello?? Call me back"), t0 + 20.0, &p.store, true);
+        assert!(p.m.check_hidden_texts(t0 + 1000.0));
+        assert!(p.m.hidden_texts.warning);
+    }
+
+    #[test]
+    fn a_notification_teaches_and_saves_a_contact_name() {
+        let mut p = Panel::new();
+        p.apply(&[incoming(1, 10, "3165551111", "See you at the game tonight", 100)]);
+        let (_, effects) =
+            p.m.notification_seen(&messages_notification("Alex Smith", "See you at the game tonight"), 0.0, &p.store, false);
+        assert_eq!(effects, vec![Effect::RefreshList]);
+        assert_eq!(p.m.index.get(10).unwrap().display_name, "Alex Smith");
+        assert_eq!(p.store.load_contacts().get("3165551111").map(String::as_str), Some("Alex Smith"));
     }
 
     #[test]
