@@ -566,7 +566,8 @@ fn connections(http: &dyn Http, token: &str, fields: &str) -> Result<Vec<Value>>
             out.extend(a.iter().cloned());
         }
         match resp.get("nextPageToken").and_then(Value::as_str) {
-            Some(t) if !t.is_empty() => page = t.to_string(),
+            // A repeated token would loop forever; stop instead.
+            Some(t) if !t.is_empty() && t != page => page = t.to_string(),
             _ => return Ok(out),
         }
     }
@@ -682,7 +683,14 @@ mod tests {
         }
         fn get_json(&self, url: &str, _: &str) -> std::result::Result<Value, String> {
             self.calls.borrow_mut().push(format!("GET {url}"));
-            self.gets.iter().find(|(k, _)| url.contains(k.as_str())).map(|(_, v)| v.clone()).ok_or_else(|| "HTTP 404".into())
+            // The longest matching key wins, so "pageToken=next" beats
+            // "connections?" whatever the map's order.
+            self.gets
+                .iter()
+                .filter(|(k, _)| url.contains(k.as_str()))
+                .max_by_key(|(k, _)| k.len())
+                .map(|(_, v)| v.clone())
+                .ok_or_else(|| "HTTP 404".into())
         }
         fn send_json(&self, method: &str, url: &str, _: &str, body: &Value) -> std::result::Result<Value, String> {
             self.calls.borrow_mut().push(format!("{method} {url} {body}"));
