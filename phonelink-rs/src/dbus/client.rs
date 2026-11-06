@@ -311,10 +311,22 @@ impl Client {
         self.call(&path, IFACE_FINDPHONE, "ring", None, None).await;
     }
 
-    /// Push clipboard text to the device.
-    pub async fn send_clipboard(&self, device_id: &str, text: &str) {
+    /// Push the desktop clipboard to the device. Daemon 26.08 only has the
+    /// argument-less `sendClipboard()`, which sends the desktop's current
+    /// clipboard; `text` must already be on it. Older daemons that only take
+    /// the text get `sendClipboard(text)`.
+    pub async fn send_clipboard(&self, device_id: &str, text: &str) -> bool {
         let path = format!("{}/clipboard", device_path(device_id));
-        self.call(&path, IFACE_CLIPBOARD, "sendClipboard", Some((text,).to_variant()), None).await;
+        match self.try_call(&path, IFACE_CLIPBOARD, "sendClipboard", None, None, CALL_TIMEOUT_MS).await {
+            Ok(_) => true,
+            Err(e) if is_definite_refusal(&e) => {
+                self.call(&path, IFACE_CLIPBOARD, "sendClipboard", Some((text,).to_variant()), None).await.is_some()
+            }
+            Err(e) => {
+                log::warn!("D-Bus: sendClipboard @ {path}: {}", e.message());
+                false
+            }
+        }
     }
 
     /// The phone's current clipboard content.

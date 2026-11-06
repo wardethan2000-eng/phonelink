@@ -61,7 +61,9 @@ const NOTIFICATIONS_XML: &str = r#"<node><interface name="org.kde.kdeconnect.dev
   <method name="activeNotifications"><arg type="as" direction="out"/></method>
   <method name="sendReply"><arg type="s" direction="in"/><arg type="s" direction="in"/></method>
   <signal name="notificationPosted"><arg type="s"/></signal>
+  <signal name="notificationUpdated"><arg type="s"/></signal>
   <signal name="notificationRemoved"><arg type="s"/></signal>
+  <signal name="allNotificationsRemoved"/>
 </interface></node>"#;
 
 const NOTIFICATION_XML: &str = r#"<node><interface name="org.kde.kdeconnect.device.notifications.notification">
@@ -70,7 +72,38 @@ const NOTIFICATION_XML: &str = r#"<node><interface name="org.kde.kdeconnect.devi
   <property name="text" type="s" access="read"/>
   <property name="ticker" type="s" access="read"/>
   <property name="replyId" type="s" access="read"/>
+  <property name="dismissable" type="b" access="read"/>
+  <property name="hasIcon" type="b" access="read"/>
+  <property name="iconPath" type="s" access="read"/>
+  <method name="dismiss"/>
+  <method name="sendReply"><arg type="s" direction="in"/></method>
 </interface></node>"#;
+
+/// The other notifications on the demo phone: (id, app, title, text,
+/// reply id, dismissable). "demo5" arrives 20 s after start.
+const OTHER_NOTIFICATIONS: &[(&str, &str, &str, &str, &str, bool)] = &[
+    ("demo2", "Gmail", "Weekly summary", "You have 3 new messages from the book club.\nThe next meeting is moved to Thursday at 7 PM, at the library on Main Street.", "", true),
+    ("demo3", "Clock", "Alarm", "7:00 AM · Weekdays", "", false),
+    ("demo4", "Calendar", "Dentist", "Tomorrow, 10:30 AM", "", true),
+    ("demo5", "WhatsApp", "Sam", "Did you see the game last night?", "demo-reply-5", true),
+];
+
+const CLIPBOARD_XML: &str = r#"<node><interface name="org.kde.kdeconnect.device.clipboard">
+  <method name="sendClipboard"/>
+</interface></node>"#;
+
+const FINDPHONE_XML: &str = r#"<node><interface name="org.kde.kdeconnect.device.findmyphone">
+  <method name="ring"/>
+</interface></node>"#;
+
+const SHARE_XML: &str = r#"<node><interface name="org.kde.kdeconnect.device.share">
+  <method name="shareUrl"><arg type="s" direction="in"/></method>
+  <method name="shareUrls"><arg type="as" direction="in"/></method>
+  <signal name="shareReceived"><arg type="s"/></signal>
+</interface></node>"#;
+
+/// A second paired device, offline, so the header shows the switcher.
+const TABLET: &str = "demotablet2";
 
 /// One answerable "Messages" notification, for the newest text in thread 11,
 /// so a reply there goes the notification route.
@@ -223,7 +256,9 @@ fn main() {
 
         let info = gio::DBusNodeInfo::for_xml(DAEMON_XML).unwrap();
         conn.register_object(DAEMON_PATH, &info.lookup_interface(IFACE_DAEMON).unwrap())
-            .method_call(|_, _, _, _, _, _, inv| inv.return_value(Some(&(vec![DEVICE.to_string()],).to_variant())))
+            .method_call(|_, _, _, _, _, _, inv| {
+                inv.return_value(Some(&(vec![DEVICE.to_string(), TABLET.to_string()],).to_variant()))
+            })
             .build()
             .unwrap();
 
@@ -297,10 +332,14 @@ fn main() {
             .build()
             .unwrap();
 
+        let active: std::rc::Rc<std::cell::RefCell<Vec<String>>> = std::rc::Rc::new(
+            [DEMO_NOTIFICATION, "demo2", "demo3", "demo4"].iter().map(|s| s.to_string()).collect::<Vec<_>>().into(),
+        );
         let notes = gio::DBusNodeInfo::for_xml(NOTIFICATIONS_XML).unwrap();
+        let listed = active.clone();
         conn.register_object(&format!("{path}/notifications"), &notes.lookup_interface(IFACE_NOTIFICATIONS).unwrap())
-            .method_call(|conn, _, path, iface, method, params, inv| match method {
-                "activeNotifications" => inv.return_value(Some(&(vec![DEMO_NOTIFICATION.to_string()],).to_variant())),
+            .method_call(move |conn, _, path, iface, method, params, inv| match method {
+                "activeNotifications" => inv.return_value(Some(&(listed.borrow().clone(),).to_variant())),
                 "sendReply" => {
                     let (reply_id, text) = params.get::<(String, String)>().unwrap();
                     eprintln!("demo: sendReply({reply_id}, {} chars)", text.len());
@@ -314,19 +353,66 @@ fn main() {
             .build()
             .unwrap();
         let note = gio::DBusNodeInfo::for_xml(NOTIFICATION_XML).unwrap();
-        conn.register_object(
-            &format!("{path}/notifications/{DEMO_NOTIFICATION}"),
-            &note.lookup_interface(IFACE_NOTIFICATION).unwrap(),
-        )
-        .property(|_, _, _, _, prop| match prop {
-            "appName" => "Messages".to_variant(),
-            "title" => "+15555550101".to_variant(),
-            "text" => "Running 10 min late".to_variant(),
-            "replyId" => "demo-reply-1".to_variant(),
-            _ => "".to_variant(),
-        })
-        .build()
-        .unwrap();
+        let all = std::iter::once((DEMO_NOTIFICATION, "Messages", "+15555550101", "Running 10 min late", "demo-reply-1", true))
+            .chain(OTHER_NOTIFICATIONS.iter().copied());
+        for (id, app, title, text, reply, dismissable) in all {
+            let gone = active.clone();
+            conn.register_object(&format!("{path}/notifications/{id}"), &note.lookup_interface(IFACE_NOTIFICATION).unwrap())
+                .property(move |_, _, _, _, prop| match prop {
+                    "appName" => app.to_variant(),
+                    "title" => title.to_variant(),
+                    "text" => text.to_variant(),
+                    "replyId" => reply.to_variant(),
+                    "dismissable" => dismissable.to_variant(),
+                    "hasIcon" => false.to_variant(),
+                    _ => "".to_variant(),
+                })
+                .method_call(move |conn, _, _, _, method, params, inv| {
+                    inv.return_value(None);
+                    if method == "sendReply" {
+                        eprintln!("demo: notification {id} sendReply({} chars)", params.child_value(0).str().unwrap_or("").len());
+                        return;
+                    }
+                    eprintln!("demo: dismiss {id}");
+                    gone.borrow_mut().retain(|n| n != id);
+                    let list = format!("{}/notifications", device_path(DEVICE));
+                    conn.emit_signal(None, &list, IFACE_NOTIFICATIONS, "notificationRemoved", Some(&(id,).to_variant()))
+                        .unwrap();
+                })
+                .build()
+                .unwrap();
+        }
+        // A new notification arrives a little later.
+        let (late, late_conn) = (active.clone(), conn.clone());
+        glib::timeout_add_seconds_local_once(20, move || {
+            late.borrow_mut().push("demo5".into());
+            let list = format!("{}/notifications", device_path(DEVICE));
+            late_conn.emit_signal(None, &list, IFACE_NOTIFICATIONS, "notificationPosted", Some(&("demo5",).to_variant())).unwrap();
+        });
+
+        for (xml, iface, sub) in
+            [(CLIPBOARD_XML, IFACE_CLIPBOARD, "clipboard"), (FINDPHONE_XML, IFACE_FINDPHONE, "findmyphone"), (SHARE_XML, IFACE_SHARE, "share")]
+        {
+            let info = gio::DBusNodeInfo::for_xml(xml).unwrap();
+            conn.register_object(&format!("{path}/{sub}"), &info.lookup_interface(iface).unwrap())
+                .method_call(|_, _, _, _, method, params, inv| {
+                    eprintln!("demo: {method}{}", params.print(false));
+                    inv.return_value(None);
+                })
+                .build()
+                .unwrap();
+        }
+
+        let tablet = device_path(TABLET);
+        conn.register_object(&tablet, &dev.lookup_interface(IFACE_DEVICE).unwrap())
+            .property(|_, _, _, _, prop| match prop {
+                "name" => "Demo Tablet".to_variant(),
+                "type" => "tablet".to_variant(),
+                "isReachable" => false.to_variant(),
+                _ => true.to_variant(),
+            })
+            .build()
+            .unwrap();
 
         let bat = gio::DBusNodeInfo::for_xml(BATTERY_XML).unwrap();
         conn.register_object(&format!("{path}/battery"), &bat.lookup_interface(IFACE_BATTERY).unwrap())

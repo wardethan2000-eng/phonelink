@@ -1,8 +1,12 @@
 //! The GTK app. Pure logic lives in `core`; this layer only builds widgets,
 //! runs D-Bus calls and applies the controllers' effects.
 
+pub mod clipboard_page;
 pub mod conversation_list;
+pub mod icons;
 pub mod messages_page;
+pub mod notifications_model;
+pub mod notifications_panel;
 pub mod thread_view;
 pub mod window;
 

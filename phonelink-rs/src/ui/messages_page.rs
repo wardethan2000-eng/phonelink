@@ -16,6 +16,7 @@ use adw::prelude::*;
 use glib::Variant;
 
 use super::conversation_list::{ConversationList, ListEvent};
+use super::notifications_model::{NoteEvent, NotificationsModel, Props};
 use super::thread_view::{BubbleActions, ThreadView};
 use crate::core::attachments::full_cache_dir;
 use crate::core::contacts::load_contact_map;
@@ -27,14 +28,14 @@ use crate::core::settings::Settings;
 use crate::core::store::MessageStore;
 use crate::core::sync::{self, Action, SIGNAL_BATCH_SIZE};
 use crate::dbus::signals::{self, Subscription};
-use crate::dbus::{Client, IFACE_CONVERSATIONS, IFACE_NOTIFICATIONS, device_path, variant};
+use crate::dbus::{Client, IFACE_CONVERSATIONS, device_path, variant};
 
 fn epoch_now() -> f64 {
     std::time::SystemTime::now().duration_since(std::time::UNIX_EPOCH).map_or(0.0, |d| d.as_secs_f64())
 }
 
 /// Notification properties as `core::contacts::Props` (strings and flags).
-fn as_props(props: &std::collections::BTreeMap<String, Variant>) -> crate::core::contacts::Props {
+fn as_props(props: &Props) -> crate::core::contacts::Props {
     props
         .iter()
         .map(|(k, v)| {
@@ -48,7 +49,7 @@ fn as_props(props: &std::collections::BTreeMap<String, Variant>) -> crate::core:
 }
 
 /// A notification's properties in the shape `core` reads.
-fn replyable(id: &str, props: &std::collections::BTreeMap<String, Variant>) -> ReplyableNotification {
+fn replyable(id: &str, props: &Props) -> ReplyableNotification {
     let text_of = |k: &str| props.get(k).map(variant::string).unwrap_or_default();
     let json: crate::core::contacts::Props =
         ["appName", "title", "text", "ticker"].iter().map(|k| (k.to_string(), text_of(k).into())).collect();
@@ -70,7 +71,7 @@ fn now() -> f64 {
 struct Inner {
     m: Messages,
     store: MessageStore,
-    settings: Settings,
+    settings: Rc<RefCell<Settings>>,
     client: Option<Client>,
     subs: Vec<Subscription>,
     queue: VecDeque<Variant>,
@@ -87,11 +88,13 @@ pub struct MessagesPage {
     thread: Rc<ThreadView>,
     /// "Your phone is hiding some texts" (rule 1).
     hidden_banner: adw::Banner,
+    /// The window's notifications (one subscription for the whole app).
+    notifications: Rc<NotificationsModel>,
     inner: RefCell<Inner>,
 }
 
 impl MessagesPage {
-    pub fn new(store: MessageStore, settings: Settings) -> Rc<Self> {
+    pub fn new(store: MessageStore, settings: Rc<RefCell<Settings>>, notifications: Rc<NotificationsModel>) -> Rc<Self> {
         let stack = gtk::Stack::new();
         stack.set_vexpand(true);
         stack.set_hexpand(true);
@@ -140,6 +143,7 @@ impl MessagesPage {
             hidden_banner,
             list,
             thread,
+            notifications: notifications.clone(),
             inner: RefCell::new(Inner {
                 m: Messages::new(),
                 store,
@@ -153,6 +157,12 @@ impl MessagesPage {
             }),
         });
         *download_target.borrow_mut() = Rc::downgrade(&this);
+        let weak = Rc::downgrade(&this);
+        notifications.connect(move |e| {
+            if let Some(this) = weak.upgrade() {
+                this.notification_event(e);
+            }
+        });
         let weak = Rc::downgrade(&this);
         this.list.connect_event(move |e| {
             if let Some(this) = weak.upgrade() {
@@ -216,7 +226,6 @@ impl MessagesPage {
             i.m.contact_map = load_contact_map(&dev.id, i.store.load_contacts());
             self.list.set_contacts(i.m.contact_map.clone());
             i.subs = self.subscribe(client, &dev.id);
-            i.subs.extend(self.subscribe_notifications(client, &dev.id));
             let mut effects = i.m.load_cached(&i.store);
             effects.push(Effect::RefreshList);
             i.m.catch_up.catch_up(now(), sync::CATCH_UP_STARTUP_DELAY_SECONDS, 0.0);
@@ -225,8 +234,6 @@ impl MessagesPage {
         self.stack.set_visible_child_name("content");
         self.run(effects);
         self.reschedule();
-
-        self.load_notifications();
 
         // The daemon's cached newest-message-per-thread list.
         let (weak, client, id) = (Rc::downgrade(self), client.clone(), dev.id.clone());
@@ -240,7 +247,7 @@ impl MessagesPage {
                 if i.m.device_id() != Some(id.as_str()) {
                     return;
                 }
-                i.m.apply_active(&raw, &i.store, &mut i.settings, now())
+                i.m.apply_active(&raw, &i.store, &mut i.settings.borrow_mut(), now())
             };
             log::info!("activeConversations: {} entries, {} parsed", entries.len(), raw.len());
             this.run(effects);
@@ -311,7 +318,8 @@ impl MessagesPage {
             let i = &mut *guard;
             let n = i.queue.len().min(SIGNAL_BATCH_SIZE);
             let batch: Vec<Variant> = i.queue.drain(..n).collect();
-            let (m, settings) = (&mut i.m, &mut i.settings);
+            let mut settings = i.settings.borrow_mut();
+            let (m, settings) = (&mut i.m, &mut *settings);
             let t = now();
             let effects = i.store.batch(|store| {
                 let mut effects = Vec::new();
@@ -408,7 +416,7 @@ impl MessagesPage {
         }
         if refresh {
             let i = self.inner.borrow();
-            self.list.set_conversations(&i.m.visible(&i.settings));
+            self.list.set_conversations(&i.m.visible(&i.settings.borrow()));
         }
     }
 
@@ -529,7 +537,7 @@ impl MessagesPage {
                 let effects = {
                     let mut guard = this.inner.borrow_mut();
                     let i = &mut *guard;
-                    let mut effects = i.m.delete(thread_id, can_delete_on_phone, &i.store, &mut i.settings, now_ms);
+                    let mut effects = i.m.delete(thread_id, can_delete_on_phone, &i.store, &mut i.settings.borrow_mut(), now_ms);
                     effects.push(Effect::ShowEmpty);
                     effects
                 };
@@ -622,66 +630,51 @@ impl MessagesPage {
 
     // ── notifications (for replying through them) ─────────────────
 
-    fn subscribe_notifications(self: &Rc<Self>, client: &Client, device_id: &str) -> Vec<Subscription> {
-        let path = format!("{}/notifications", device_path(device_id));
-        let mut subs = Vec::new();
-        for name in ["notificationPosted", "notificationUpdated"] {
-            let weak = Rc::downgrade(self);
-            subs.push(signals::subscribe(client.bus(), &path, IFACE_NOTIFICATIONS, name, move |p| {
-                let (Some(this), Some(id)) = (weak.upgrade(), p.get::<(String,)>().map(|t| t.0)) else { return };
-                this.load_notification(id);
-            }));
-        }
-        let weak = Rc::downgrade(self);
-        subs.push(signals::subscribe(client.bus(), &path, IFACE_NOTIFICATIONS, "notificationRemoved", move |p| {
-            let (Some(this), Some(id)) = (weak.upgrade(), p.get::<(String,)>().map(|t| t.0)) else { return };
-            this.inner.borrow_mut().m.remove_notification(&id);
-        }));
-        let weak = Rc::downgrade(self);
-        subs.push(signals::subscribe(client.bus(), &path, IFACE_NOTIFICATIONS, "allNotificationsRemoved", move |_| {
-            if let Some(this) = weak.upgrade() {
-                this.inner.borrow_mut().m.clear_notifications();
-            }
-        }));
-        subs
-    }
-
-    fn load_notifications(self: &Rc<Self>) {
-        let weak = Rc::downgrade(self);
-        self.with_device(move |c, d| async move {
-            let all = c.fetch_active_notifications(&d).await;
-            let Some(this) = weak.upgrade() else { return };
-            let mut effects = Vec::new();
-            {
-                let mut guard = this.inner.borrow_mut();
-                let i = &mut *guard;
-                for (id, props) in all {
-                    i.m.note_notification(replyable(&id, &props));
-                    // Already on the phone at startup: names only, not the
-                    // hidden-texts watch.
-                    effects.extend(i.m.notification_seen(&as_props(&props), epoch_now(), &i.store, false).1);
+    /// The window's notifications model reports a change. A full load is
+    /// what was already on the phone: names only, not the hidden-texts watch.
+    fn notification_event(self: &Rc<Self>, e: &NoteEvent) {
+        let (schedule, effects) = {
+            let mut guard = self.inner.borrow_mut();
+            let i = &mut *guard;
+            match e {
+                NoteEvent::Loaded(all) => {
+                    let mut effects = Vec::new();
+                    for (id, props) in all.iter() {
+                        i.m.note_notification(replyable(id, props));
+                        effects.extend(i.m.notification_seen(&as_props(props), epoch_now(), &i.store, false).1);
+                    }
+                    (false, effects)
+                }
+                NoteEvent::Posted(id, props) => {
+                    i.m.note_notification(replyable(id, props));
+                    i.m.notification_seen(&as_props(props), epoch_now(), &i.store, true)
+                }
+                NoteEvent::Removed(id) => {
+                    i.m.remove_notification(id);
+                    (false, Vec::new())
+                }
+                NoteEvent::Cleared => {
+                    i.m.clear_notifications();
+                    (false, Vec::new())
                 }
             }
-            this.run(effects);
-        });
+        };
+        self.run(effects);
+        if schedule {
+            self.schedule_hidden_check();
+        }
     }
 
-    fn load_notification(self: &Rc<Self>, id: String) {
-        let weak = Rc::downgrade(self);
-        self.with_device(move |c, d| async move {
-            let props = c.notification_properties(&d, &id).await;
-            let Some(this) = weak.upgrade() else { return };
-            let (schedule, effects) = {
-                let mut guard = this.inner.borrow_mut();
-                let i = &mut *guard;
-                i.m.note_notification(replyable(&id, &props));
-                i.m.notification_seen(&as_props(&props), epoch_now(), &i.store, true)
-            };
-            this.run(effects);
-            if schedule {
-                this.schedule_hidden_check();
-            }
-        });
+    /// Re-read the phone's notifications (through the window's model).
+    fn load_notifications(&self) {
+        self.notifications.reload();
+    }
+
+    /// Catch up on texts the phone never pushed (resume, window shown,
+    /// reconnect), at most once per `min_interval` seconds.
+    pub fn catch_up(self: &Rc<Self>, min_interval: f64) {
+        self.inner.borrow_mut().m.catch_up.catch_up(now(), sync::CATCH_UP_DELAY_SECONDS, min_interval);
+        self.reschedule();
     }
 
     /// Judge texting notifications once they're old enough.
