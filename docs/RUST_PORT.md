@@ -111,6 +111,26 @@ tree that has no `gtk` imports, so `cargo test` for core needs no display.
 - `_tray.py` is not ported. It is a separate GTK3 + XApp tray process,
   used only when no StatusNotifierWatcher exists (Mint). Fedora has a watcher.
 
+## Memory (2026-11-06)
+Measured on the laptop the same day, idle 90 s after start, no chat opened:
+
+| App | RSS |
+|---|---|
+| Python | 233 MB |
+| Rust, Vulkan (GTK default) | 167 MB |
+| Rust, `ngl` | 226 MB |
+| Rust, `cairo` | 132 MB |
+
+The Rust app's own heap and data ("Anonymous") is 76 MB against the Python's
+135 MB. The rest is GTK and the graphics stack. Ethan found cairo no
+different in use, and its freezes matched Vulkan's, so the Rust app defaults
+to `GSK_RENDERER=cairo` unless the variable is already set. On the build box
+under Broadway, with the same demo data for both apps, Rust uses 88 MB against
+Python's 125 MB (`scripts/mem-compare.sh`). Fixes along the way:
+- the idle reload loop
+- a 64 MB cap on the picture cache
+- Files thumbnails are decoded only once the tab is shown
+
 ## UI changes from the Python app (approved by Ethan)
 - 2026-11-05, thread view: no time under every bubble. Centered time lines
   appear at each new day ("Tuesday · 11:09 AM") and after a gap of an hour

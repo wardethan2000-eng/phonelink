@@ -114,7 +114,19 @@ fn load_css() {
     }
 }
 
+/// GTK's CPU renderer unless the user picked one. On Ethan's laptop
+/// (2026-11-06, Plasma, Intel) it idled at 132 MB against 167 MB for the
+/// default Vulkan renderer (which loads Mesa and its LLVM), with the same
+/// freezes and no visible difference. `GSK_RENDERER=vulkan` (or `ngl`)
+/// still overrides it.
+const DEFAULT_RENDERER: &str = "cairo";
+
 pub fn run() -> glib::ExitCode {
+    if std::env::var_os("GSK_RENDERER").is_none() {
+        // SAFETY: called first thing on the main thread, before GTK or any
+        // other thread starts, so nothing else reads the environment yet.
+        unsafe { std::env::set_var("GSK_RENDERER", DEFAULT_RENDERER) };
+    }
     if let Err(msg) = check_versions() {
         eprintln!("{msg}");
         return glib::ExitCode::FAILURE;
