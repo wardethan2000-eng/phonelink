@@ -123,7 +123,7 @@ impl MessagesPage {
         stack.set_vexpand(true);
         stack.set_hexpand(true);
         stack.set_transition_type(gtk::StackTransitionType::Crossfade);
-        let hidden_banner = adw::Banner::new("Your phone is hiding some texts from Phone Link");
+        let hidden_banner = adw::Banner::new("Your phone is hiding some texts from PhoneRelay");
         hidden_banner.set_button_label(Some("Copy fix"));
         hidden_banner.connect_button_clicked(|b| {
             b.clipboard().set_text(crate::core::hidden_texts::FIX_COMMAND);
@@ -646,7 +646,7 @@ impl MessagesPage {
     /// Run the Google Messages helper off the main thread, then say how it went.
     fn delete_on_google(self: &Rc<Self>, chats: Vec<(i64, Vec<String>)>) {
         if !crate::core::phone_delete::available() {
-            self.toast("Removed from Phone Link only: Google Messages isn't paired on this computer");
+            self.toast("Removed from PhoneRelay only: Google Messages isn't paired on this computer");
             return;
         }
         let weak = Rc::downgrade(self);
@@ -661,7 +661,7 @@ impl MessagesPage {
                     }
                     this.toast(&crate::core::phone_delete::summary(&result));
                 }
-                Err(_) => this.toast("Removed from Phone Link only: the Google Messages helper crashed"),
+                Err(_) => this.toast("Removed from PhoneRelay only: the Google Messages helper crashed"),
             }
         });
     }
@@ -689,17 +689,17 @@ impl MessagesPage {
                     .get(*thread_id)
                     .map(|c| if c.display_name.is_empty() { c.address.clone() } else { c.display_name.clone() })
                     .unwrap_or_else(|| format!("Thread {thread_id}"));
-                ("Delete Conversation".to_string(), format!("Remove the conversation with {name} from Phone Link?"))
+                ("Delete Conversation".to_string(), format!("Remove the conversation with {name} from PhoneRelay?"))
             } else {
                 let n = thread_ids.len();
-                (format!("Delete {n} Conversations"), format!("Remove these {n} conversations from Phone Link?"))
+                (format!("Delete {n} Conversations"), format!("Remove these {n} conversations from PhoneRelay?"))
             };
             body.push_str(if google_deletes {
                 "\n\nThis also deletes them from your phone (Google Messages). It can't be undone."
             } else if kde_deletes {
                 "\n\nPhone Link will also ask your phone to delete them there."
             } else {
-                "\n\nThis removes them from Phone Link only: phone-side deletion needs Google Messages paired (gmcli) and the phonelink-gm helper."
+                "\n\nThis removes them from PhoneRelay only: phone-side deletion needs Google Messages paired (gmcli) and the phonelink-gm helper."
             });
             if thread_ids.len() == 1 {
                 body = body
@@ -739,7 +739,7 @@ impl MessagesPage {
                     if !to_phone.is_empty() {
                         this.delete_on_google(to_phone);
                     }
-                    // One "only from Phone Link" note, not one per chat.
+                    // One "only from PhoneRelay" note, not one per chat.
                     let mut toasted = false;
                     effects.retain(|e| !matches!(e, Effect::Toast(_)) || !std::mem::replace(&mut toasted, true));
                     effects.push(Effect::ShowEmpty);
@@ -758,7 +758,7 @@ impl MessagesPage {
             Some("Sync Contacts"),
             Some(
                 "Choose how to load your full contact list:\n\n\
-                 Google Contacts:\nAuthorize in your browser and import directly into Phone Link.\n\n\
+                 Google Contacts:\nAuthorize in your browser and import directly into PhoneRelay.\n\n\
                  Phone share:\n1. Open Contacts on your phone\n2. Tap ⋮ menu → Share\n3. Select all contacts\n\
                  4. Share via KDE Connect to this PC\n\n\
                  Manual file:\nImport a VCF or Google Contacts CSV if you already have one.",
@@ -1078,7 +1078,7 @@ impl MessagesPage {
             };
             if changed {
                 if warning {
-                    this.hidden_banner.set_title("Your phone is hiding some texts from Phone Link");
+                    this.hidden_banner.set_title("Your phone is hiding some texts from PhoneRelay");
                 }
                 this.hidden_banner.set_revealed(warning);
             }

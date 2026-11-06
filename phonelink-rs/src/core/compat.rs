@@ -39,12 +39,12 @@ pub struct TooOld {
 impl TooOld {
     /// What the user sees: what is too old, what is needed, what to do.
     pub fn message(&self) -> String {
-        let mut lines = vec!["Phone Link can't start: this system's GTK libraries are too old.".to_string(), String::new()];
+        let mut lines = vec!["PhoneRelay can't start: this system's GTK libraries are too old.".to_string(), String::new()];
         if let Some(v) = self.gtk {
-            lines.push(format!("  GTK {v} is installed; Phone Link needs {MIN_GTK} or newer."));
+            lines.push(format!("  GTK {v} is installed; PhoneRelay needs {MIN_GTK} or newer."));
         }
         if let Some(v) = self.adw {
-            lines.push(format!("  libadwaita {v} is installed; Phone Link needs {MIN_ADW} or newer."));
+            lines.push(format!("  libadwaita {v} is installed; PhoneRelay needs {MIN_ADW} or newer."));
         }
         lines.push(String::new());
         lines.push(

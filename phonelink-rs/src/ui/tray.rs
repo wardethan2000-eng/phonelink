@@ -1,5 +1,5 @@
 //! The tray icon (port of `phonelink/tray_sni.py`): a StatusNotifierItem
-//! and a two-item DBusMenu ("Show Phone Link", "Quit") exported over gio on
+//! and a two-item DBusMenu ("Show PhoneRelay", "Quit") exported over gio on
 //! the app's own session connection. Left click toggles the window.
 //! `_tray.py`, the GTK3 / XApp fallback for desktops without a
 //! StatusNotifierWatcher, is not ported: without a watcher there is no tray,
@@ -93,7 +93,7 @@ fn menu_node(id: i32, props: Variant, children: Vec<Variant>) -> Variant {
 fn layout() -> Variant {
     let root = glib::VariantDict::new(None);
     root.insert_value("children-display", &"submenu".to_variant());
-    let items = [(SHOW_ID, "Show Phone Link"), (QUIT_ID, "Quit")]
+    let items = [(SHOW_ID, "Show PhoneRelay"), (QUIT_ID, "Quit")]
         .iter()
         .map(|(id, label)| Variant::from_variant(&menu_node(*id, props(label), Vec::new())))
         .collect();
@@ -141,7 +141,7 @@ pub fn start(conn: &gio::DBusConnection, toggle: Rc<dyn Fn()>, quit: Rc<dyn Fn()
         .property(move |_, _, _, _, prop| match prop {
             "Category" => "ApplicationStatus".to_variant(),
             "Id" => "phonelink".to_variant(),
-            "Title" => "Phone Link".to_variant(),
+            "Title" => "PhoneRelay".to_variant(),
             "Status" => "Active".to_variant(),
             "IconName" => APPLICATION_ID.to_variant(),
             "IconPixmap" => pixmaps.clone(),
@@ -169,7 +169,7 @@ pub fn start(conn: &gio::DBusConnection, toggle: Rc<dyn Fn()>, quit: Rc<dyn Fn()
         .method_call(move |_, _, _, _, method, params, inv| match method {
             "GetLayout" => inv.return_value(Some(&layout())),
             "GetGroupProperties" => {
-                let entries: Vec<Variant> = [(SHOW_ID, "Show Phone Link"), (QUIT_ID, "Quit")]
+                let entries: Vec<Variant> = [(SHOW_ID, "Show PhoneRelay"), (QUIT_ID, "Quit")]
                     .iter()
                     .map(|(id, label)| Variant::tuple_from_iter([id.to_variant(), props(label)]))
                     .collect();

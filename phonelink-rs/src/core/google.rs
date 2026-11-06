@@ -109,7 +109,7 @@ pub fn load_client_config(env_id: Option<&str>, env_secret: Option<&str>, file: 
     Ok(ClientConfig { client_id, client_secret: s("client_secret", ""), auth_uri: s("auth_uri", AUTH_URI), token_uri: s("token_uri", TOKEN_URI) })
 }
 
-/// Phone Link's own client, baked in at build time (see build.rs).
+/// PhoneRelay's own client, baked in at build time (see build.rs).
 pub const BUILTIN_CLIENT: Option<(&str, &str)> =
     match (option_env!("PHONELINK_BUILTIN_GOOGLE_CLIENT_ID"), option_env!("PHONELINK_BUILTIN_GOOGLE_CLIENT_SECRET")) {
         (Some(id), Some(secret)) => Some((id, secret)),
@@ -416,7 +416,7 @@ pub struct SignIn {
 }
 
 const SUCCESS_PAGE: &str = "<html><body style=\"font-family:sans-serif\"><h2>Google Contacts access granted.</h2>\
-     <p>You can close this window and return to Phone Link.</p></body></html>";
+     <p>You can close this window and return to PhoneRelay.</p></body></html>";
 
 impl SignIn {
     /// Listen on 127.0.0.1 at a random port and build the consent URL
@@ -656,7 +656,7 @@ fn contact_names(name: &str) -> Value {
     json!([{ "unstructuredName": name, "displayName": name }])
 }
 
-/// A rename in Phone Link updates the Google contact with that number, or
+/// A rename in PhoneRelay updates the Google contact with that number, or
 /// creates one.
 pub fn upsert_contact(http: &dyn Http, token: &str, address: &str, name: &str) -> Result<Upsert> {
     if name.trim().is_empty() || normalize_phone(address).is_empty() {

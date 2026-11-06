@@ -143,12 +143,12 @@ impl SettingsPage {
         let startup = group("Startup");
         let open_on_login = switch_row(
             "Open on Login",
-            "Automatically launch Phone Link when you sign in",
+            "Automatically launch PhoneRelay when you sign in",
             settings.borrow().open_on_startup(),
         );
         if !AUTOSTART_WIRED {
             open_on_login.set_sensitive(false);
-            open_on_login.set_subtitle("The current Phone Link opens at login. This moves to the new version when you switch over.");
+            open_on_login.set_subtitle("The old Python Phone Link opens at login. This moves to the new version when you switch over.");
         }
         startup.add(&open_on_login);
         content.add_named(&page_with(&[&startup]), Some("general"));
@@ -179,7 +179,7 @@ impl SettingsPage {
         for (t, sub) in [
             (
                 "Low-volume sync",
-                "Phone Link only runs automatic Google refresh when a saved account exists and the last attempt is older than one day.",
+                "PhoneRelay only runs automatic Google refresh when a saved account exists and the last attempt is older than one day.",
             ),
             (
                 "Contact photos",

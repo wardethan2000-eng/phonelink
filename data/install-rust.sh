@@ -1,5 +1,5 @@
 #!/bin/bash
-# Install the Rust Phone Link for the current user (Phase 7 switch-over):
+# Install the Rust PhoneRelay for the current user (Phase 7 switch-over):
 #   data/install-rust.sh path/to/phonelink-rs
 # Puts the binary in ~/.local/bin, a desktop file and icons under the app id
 # io.github.wardethan2000_eng.phonelink. It does not touch autostart: turn on
@@ -25,14 +25,14 @@ fi
 
 cat > "$HOME/.local/share/applications/$APP_ID.desktop" <<DESKTOP
 [Desktop Entry]
-Name=Phone Link
+Name=PhoneRelay
 Comment=Connect your Android phone - SMS, notifications, and files
 Exec="$BIN"
 Icon=$APP_ID
 Terminal=false
 Type=Application
 Categories=Utility;Communication;
-Keywords=phone;sms;notifications;kdeconnect;android;
+Keywords=phone;phone link;sms;notifications;kdeconnect;android;
 StartupWMClass=$APP_ID
 DESKTOP
 
@@ -45,4 +45,4 @@ done
 
 update-desktop-database "$HOME/.local/share/applications/" 2>/dev/null || true
 gtk-update-icon-cache "$HOME/.local/share/icons/hicolor/" 2>/dev/null || true
-echo "Installed $BIN and the \"Phone Link\" menu entry ($APP_ID)."
+echo "Installed $BIN and the \"PhoneRelay\" menu entry ($APP_ID)."

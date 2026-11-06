@@ -76,7 +76,7 @@ pub enum Effect {
 
 pub const TOAST_NOT_CONNECTED: &str = "Can't send — your phone isn't connected right now";
 pub const TOAST_LOCAL_DELETE_ONLY: &str =
-    "Removed from Phone Link only; phone-side deletion is not available on this KDE Connect version";
+    "Removed from PhoneRelay only; phone-side deletion is not available on this KDE Connect version";
 
 /// How a text sent from this app left it. Shown under the sent bubble so a
 /// fallback to SMS is never silent.

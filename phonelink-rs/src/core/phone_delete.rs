@@ -1,7 +1,7 @@
 //! Deleting chats on the phone through Google Messages.
 //!
 //! KDE Connect only reads texts, and only the default SMS app may delete
-//! them, so Phone Link runs the `phonelink-gm` helper (Go, libgm), which
+//! them, so PhoneRelay runs the `phonelink-gm` helper (Go, libgm), which
 //! deletes through the Google Messages web link paired with gmcli. The
 //! helper is matched by the chat's members; it refuses a chat it can't pin
 //! to exactly one Google Messages conversation.
@@ -99,7 +99,7 @@ pub fn delete_chats(chats: &[Vec<String>]) -> Result<Vec<Outcome>, String> {
 /// What to tell the user afterwards.
 pub fn summary(result: &Result<Vec<Outcome>, String>) -> String {
     let outcomes = match result {
-        Err(e) => return format!("Removed from Phone Link only: {e}"),
+        Err(e) => return format!("Removed from PhoneRelay only: {e}"),
         Ok(o) => o,
     };
     let total = outcomes.len();
@@ -120,7 +120,7 @@ pub fn summary(result: &Result<Vec<Outcome>, String>) -> String {
         let why = outcomes.iter().find_map(|o| if let Outcome::Failed(m) = o { Some(m.as_str()) } else { None }).unwrap_or("");
         parts.push(format!("{failed} failed ({why})"));
     }
-    let tail = if total == 1 { "removed from Phone Link only" } else { "the rest removed from Phone Link only" };
+    let tail = if total == 1 { "removed from PhoneRelay only" } else { "the rest removed from PhoneRelay only" };
     let head = if total == 1 && unmatched == 1 { "Not found in Google Messages".to_string() } else { parts.join(", ") };
     format!("{head}; {tail}")
 }
@@ -149,12 +149,12 @@ mod tests {
     fn summaries_say_what_happened_on_the_phone() {
         assert_eq!(summary(&Ok(vec![Outcome::Deleted])), "Deleted on your phone too");
         assert_eq!(summary(&Ok(vec![Outcome::Deleted, Outcome::Deleted])), "Deleted all 2 on your phone too");
-        assert_eq!(summary(&Ok(vec![Outcome::NotMatched])), "Not found in Google Messages; removed from Phone Link only");
+        assert_eq!(summary(&Ok(vec![Outcome::NotMatched])), "Not found in Google Messages; removed from PhoneRelay only");
         assert_eq!(
             summary(&Ok(vec![Outcome::Deleted, Outcome::NotMatched, Outcome::Failed("x".into())])),
-            "1 deleted on your phone, 1 not found in Google Messages, 1 failed (x); the rest removed from Phone Link only"
+            "1 deleted on your phone, 1 not found in Google Messages, 1 failed (x); the rest removed from PhoneRelay only"
         );
-        assert_eq!(summary(&Err("boom".into())), "Removed from Phone Link only: boom");
+        assert_eq!(summary(&Err("boom".into())), "Removed from PhoneRelay only: boom");
     }
 
     #[test]

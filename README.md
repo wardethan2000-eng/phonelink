@@ -1,6 +1,6 @@
-# Phone Link for Linux
+# PhoneRelay (formerly Phone Link for Linux)
 
-A desktop app that brings your Android phone's messages, notifications, and files to your Linux desktop — similar to Microsoft's Phone Link on Windows. Built with GTK4 and Libadwaita, it uses [KDE Connect](https://kdeconnect.kde.org/) as the communication backend.
+PhoneRelay is a desktop app that brings your Android phone's messages, notifications, and files to your Linux desktop — similar to Microsoft's Phone Link on Windows. Built with GTK4 and Libadwaita, it uses [KDE Connect](https://kdeconnect.kde.org/) as the communication backend.
 
 > **New: Phone Link is now written in Rust** (`phonelink-rs/`). It does
 > everything the Python version does, with the same look, about 40% less

@@ -4,7 +4,7 @@ version = "0.1.0"
 edition = "2024"
 rust-version = "1.98"
 license = "MIT"
-description = "Phone Link for Linux (Rust port)"
+description = "PhoneRelay for Linux (Rust port)"
 
 [dependencies]
 anyhow = "1"

@@ -1,6 +1,6 @@
 # phonelink-gm
 
-Deletes chats on the phone for Phone Link. KDE Connect can only read texts,
+Deletes chats on the phone for PhoneRelay. KDE Connect can only read texts,
 and Android lets only the default SMS app (Google Messages) delete them, so
 this helper deletes through the Google Messages web link using libgm
 (mautrix-gmessages) and the session paired by
@@ -16,5 +16,5 @@ same people), is left alone.
 Build: `CGO_ENABLED=0 go build -trimpath -ldflags="-s -w" -o phonelink-gm .`
 (on the build box; `data/install-rust.sh` installs it next to the app).
 
-License: AGPL-3.0-or-later, because it links libgm. The rest of Phone Link
+License: AGPL-3.0-or-later, because it links libgm. The rest of PhoneRelay
 stays MIT; the app only runs this as a separate program.

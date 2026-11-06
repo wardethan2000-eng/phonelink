@@ -140,7 +140,7 @@ pub fn quote_desktop_exec_arg(value: &str) -> String {
 pub fn desktop_entry_text(exec: &str) -> String {
     format!(
         "[Desktop Entry]\n\
-         Name=Phone Link\n\
+         Name=PhoneRelay\n\
          Comment=Connect your Android phone - SMS, notifications, and files\n\
          Exec={exec}\n\
          Icon={APPLICATION_ID}\n\

@@ -14,7 +14,7 @@ fn main() {
     builtin_google_client();
 }
 
-/// Phone Link's own Google OAuth client, so users only click Connect. Read
+/// PhoneRelay's own Google OAuth client, so users only click Connect. Read
 /// from `data/google_oauth_client.json` (the Desktop client JSON from Google
 /// Cloud, gitignored: it stays out of the public repo) and baked in as
 /// `PHONELINK_BUILTIN_GOOGLE_CLIENT_ID` / `_SECRET`. Google treats a desktop

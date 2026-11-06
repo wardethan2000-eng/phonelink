@@ -2,7 +2,7 @@
 // Messages web link (libgm), using the session paired by gmcli.
 //
 // KDE Connect can only read texts; only the default SMS app (Google
-// Messages) can delete them. Phone Link runs this helper when a chat is
+// Messages) can delete them. PhoneRelay runs this helper when a chat is
 // deleted on the desktop.
 //
 //	phonelink-gm status
@@ -123,7 +123,7 @@ func saveAuth(path string, auth *libgm.AuthData) error {
 
 var nonDigit = regexp.MustCompile(`\D`)
 
-// phoneKey: last 10 digits (or all when shorter), like Phone Link's.
+// phoneKey: last 10 digits (or all when shorter), like PhoneRelay's.
 func phoneKey(s string) string {
 	d := nonDigit.ReplaceAllString(s, "")
 	if len(d) > 10 {

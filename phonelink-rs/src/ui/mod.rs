@@ -29,10 +29,10 @@ const PYTHON_APP_ID: &str = "dev.phonelink.app";
 fn check_versions() -> Result<(), String> {
     // The bindings refuse to report versions before initialization.
     if let Err(e) = gtk::init() {
-        return Err(format!("Phone Link could not start GTK: {e}"));
+        return Err(format!("PhoneRelay could not start GTK: {e}"));
     }
     if let Err(e) = adw::init() {
-        return Err(format!("Phone Link could not start libadwaita: {e}"));
+        return Err(format!("PhoneRelay could not start libadwaita: {e}"));
     }
     let gtk_v = Version(gtk::major_version(), gtk::minor_version(), gtk::micro_version());
     let adw_v = Version(adw::major_version(), adw::minor_version(), adw::micro_version());
@@ -133,7 +133,7 @@ pub fn run() -> glib::ExitCode {
     }
     if python_app_running() {
         eprintln!(
-            "The Python Phone Link app is running. Quit it first (tray icon → Quit): \
+            "The old Python Phone Link app is running. Quit it first (tray icon → Quit): \
              both apps use the same message store."
         );
         return glib::ExitCode::FAILURE;

@@ -118,7 +118,7 @@ impl Window {
         let settings = Rc::new(RefCell::new(settings));
 
         let window = adw::ApplicationWindow::new(app);
-        window.set_title(Some("Phone Link"));
+        window.set_title(Some("PhoneRelay"));
         window.set_default_size(960, 640);
         window.set_size_request(640, 420);
 
@@ -420,8 +420,8 @@ impl Window {
                     this.show_status(
                         "dialog-error-symbolic",
                         "Can't reach your desktop session",
-                        "Phone Link couldn't connect to the service that links your phone.\n\
-                         Sign in to a normal desktop session, then reopen Phone Link.",
+                        "PhoneRelay couldn't connect to the service that links your phone.\n\
+                         Sign in to a normal desktop session, then reopen PhoneRelay.",
                     );
                     return;
                 }
@@ -489,9 +489,9 @@ impl Window {
         self.show_status(
             "dialog-warning-symbolic",
             "Finish setting up your phone",
-            "Phone Link uses KDE Connect to talk to your phone, and it isn't running yet.\n\n\
+            "PhoneRelay uses KDE Connect to talk to your phone, and it isn't running yet.\n\n\
              Install it:\n  sudo apt install kdeconnect\n\n\
-             Then open KDE Connect and pair your phone — Phone Link picks it up automatically.",
+             Then open KDE Connect and pair your phone — PhoneRelay picks it up automatically.",
         );
     }
 
