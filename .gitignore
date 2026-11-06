@@ -12,3 +12,4 @@ venv/
 
 # built Google Messages helper
 /phonelink-gm/phonelink-gm
+/data/google_oauth_client.json

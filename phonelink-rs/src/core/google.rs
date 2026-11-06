@@ -109,10 +109,36 @@ pub fn load_client_config(env_id: Option<&str>, env_secret: Option<&str>, file: 
     Ok(ClientConfig { client_id, client_secret: s("client_secret", ""), auth_uri: s("auth_uri", AUTH_URI), token_uri: s("token_uri", TOKEN_URI) })
 }
 
+/// Phone Link's own client, baked in at build time (see build.rs).
+pub const BUILTIN_CLIENT: Option<(&str, &str)> =
+    match (option_env!("PHONELINK_BUILTIN_GOOGLE_CLIENT_ID"), option_env!("PHONELINK_BUILTIN_GOOGLE_CLIENT_SECRET")) {
+        (Some(id), Some(secret)) => Some((id, secret)),
+        _ => None,
+    };
+
+/// Env vars, else the user's own client file, else the built-in client.
+pub fn load_client_config_with(
+    env_id: Option<&str>,
+    env_secret: Option<&str>,
+    file: &Path,
+    builtin: Option<(&str, &str)>,
+) -> Result<ClientConfig> {
+    let has_env = env_id.is_some_and(|s| !s.trim().is_empty());
+    match builtin {
+        Some((id, secret)) if !has_env && !file.is_file() => Ok(ClientConfig {
+            client_id: id.to_string(),
+            client_secret: secret.to_string(),
+            auth_uri: AUTH_URI.into(),
+            token_uri: TOKEN_URI.into(),
+        }),
+        _ => load_client_config(env_id, env_secret, file),
+    }
+}
+
 pub fn load_client_config_default(home: &Path) -> Result<ClientConfig> {
     let id = std::env::var("PHONELINK_GOOGLE_CLIENT_ID").ok();
     let secret = std::env::var("PHONELINK_GOOGLE_CLIENT_SECRET").ok();
-    load_client_config(id.as_deref(), secret.as_deref(), &client_file(home))
+    load_client_config_with(id.as_deref(), secret.as_deref(), &client_file(home), BUILTIN_CLIENT)
 }
 
 // ── the saved token ────────────────────────────────────────────────
@@ -710,6 +736,20 @@ mod tests {
         format!(
             r#"{{"token":"old","refresh_token":"r1","token_uri":"https://t/token","client_id":"cid","client_secret":"s","scopes":["{SCOPE}"],"universe_domain":"googleapis.com","account":"","expiry":"{expiry}"}}"#
         )
+    }
+
+    #[test]
+    fn builtin_client_is_used_only_without_env_or_file() {
+        let dir = tempfile::tempdir().unwrap();
+        let missing = dir.path().join("none.json");
+        let got = load_client_config_with(None, None, &missing, Some(("built-id", "built-secret"))).unwrap();
+        assert_eq!((got.client_id.as_str(), got.client_secret.as_str()), ("built-id", "built-secret"));
+        let env = load_client_config_with(Some("env-id"), Some("s"), &missing, Some(("built-id", "x"))).unwrap();
+        assert_eq!(env.client_id, "env-id");
+        let file = dir.path().join("own.json");
+        std::fs::write(&file, r#"{"installed":{"client_id":"own-id","client_secret":"own"}}"#).unwrap();
+        assert_eq!(load_client_config_with(None, None, &file, Some(("built-id", "x"))).unwrap().client_id, "own-id");
+        assert!(load_client_config_with(None, None, &missing, None).is_err());
     }
 
     #[test]

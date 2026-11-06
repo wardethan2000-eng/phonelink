@@ -11,6 +11,34 @@ fn main() {
     // the problem instead of the loader printing "undefined symbol".
     println!("cargo:rustc-link-arg-bins=-Wl,-z,lazy");
     compile_icons();
+    builtin_google_client();
+}
+
+/// Phone Link's own Google OAuth client, so users only click Connect. Read
+/// from `data/google_oauth_client.json` (the Desktop client JSON from Google
+/// Cloud, gitignored: it stays out of the public repo) and baked in as
+/// `PHONELINK_BUILTIN_GOOGLE_CLIENT_ID` / `_SECRET`. Google treats a desktop
+/// client's secret as not confidential, but keeping it out of git avoids
+/// secret scanners. Without the file the app falls back to the user's own
+/// `~/.config/phonelink/google_oauth.json`.
+fn builtin_google_client() {
+    let path = PathBuf::from(env!("CARGO_MANIFEST_DIR")).join("../data/google_oauth_client.json");
+    println!("cargo:rerun-if-changed={}", path.display());
+    let Ok(text) = std::fs::read_to_string(&path) else { return };
+    let field = |key: &str| -> Option<String> {
+        // Tiny scan for "key": "value" (no JSON crate in build-dependencies).
+        let at = text.find(&format!("\"{key}\""))?;
+        let rest = &text[at + key.len() + 2..];
+        let start = rest.find('"')? + 1;
+        let end = rest[start..].find('"')? + start;
+        Some(rest[start..end].to_string())
+    };
+    if let (Some(id), Some(secret)) = (field("client_id"), field("client_secret")) {
+        println!("cargo:rustc-env=PHONELINK_BUILTIN_GOOGLE_CLIENT_ID={id}");
+        println!("cargo:rustc-env=PHONELINK_BUILTIN_GOOGLE_CLIENT_SECRET={secret}");
+    } else {
+        println!("cargo:warning=data/google_oauth_client.json has no client_id/client_secret; no built-in Google client");
+    }
 }
 
 /// Bundle the app icon (`data/icons`) into the binary as a GResource in the

@@ -241,6 +241,8 @@ If you are not on Debian-based Linux, you can use pip directly in a virtualenv, 
 python3 -m pip install google-auth-oauthlib google-api-python-client google-auth-httplib2
 ```
 
+The Rust app has Phone Link's own Google client built in: click **Connect** in Settings and pick your account. (Builds include it when `data/google_oauth_client.json`, the Desktop client JSON from Google Cloud, is present; it is kept out of git.) The options below are for the Python app, or to use your own Google Cloud client instead.
+
 Then configure a Google OAuth desktop client for Phone Link.
 
 Option A: environment variables
