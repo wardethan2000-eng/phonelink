@@ -13,6 +13,9 @@
 //!   rebuilds the thread.
 //! - Images are measured and decoded off the main thread at 2× display size,
 //!   with an LRU of [`IMAGE_CACHE_MAX`] textures.
+//! - Find (Ctrl+F, or opening a chat from a search match) steps through
+//!   matching messages; a match outside the window widens it, then the
+//!   chat appears centred on the match instead of at the bottom.
 
 use std::cell::{Cell, RefCell};
 use std::collections::{HashSet, VecDeque};
@@ -28,9 +31,12 @@ use regex::Regex;
 use crate::core::attachments::{existing_full_in, full_cache_dir, image_ext, is_image, sanitize_name};
 use crate::core::messages::SendRoute;
 use crate::core::models::{Attachment, Conversation, SmsMessage};
+use crate::core::search;
 
 pub const THREAD_WINDOW: usize = 60;
 pub const THREAD_WINDOW_STEP: usize = 100;
+/// Older messages built above a revealed search match.
+const REVEAL_CONTEXT: usize = 10;
 /// A centered time line goes in wherever this much time passed between two
 /// messages (and at the start of each day). Per-bubble times are hidden
 /// except on the newest message; tap a bubble to see its time. (Ethan,
@@ -272,6 +278,8 @@ pub struct BubbleActions {
 
 struct Bubble {
     widget: gtk::Box,
+    /// The text, when it has no links (links are markup already).
+    body: Option<gtk::Label>,
     revealer: gtk::Revealer,
     /// The send route on its own, shown while the time is hidden.
     route_tag: Option<gtk::Label>,
@@ -355,7 +363,8 @@ impl Bubble {
             tag
         });
 
-        let bubble = Rc::new(Self { widget, revealer, route_tag, message: msg.clone() });
+        let body = (!has_links && !msg.body.is_empty()).then_some(body);
+        let bubble = Rc::new(Self { widget, body, revealer, route_tag, message: msg.clone() });
         bubble.set_timestamp_visible(show_time);
         if !has_links {
             // Tap a bubble to show or hide its time.
@@ -369,6 +378,25 @@ impl Bubble {
             frame.add_controller(click);
         }
         bubble
+    }
+
+    /// Outline the bubble and bold `needle` in its text (None clears).
+    fn set_search_hit(&self, needle: Option<&str>) {
+        match needle {
+            Some(n) => {
+                self.widget.add_css_class("search-hit");
+                if let (Some(body), Some(q)) = (&self.body, search::fold_query(n)) {
+                    let ranges = search::fold(&self.message.body).find_all(&q);
+                    body.set_markup(&search::bold_markup(&self.message.body, &ranges));
+                }
+            }
+            None => {
+                self.widget.remove_css_class("search-hit");
+                if let Some(body) = &self.body {
+                    body.set_text(&self.message.body);
+                }
+            }
+        }
     }
 
     fn set_timestamp_visible(&self, visible: bool) {
@@ -673,6 +701,16 @@ struct State {
     /// While older bubbles are added above: the scroll distance from the
     /// bottom to hold.
     anchor_from_bottom: Option<f64>,
+    /// Find: the text, the matching uids (oldest first) and the one shown.
+    find_needle: String,
+    find_matches: Vec<i64>,
+    find_current: usize,
+    /// The match outlined now.
+    highlighted: Option<i64>,
+    /// Show this message, not the bottom, when the build finishes.
+    reveal: Option<i64>,
+    /// A chat about to open from a search match: (thread, text, uid).
+    pending_find: Option<(i64, String, i64)>,
 }
 
 pub struct ThreadView {
@@ -697,6 +735,9 @@ pub struct ThreadView {
     /// Told the uids of messages just put on screen (for full pictures).
     on_rendered: RefCell<Option<RenderedHandler>>,
     actions: BubbleActions,
+    find_bar: gtk::SearchBar,
+    find_entry: gtk::SearchEntry,
+    find_label: gtk::Label,
     state: RefCell<State>,
 }
 
@@ -740,6 +781,30 @@ impl ThreadView {
         header.append(&address);
         thread_box.append(&header);
         thread_box.append(&gtk::Separator::new(gtk::Orientation::Horizontal));
+
+        // Find in this chat (Ctrl+F; opens by itself from a search match).
+        let find_entry = gtk::SearchEntry::new();
+        find_entry.set_placeholder_text(Some("Find in this chat"));
+        find_entry.set_hexpand(true);
+        let find_label = gtk::Label::new(None);
+        find_label.add_css_class("dim-label");
+        find_label.add_css_class("caption");
+        find_label.add_css_class("numeric");
+        let find_older = gtk::Button::from_icon_name("go-up-symbolic");
+        find_older.set_tooltip_text(Some("Earlier match (Enter)"));
+        let find_newer = gtk::Button::from_icon_name("go-down-symbolic");
+        find_newer.set_tooltip_text(Some("Later match (Shift+Enter)"));
+        let find_box = gtk::Box::new(gtk::Orientation::Horizontal, 6);
+        find_box.set_size_request(360, -1);
+        find_box.append(&find_entry);
+        find_box.append(&find_label);
+        find_box.append(&find_older);
+        find_box.append(&find_newer);
+        let find_bar = gtk::SearchBar::new();
+        find_bar.set_child(Some(&find_box));
+        find_bar.set_show_close_button(true);
+        find_bar.connect_entry(&find_entry);
+        thread_box.append(&find_bar);
 
         let scroll = gtk::ScrolledWindow::new();
         scroll.set_vexpand(true);
@@ -820,7 +885,69 @@ impl ThreadView {
             on_zoom: RefCell::default(),
             on_rendered: RefCell::default(),
             actions,
+            find_bar: find_bar.clone(),
+            find_entry: find_entry.clone(),
+            find_label,
             state: RefCell::new(State { window: THREAD_WINDOW, pinned: true, ..Default::default() }),
+        });
+
+        let weak = Rc::downgrade(&this);
+        find_entry.connect_search_changed(move |e| {
+            if let Some(this) = weak.upgrade() {
+                this.find_changed(&e.text());
+            }
+        });
+        for (button, step) in [(&find_older, -1), (&find_newer, 1)] {
+            let weak = Rc::downgrade(&this);
+            button.connect_clicked(move |_| {
+                if let Some(this) = weak.upgrade() {
+                    this.find_step(step);
+                }
+            });
+        }
+        let weak = Rc::downgrade(&this);
+        find_entry.connect_activate(move |_| {
+            if let Some(this) = weak.upgrade() {
+                this.find_step(-1);
+            }
+        });
+        let weak = Rc::downgrade(&this);
+        find_entry.connect_next_match(move |_| {
+            if let Some(this) = weak.upgrade() {
+                this.find_step(-1);
+            }
+        });
+        let weak = Rc::downgrade(&this);
+        find_entry.connect_previous_match(move |_| {
+            if let Some(this) = weak.upgrade() {
+                this.find_step(1);
+            }
+        });
+        let (bar, compose) = (find_bar.clone(), this.entry.clone());
+        find_entry.connect_stop_search(move |_| {
+            bar.set_search_mode(false);
+            compose.grab_focus();
+        });
+        let shift_enter = gtk::EventControllerKey::new();
+        let weak = Rc::downgrade(&this);
+        shift_enter.connect_key_pressed(move |_, key, _, state| {
+            let enter = matches!(key, gdk::Key::Return | gdk::Key::KP_Enter);
+            match (enter && state.contains(gdk::ModifierType::SHIFT_MASK), weak.upgrade()) {
+                (true, Some(this)) => {
+                    this.find_step(1);
+                    glib::Propagation::Stop
+                }
+                _ => glib::Propagation::Proceed,
+            }
+        });
+        find_entry.add_controller(shift_enter);
+        let weak = Rc::downgrade(&this);
+        find_bar.connect_search_mode_enabled_notify(move |bar| {
+            if !bar.is_search_mode()
+                && let Some(this) = weak.upgrade()
+            {
+                this.end_find();
+            }
         });
 
         let weak = Rc::downgrade(&this);
@@ -913,6 +1040,18 @@ impl ThreadView {
             });
             shortcuts.add_shortcut(gtk::Shortcut::new(gtk::ShortcutTrigger::parse_string(trigger), Some(action)));
         }
+        let weak = Rc::downgrade(&this);
+        let find = gtk::CallbackAction::new(move |_, _| {
+            let Some(this) = weak.upgrade() else { return glib::Propagation::Proceed };
+            if !this.widget.is_mapped() || this.widget.visible_child_name().as_deref() != Some("thread") {
+                return glib::Propagation::Proceed;
+            }
+            this.find_bar.set_search_mode(true);
+            this.find_entry.grab_focus();
+            this.find_entry.select_region(0, -1);
+            glib::Propagation::Stop
+        });
+        shortcuts.add_shortcut(gtk::Shortcut::new(gtk::ShortcutTrigger::parse_string("<Control>f"), Some(find)));
         this.widget.add_controller(shortcuts);
 
         // Pinned to the bottom unless the user scrolled up; stay there while
@@ -1107,16 +1246,27 @@ impl ThreadView {
         self.set_header(conv);
         let same = self.state.borrow().thread_id == Some(conv.thread_id)
             && self.widget.visible_child_name().as_deref() == Some("thread");
+        let changed = self.state.borrow().thread_id != Some(conv.thread_id);
         {
             let mut st = self.state.borrow_mut();
-            if st.thread_id != Some(conv.thread_id) {
+            if changed {
                 st.window = THREAD_WINDOW;
                 st.thread_id = Some(conv.thread_id);
+                st.reveal = None;
             }
             st.routes = conv.messages.iter().filter_map(|m| route(m.uid).map(|r| (m.uid, r))).collect();
         }
         if !same {
-            self.state.borrow_mut().all = sorted(&conv.messages);
+            let pending = {
+                let mut st = self.state.borrow_mut();
+                st.all = sorted(&conv.messages);
+                st.pending_find.take().filter(|(tid, _, _)| *tid == conv.thread_id)
+            };
+            match pending {
+                Some((_, needle, uid)) => self.start_find(&needle, Some(uid)),
+                None if changed => self.find_bar.set_search_mode(false),
+                None => {}
+            }
             self.set_messages(false);
             return;
         }
@@ -1136,6 +1286,7 @@ impl ThreadView {
         self.state.borrow_mut().all = sorted(&conv.messages);
         if rebuild {
             self.set_messages(true);
+            self.refresh_find();
             return;
         }
         let hidden = {
@@ -1159,6 +1310,7 @@ impl ThreadView {
             let r = self.state.borrow().routes.get(&m.uid).copied();
             self.append_message(m, r);
         }
+        self.refresh_find();
     }
 
     /// Rebuild from `state.all`, rendering the newest `state.window`.
@@ -1231,7 +1383,7 @@ impl ThreadView {
             // With batches still to come, they reveal it when done.
             if split == 0 {
                 super::perf::built();
-                self.reveal_at_bottom();
+                self.finish_open();
             }
         } else if self.scroll.opacity() == 0.0 && !self.state.borrow().revealing {
             // A rebuild cut short a fresh open's batches: show it now.
@@ -1241,6 +1393,7 @@ impl ThreadView {
             let adj = self.scroll.vadjustment();
             glib::idle_add_local_once(move || adj.set_value(adj.upper() - adj.page_size()));
         }
+        self.mark_highlight();
     }
 
     /// Add `shown[..upto]` above what is built, newest first, a batch per
@@ -1295,7 +1448,7 @@ impl ThreadView {
             }
             if reveal_when_done {
                 super::perf::built();
-                this.reveal_at_bottom();
+                this.finish_open();
             }
             // Let the last batch be laid out before letting go of the anchor.
             let weak = Rc::downgrade(&this);
@@ -1347,6 +1500,7 @@ impl ThreadView {
             let adj = self.scroll.vadjustment();
             glib::idle_add_local_once(move || adj.set_value(adj.upper() - adj.page_size()));
         }
+        self.mark_highlight();
     }
 
     fn show_earlier(self: &Rc<Self>) {
@@ -1389,6 +1543,209 @@ impl ThreadView {
             }
             glib::ControlFlow::Break
         });
+    }
+
+    /// A fresh build is done: show the match being revealed, else the bottom.
+    fn finish_open(self: &Rc<Self>) {
+        let reveal = self.state.borrow_mut().reveal.take();
+        match reveal {
+            Some(uid) => self.reveal_match(uid),
+            None => self.reveal_at_bottom(),
+        }
+    }
+
+    /// As [`Self::reveal_at_bottom`], but centred on message `uid`.
+    fn reveal_match(self: &Rc<Self>, uid: i64) {
+        self.scroll.set_opacity(0.0);
+        self.state.borrow_mut().revealing = true;
+        let frames = Cell::new(0);
+        let weak = Rc::downgrade(self);
+        self.scroll.add_tick_callback(move |widget, _| {
+            frames.set(frames.get() + 1);
+            if frames.get() < 2 {
+                return glib::ControlFlow::Continue; // the first tick is before layout
+            }
+            if let Some(this) = weak.upgrade() {
+                this.state.borrow_mut().revealing = false;
+                this.scroll_to(uid);
+            }
+            widget.set_opacity(1.0);
+            super::perf::revealed();
+            glib::ControlFlow::Break
+        });
+    }
+
+    /// Centre a built bubble and outline it.
+    fn scroll_to(&self, uid: i64) {
+        let widget = {
+            let mut st = self.state.borrow_mut();
+            st.anchor_from_bottom = None;
+            st.pinned = false;
+            st.highlighted = Some(uid);
+            st.bubbles.iter().find(|b| b.message.uid == uid).map(|b| b.widget.clone())
+        };
+        self.mark_highlight();
+        let Some(widget) = widget else { return };
+        #[allow(deprecated)] // compute_point is GTK 4.12; the app supports 4.10
+        let Some((_, y)) = widget.translate_coordinates(&self.messages_box, 0.0, 0.0) else { return };
+        let adj = self.scroll.vadjustment();
+        let h = f64::from(widget.height());
+        let top = (adj.upper() - adj.page_size()).max(adj.lower());
+        adj.set_value((y - (adj.page_size() - h) / 2.0).clamp(adj.lower(), top));
+    }
+
+    /// Outline the highlighted match (bubbles are rebuilt often).
+    fn mark_highlight(&self) {
+        let st = self.state.borrow();
+        let needle = (!st.find_needle.is_empty()).then_some(st.find_needle.as_str());
+        for b in &st.bubbles {
+            if needle.is_some() && st.highlighted == Some(b.message.uid) {
+                b.set_search_hit(needle); // again: the text may have changed
+            } else if b.widget.has_css_class("search-hit") {
+                b.set_search_hit(None);
+            }
+        }
+    }
+
+    /// The next chat to open came from a search match: open it on `uid`.
+    pub fn find_on_open(&self, thread_id: i64, needle: &str, uid: i64) {
+        self.state.borrow_mut().pending_find = Some((thread_id, needle.to_string(), uid));
+    }
+
+    /// Open the find bar on `needle`, at match `at` (else the newest), and
+    /// widen the window so the next build includes it.
+    fn start_find(&self, needle: &str, at: Option<i64>) {
+        {
+            let mut st = self.state.borrow_mut();
+            st.find_needle = needle.to_string();
+            st.find_matches = search::matching_uids(&st.all, needle);
+            st.find_current = at
+                .and_then(|u| st.find_matches.iter().position(|m| *m == u))
+                .unwrap_or(st.find_matches.len().saturating_sub(1));
+            if let Some(&uid) = st.find_matches.get(st.find_current) {
+                if let Some(idx) = st.all.iter().position(|m| m.uid == uid) {
+                    st.window = st.window.max(st.all.len() - idx + REVEAL_CONTEXT);
+                }
+                st.reveal = Some(uid);
+                st.highlighted = Some(uid);
+            }
+        }
+        // The entry's own change signal comes later and finds nothing new.
+        self.find_entry.set_text(needle);
+        self.find_bar.set_search_mode(true);
+        self.update_find_label();
+    }
+
+    fn find_changed(self: &Rc<Self>, text: &str) {
+        {
+            let mut st = self.state.borrow_mut();
+            if st.find_needle == text {
+                return;
+            }
+            st.find_needle = text.to_string();
+            st.find_matches = search::matching_uids(&st.all, text);
+            st.find_current = st.find_matches.len().saturating_sub(1);
+        }
+        self.show_find_current();
+    }
+
+    /// -1 = an earlier match, 1 = a later one. Stops at the ends.
+    fn find_step(self: &Rc<Self>, step: isize) {
+        {
+            let mut st = self.state.borrow_mut();
+            let n = st.find_matches.len();
+            if n == 0 {
+                return;
+            }
+            let next = st.find_current.saturating_add_signed(step).min(n - 1);
+            if next == st.find_current {
+                return;
+            }
+            st.find_current = next;
+        }
+        self.show_find_current();
+    }
+
+    fn show_find_current(self: &Rc<Self>) {
+        self.update_find_label();
+        let uid = {
+            let st = self.state.borrow();
+            st.find_matches.get(st.find_current).copied()
+        };
+        match uid {
+            Some(uid) => self.reveal(uid),
+            None => {
+                self.state.borrow_mut().highlighted = None;
+                self.mark_highlight();
+            }
+        }
+    }
+
+    /// Bring message `uid` on screen: scroll if it is built, else widen the
+    /// window and rebuild around it.
+    fn reveal(self: &Rc<Self>, uid: i64) {
+        let (built, building, idx) = {
+            let st = self.state.borrow();
+            (
+                st.bubbles.iter().any(|b| b.message.uid == uid),
+                st.rendered.contains(&uid),
+                st.all.iter().position(|m| m.uid == uid),
+            )
+        };
+        if built {
+            self.scroll_to(uid);
+            return;
+        }
+        let mut st = self.state.borrow_mut();
+        st.reveal = Some(uid);
+        st.highlighted = Some(uid);
+        if building {
+            return; // the batches still being built reveal it when done
+        }
+        let Some(idx) = idx else { return };
+        st.window = st.window.max(st.all.len() - idx + REVEAL_CONTEXT);
+        drop(st);
+        self.set_messages(false);
+    }
+
+    /// New or removed messages: recount the matches, keeping the current one.
+    fn refresh_find(&self) {
+        {
+            let mut st = self.state.borrow_mut();
+            if st.find_needle.is_empty() {
+                return;
+            }
+            let current = st.find_matches.get(st.find_current).copied();
+            st.find_matches = search::matching_uids(&st.all, &st.find_needle);
+            st.find_current = current
+                .and_then(|u| st.find_matches.iter().position(|m| *m == u))
+                .unwrap_or(st.find_matches.len().saturating_sub(1));
+        }
+        self.update_find_label();
+    }
+
+    fn update_find_label(&self) {
+        let st = self.state.borrow();
+        let text = match st.find_matches.len() {
+            _ if st.find_needle.trim().is_empty() => String::new(),
+            0 => "No matches".into(),
+            n => format!("{} of {n}", st.find_current + 1),
+        };
+        self.find_label.set_label(&text);
+    }
+
+    /// The find bar closed.
+    fn end_find(&self) {
+        {
+            let mut st = self.state.borrow_mut();
+            st.find_needle.clear();
+            st.find_matches.clear();
+            st.highlighted = None;
+            st.reveal = None;
+        }
+        self.mark_highlight();
+        self.find_entry.set_text("");
+        self.update_find_label();
     }
 
     fn append_message(self: &Rc<Self>, m: &SmsMessage, route: Option<SendRoute>) {

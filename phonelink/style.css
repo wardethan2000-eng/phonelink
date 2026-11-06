@@ -194,3 +194,10 @@ levelbar trough block {
 .avatar-hue-7 { background-color: #db2777; }
 .avatar-hue-8 { background-color: #9333ea; }
 .avatar-hue-9 { background-color: #0891b2; }
+
+/* A search match in an open chat (Rust app: find bar). */
+.search-hit .message-bubble-sent,
+.search-hit .message-bubble-received {
+    outline: 2px solid @warning_color;
+    outline-offset: 1px;
+}

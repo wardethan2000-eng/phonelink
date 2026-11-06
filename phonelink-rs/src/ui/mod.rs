@@ -118,11 +118,13 @@ fn load_css() {
 /// (2026-11-06, Plasma, Intel) it idled at 132 MB against 167 MB for the
 /// default Vulkan renderer (which loads Mesa and its LLVM), with the same
 /// freezes and no visible difference. `GSK_RENDERER=vulkan` (or `ngl`)
-/// still overrides it.
+/// still overrides it. Not under Broadway (the UI demo), which draws only
+/// with its own renderer: forcing cairo there gave a blank window.
 const DEFAULT_RENDERER: &str = "cairo";
 
 pub fn run() -> glib::ExitCode {
-    if std::env::var_os("GSK_RENDERER").is_none() {
+    let broadway = std::env::var("GDK_BACKEND").is_ok_and(|b| b.contains("broadway"));
+    if std::env::var_os("GSK_RENDERER").is_none() && !broadway {
         // SAFETY: called first thing on the main thread, before GTK or any
         // other thread starts, so nothing else reads the environment yet.
         unsafe { std::env::set_var("GSK_RENDERER", DEFAULT_RENDERER) };

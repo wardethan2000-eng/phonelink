@@ -114,6 +114,9 @@ pub struct MessagesPage {
     toasts: RefCell<Option<adw::ToastOverlay>>,
     /// Google Contacts (import choice, rename write-back), once the window sets it.
     google: RefCell<Option<Rc<GoogleSync>>>,
+    /// Folded message text for searching (kept outside `inner`: the list
+    /// asks for hits while `inner` is borrowed).
+    search: RefCell<crate::core::search::SearchIndex>,
     inner: RefCell<Inner>,
 }
 
@@ -170,6 +173,7 @@ impl MessagesPage {
             notifications: notifications.clone(),
             toasts: RefCell::default(),
             google: RefCell::default(),
+            search: RefCell::default(),
             inner: RefCell::new(Inner {
                 m: Messages::new(),
                 store,
@@ -225,6 +229,10 @@ impl MessagesPage {
         let weak = Rc::downgrade(&this);
         this.list.connect_selected(move |tid| {
             if let Some(this) = weak.upgrade() {
+                // Opened from a message match: land on that message.
+                if let Some((needle, uid)) = this.list.reveal_for(tid) {
+                    this.thread.find_on_open(tid, &needle, uid);
+                }
                 let effects = {
                     let mut guard = this.inner.borrow_mut();
                     let i = &mut *guard;
@@ -512,6 +520,11 @@ impl MessagesPage {
                 let _t = super::perf::span("refreshing the conversation list");
                 self.list.set_conversations(&i.m.visible(&*i.settings.borrow()))
             };
+            // Matches follow new and removed messages.
+            let needle = self.list.search_text();
+            if !needle.trim().is_empty() {
+                self.search(&needle);
+            }
             if more {
                 // The rest of the rows, a batch per idle callback.
                 let weak = Rc::downgrade(self);
@@ -567,7 +580,22 @@ impl MessagesPage {
             ListEvent::Delete { thread_id } => self.delete_dialog(vec![thread_id]),
             ListEvent::DeleteMany { thread_ids } => self.delete_dialog(thread_ids),
             ListEvent::ImportContacts => self.import_dialog(),
+            ListEvent::Search(needle) => self.search(&needle),
         }
+    }
+
+    /// Message-text matches for the list's search.
+    fn search(&self, needle: &str) {
+        if needle.trim().is_empty() {
+            return;
+        }
+        let hits = {
+            let i = self.inner.borrow();
+            let _t = super::perf::span("searching messages");
+            let visible = i.m.visible(&*i.settings.borrow());
+            self.search.borrow_mut().search(visible, needle)
+        };
+        self.list.set_hits(needle, hits);
     }
 
     fn parent_window(&self) -> Option<gtk::Window> {

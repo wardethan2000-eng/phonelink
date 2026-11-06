@@ -310,7 +310,8 @@ fn thread_messages(index: usize) -> Vec<Variant> {
             let (burst, within) = ((long_thread_len() - k) as i64 / 5, (k % 5) as i64);
             let date = base - burst * 5 * 60 * 60_000 - 10 * 60_000 + within * 2 * 60_000;
             let uid = 5000 + k as i32;
-            let body = chatter[k % chatter.len()];
+            // One old text to find with search (item A in NEXT_FEATURES.md).
+            let body = if k == 20 { "Don't forget the birthday party at the lake house on Saturday" } else { chatter[k % chatter.len()] };
             // A photo every 60 texts (and one near the end).
             let atts = if k == long_thread_len() - 3 || k % 60 == 57 {
                 vec![(uid as i64, "image/png".to_string(), thumbnail_png(), format!("PART_{uid}.png"))]

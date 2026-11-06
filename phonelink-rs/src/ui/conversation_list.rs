@@ -15,6 +15,7 @@ use gtk::prelude::*;
 
 use crate::core::contacts::contact_photo_path;
 use crate::core::models::Conversation;
+use crate::core::search::{self, Hit};
 
 /// Number of avatar tint classes in style.css (`.avatar-hue-0` …).
 const AVATAR_HUE_COUNT: u32 = 10;
@@ -99,6 +100,8 @@ fn display_text(c: &Conversation) -> String {
 struct Summary {
     name: String,
     address: String,
+    /// Every member's number, for number-like searches.
+    addresses: Vec<String>,
     time: String,
     preview: String,
     last_message: String,
@@ -112,6 +115,7 @@ impl Summary {
         Self {
             name: display_text(c),
             address: c.address.clone(),
+            addresses: c.addresses.clone(),
             time: c.time_label(),
             preview: c.preview(),
             last_message: c.last_message.clone(),
@@ -120,12 +124,25 @@ impl Summary {
         }
     }
 
+    /// Matches by name or number (message text is [`Hit`]s).
     fn matches(&self, needle: &str) -> bool {
-        needle.is_empty()
-            || self.name.to_lowercase().contains(needle)
-            || self.address.to_lowercase().contains(needle)
-            || self.last_message.to_lowercase().contains(needle)
+        let Some(q) = search::fold_query(needle) else { return true };
+        search::fold_query(&self.name).is_some_and(|n| n.contains(&q))
+            || self.address.to_lowercase().contains(&q)
+            || search::number_matches(&self.addresses, needle)
     }
+}
+
+/// Whether a row shows while searching for `needle`, and the message hit it
+/// shows instead of its preview (only when the name or number didn't match).
+fn search_view<'a>(summary: &Summary, needle: &str, hit: Option<&'a Hit>) -> (bool, Option<&'a Hit>) {
+    if needle.trim().is_empty() {
+        return (true, None);
+    }
+    if summary.matches(needle) {
+        return (true, None);
+    }
+    (hit.is_some(), hit)
 }
 
 struct Row {
@@ -135,6 +152,8 @@ struct Row {
     preview: gtk::Label,
     dot: gtk::Label,
     summary: Summary,
+    /// The message hit shown as the preview: (uid, snippet, count).
+    showing_hit: Option<(i64, String, usize)>,
 }
 
 impl Row {
@@ -184,14 +203,41 @@ impl Row {
         dot.set_valign(gtk::Align::Center);
         hbox.append(&dot);
 
-        let r = Self { row, name, time, preview, dot, summary };
+        let r = Self { row, name, time, preview, dot, summary, showing_hit: None };
         r.show(&r.summary.clone());
         r
+    }
+
+    /// Show or hide the row for a search, with the matching text in place of
+    /// the preview when the match is in a message.
+    fn apply_search(&mut self, needle: &str, hit: Option<&Hit>) {
+        let (visible, hit) = search_view(&self.summary, needle, hit);
+        self.row.set_visible(visible);
+        let wanted = hit.map(|h| (h.uid, h.snippet.clone(), h.count));
+        if wanted == self.showing_hit {
+            return;
+        }
+        match hit {
+            Some(h) => {
+                let mut markup = search::bold_markup(&h.snippet, &h.ranges);
+                if h.count > 1 {
+                    markup = format!("{} matches · {markup}", h.count);
+                }
+                self.preview.set_use_markup(true);
+                self.preview.set_markup(&markup);
+            }
+            None => {
+                self.preview.set_use_markup(false);
+                self.preview.set_label(&self.summary.preview);
+            }
+        }
+        self.showing_hit = wanted;
     }
 
     fn show(&self, s: &Summary) {
         self.name.set_label(&s.name);
         self.time.set_label(&s.time);
+        self.preview.set_use_markup(false);
         self.preview.set_label(&s.preview);
         if s.is_read {
             self.name.remove_css_class("conversation-name-unread");
@@ -209,6 +255,8 @@ struct State {
     /// Thread ids in list order (index = row position).
     order: Vec<i64>,
     search: String,
+    /// Message-text matches for `search`, by thread (from the page).
+    hits: HashMap<i64, Hit>,
     /// For contact suggestions while searching.
     contacts: HashMap<String, String>,
     conversation_phones: Vec<String>,
@@ -234,6 +282,8 @@ pub enum ListEvent {
     /// Several chats selected with Shift/Ctrl+click.
     DeleteMany { thread_ids: Vec<i64> },
     ImportContacts,
+    /// The search text changed; the page answers with [`ConversationList::set_hits`].
+    Search(String),
 }
 
 type EventHandler = Rc<dyn Fn(ListEvent)>;
@@ -428,7 +478,7 @@ impl ConversationList {
             let Some(this) = weak.upgrade() else { return };
             let (name, address) = {
                 let st = this.state.borrow();
-                let s = crate::core::contacts::contact_suggestions(&st.search, &st.contacts, &st.conversation_phones);
+                let s = crate::core::contacts::contact_suggestions(&st.search.to_lowercase(), &st.contacts, &st.conversation_phones);
                 match usize::try_from(row.index()).ok().and_then(|i| s.get(i).cloned()) {
                     Some(x) => x,
                     None => return,
@@ -484,7 +534,9 @@ impl ConversationList {
         let weak = Rc::downgrade(&this);
         search.connect_search_changed(move |entry| {
             if let Some(this) = weak.upgrade() {
-                this.set_search(&entry.text().to_lowercase());
+                let text = entry.text().to_string();
+                this.set_search(&text);
+                this.emit(ListEvent::Search(text));
             }
         });
         this
@@ -614,7 +666,7 @@ impl ConversationList {
         }
         let suggestions = {
             let st = self.state.borrow();
-            crate::core::contacts::contact_suggestions(&st.search, &st.contacts, &st.conversation_phones)
+            crate::core::contacts::contact_suggestions(&st.search.to_lowercase(), &st.contacts, &st.conversation_phones)
         };
         self.contacts_header.set_visible(!suggestions.is_empty());
         for (name, phone) in suggestions {
@@ -650,13 +702,43 @@ impl ConversationList {
             self.listbox.set_placeholder(None::<&gtk::Widget>);
         }
         {
-            let mut st = self.state.borrow_mut();
+            let mut guard = self.state.borrow_mut();
+            let st = &mut *guard;
             st.search = needle.to_string();
-            for row in st.rows.values() {
-                row.row.set_visible(row.summary.matches(needle));
+            // The old hits are for other text; the page sends new ones.
+            st.hits.clear();
+            for row in st.rows.values_mut() {
+                row.apply_search(needle, None);
             }
         }
         self.update_suggestions();
+    }
+
+    /// The text being searched for ("" when not searching).
+    pub fn search_text(&self) -> String {
+        self.state.borrow().search.clone()
+    }
+
+    /// Message-text matches for `needle`; ignored if the search has moved on.
+    pub fn set_hits(&self, needle: &str, hits: HashMap<i64, Hit>) {
+        let mut guard = self.state.borrow_mut();
+        let st = &mut *guard;
+        if st.search != needle {
+            return;
+        }
+        st.hits = hits;
+        for (tid, row) in st.rows.iter_mut() {
+            row.apply_search(needle, st.hits.get(tid));
+        }
+    }
+
+    /// For a chat opened from a message match: the search text and the
+    /// message to show.
+    pub fn reveal_for(&self, thread_id: i64) -> Option<(String, i64)> {
+        let st = self.state.borrow();
+        let row = st.rows.get(&thread_id)?;
+        let (uid, _, _) = row.showing_hit.as_ref()?;
+        Some((st.search.clone(), *uid))
     }
 
     /// Show `conversations` (any order; sorted newest first here), updating
@@ -718,6 +800,7 @@ impl ConversationList {
                     if row.summary != summary {
                         row.show(&summary);
                         row.summary = summary;
+                        row.showing_hit = None;
                     }
                 }
                 None => {
@@ -734,8 +817,10 @@ impl ConversationList {
                 self.listbox.insert(&widget, pos as i32);
                 st.order.insert(pos, tid);
             }
-            let row = &st.rows[&tid];
-            row.row.set_visible(row.summary.matches(&st.search));
+            let hit = st.hits.get(&tid);
+            if let Some(row) = st.rows.get_mut(&tid) {
+                row.apply_search(&st.search, hit);
+            }
             pos += 1;
         }
 

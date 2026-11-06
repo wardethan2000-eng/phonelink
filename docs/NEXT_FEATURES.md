@@ -84,6 +84,13 @@ message and highlights it.
   result whose match is about 200 messages back, to check that the reveal
   and the highlight land on it.
 
+**Status 2026-11-06:** built (`core/search.rs`, list, thread find bar).
+Checked on the mock daemon in Broadway with a 2,226-message chat: a match
+about 2,200 messages back opens centred and outlined; 278 matches step with
+Enter and Shift+Enter; every search took under 10 ms in a debug build. The
+list snippet puts only about 12 characters before the match, because the row
+shows about 30 and cuts the end. Waiting on the laptop run.
+
 **Done when:** on the laptop, a word from an old text finds its chat,
 opening it lands on that text, and the perf log shows the search under
 30 ms.
