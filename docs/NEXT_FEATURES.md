@@ -14,8 +14,8 @@ laptop. That check changed three of them:
 | E | Phone media controls | **Small value on Plasma or GNOME.** Phone players already show in the desktop's media widget |
 | F | Take a photo with the phone | **Dropped.** KDE Connect 26.08 has no photo plugin on the desktop side |
 
-Suggested order: A, then C, then B. D and E wait for Ethan to decide whether
-they're still worth doing (see "Decisions needed" at the end).
+Order (Ethan, 2026-11-06): A, then C, then D, then B. E is skipped. See
+"Decisions" at the end.
 
 All work goes on `rust-port`. All checks run on the build box through
 `scripts/remote-build.sh`. Every item adds tests in `core/` and ends with a run on
@@ -183,8 +183,7 @@ phone. Incoming RCS shows up within a few seconds without KDE Connect.
    - a short INSTALL.txt
 
    Checksum it, then create the release with `gh release create` and these
-   notes. Version: `v0.2.0` (the Cargo version is 0.1.0; the Python app never
-   tagged a release). See "Decisions needed".
+   notes. Version: `v0.2.0` (Ethan, 2026-11-06); bump `Cargo.toml` to match.
 3. **Rust CI on GitHub.** Add a `cargo test` + `clippy` job to `ci.yml` on
    `ubuntu-24.04`. The repo is public, so Actions minutes are free. The
    Python job stays until the Python app is removed. If the runner hangs on
@@ -228,7 +227,7 @@ app** is calls in the conversation timeline:
   running. KDE Connect can't read the phone's call log, so past calls can't
   be filled in.
 
-Effort: small to medium. **Ethan to decide whether this is worth it.**
+Effort: small to medium. **Ethan: yes (2026-11-06).**
 
 ---
 
@@ -258,7 +257,7 @@ The D-Bus surface (26.08.3, `/modules/kdeconnect/devices/<id>/mprisremote`,
   the properties when it fires
 
 Effort: small. Its value is mainly for desktops without an MPRIS widget, so
-it's low on Plasma, which Ethan uses. **Ethan to decide; suggest skipping.**
+it's low on Plasma, which Ethan uses. **Skipped (Ethan, 2026-11-06).**
 
 ---
 
@@ -272,9 +271,9 @@ separate project.
 
 ---
 
-## Decisions needed (Ethan)
-1. **D, calls in the chat:** do it in the reduced form, or skip?
-2. **E, media strip:** skip (suggested), or build it anyway?
-3. **Release version:** `v0.2.0` (suggested) or `v1.0.0`?
-4. **Order:** A → C → B (suggested). A is quick and you'd notice it every
-   day, C clears the public promises, and B is the long one.
+## Decisions (Ethan, 2026-11-06)
+1. **D, calls in the chat:** yes, in the reduced form above. Done after C,
+   before B.
+2. **E, media strip:** skipped.
+3. **Release version:** `v0.2.0`.
+4. **Order:** A → C → D → B.
