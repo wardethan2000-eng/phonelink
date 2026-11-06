@@ -756,7 +756,25 @@ impl FilesPage {
             self.photo_grid.append(&tile.child);
             self.state.borrow_mut().tiles.push(tile);
         }
-        self.load_thumbnails(generation, found);
+        // Decode only once the tab is on screen: 18 thumbnails held ~7 MB
+        // from startup even when Files was never opened (heaptrack,
+        // 2026-11-06).
+        if self.widget.is_mapped() {
+            self.load_thumbnails(generation, found);
+            return;
+        }
+        let weak = Rc::downgrade(self);
+        let handler: Rc<RefCell<Option<glib::SignalHandlerId>>> = Rc::default();
+        let h = handler.clone();
+        let id = self.widget.connect_map(move |w| {
+            if let Some(id) = h.borrow_mut().take() {
+                w.disconnect(id);
+            }
+            if let Some(this) = weak.upgrade() {
+                this.load_thumbnails(generation, found.clone());
+            }
+        });
+        *handler.borrow_mut() = Some(id);
     }
 
     fn make_tile(self: &Rc<Self>, path: &Path) -> Tile {

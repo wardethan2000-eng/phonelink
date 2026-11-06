@@ -37,6 +37,9 @@ echo "store: $(sqlite3 "$H/.local/share/phonelink/messages.db" 'select count(*) 
 # 2. Idle with the full store loaded, as on the laptop.
 run_app rust-idle 45 target/release/phonelink-rs
 run_app python-idle 45 python3 run.py
+if [ "${ARENA_TEST:-0}" = 1 ]; then
+    run_app rust-idle-arena2 45 env MALLOC_ARENA_MAX=2 target/release/phonelink-rs
+fi
 if [ "${HEAPTRACK:-0}" = 1 ]; then
     HOME=$H GDK_BACKEND=broadway BROADWAY_DISPLAY=:7 timeout -s INT 45 heaptrack -o "$HOME/memtest-heaptrack" target/release/phonelink-rs >/dev/null 2>&1
     f=$(ls -t "$HOME"/memtest-heaptrack*.zst | head -1)
