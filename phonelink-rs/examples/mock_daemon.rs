@@ -102,6 +102,48 @@ const SHARE_XML: &str = r#"<node><interface name="org.kde.kdeconnect.device.shar
   <signal name="shareReceived"><arg type="s"/></signal>
 </interface></node>"#;
 
+const SFTP_XML: &str = r#"<node><interface name="org.kde.kdeconnect.device.sftp">
+  <method name="isMounted"><arg type="b" direction="out"/></method>
+  <method name="mountAndWait"><arg type="b" direction="out"/></method>
+  <method name="startBrowsing"><arg type="b" direction="out"/></method>
+  <method name="mountPoint"><arg type="s" direction="out"/></method>
+  <method name="getMountError"><arg type="s" direction="out"/></method>
+  <method name="getDirectories"><arg type="a{sv}" direction="out"/></method>
+  <signal name="mounted"/>
+  <signal name="unmounted"/>
+</interface></node>"#;
+
+/// A local folder standing in for the phone's sftp mount: camera pictures,
+/// screenshots and a few other files, with spread-out times.
+fn fake_phone_storage() -> std::path::PathBuf {
+    let root = phonelink_rs::core::settings::home_dir().join("demo-sftp");
+    let base = root.join("storage/emulated/0");
+    let colors: [u32; 6] = [0x35_84_e4_ff, 0xe6_61_00_ff, 0x26_a2_69_ff, 0x91_41_ac_ff, 0xc0_1c_28_ff, 0xe5_a5_0a_ff];
+    for (i, dir) in ["DCIM/Camera", "DCIM/Camera", "DCIM/Camera", "DCIM/Screenshots", "Pictures", "Download"]
+        .iter()
+        .cycle()
+        .take(18)
+        .enumerate()
+    {
+        let d = base.join(dir);
+        std::fs::create_dir_all(&d).unwrap();
+        let file = d.join(format!("IMG_2026110{}_{:04}.jpg", 1 + i % 5, 1000 + i));
+        let pb = gtk::gdk_pixbuf::Pixbuf::new(gtk::gdk_pixbuf::Colorspace::Rgb, false, 8, 800, 600).unwrap();
+        pb.fill(colors[i % colors.len()]);
+        pb.new_subpixbuf(0, 380, 800, 220).fill(0xf6_f5_f4_ff);
+        pb.new_subpixbuf(80 + (i as i32 * 30) % 500, 200, 160, 160).fill(0x24_1f_31_ff);
+        pb.savev(&file, "jpeg", &[("quality", "80")]).unwrap();
+        let t = SystemTime::now() - std::time::Duration::from_secs(3600 * i as u64);
+        std::fs::File::options().write(true).open(&file).unwrap().set_modified(t).unwrap();
+    }
+    for (name, bytes) in [("Download/boarding-pass.pdf", 48_000usize), ("Download/notes.txt", 900), ("Music/song.mp3", 3_400_000)] {
+        let f = base.join(name);
+        std::fs::create_dir_all(f.parent().unwrap()).unwrap();
+        std::fs::write(&f, vec![0u8; bytes]).unwrap();
+    }
+    root
+}
+
 /// A second paired device, offline, so the header shows the switcher.
 const TABLET: &str = "demotablet2";
 
@@ -409,6 +451,35 @@ fn main() {
                 .build()
                 .unwrap();
         }
+
+        let mount = fake_phone_storage().to_string_lossy().into_owned();
+        let mounted = std::rc::Rc::new(std::cell::Cell::new(false));
+        let sftp = gio::DBusNodeInfo::for_xml(SFTP_XML).unwrap();
+        conn.register_object(&format!("{path}/sftp"), &sftp.lookup_interface(IFACE_SFTP).unwrap())
+            .method_call(move |conn, _, path, iface, method, _, inv| match method {
+                "isMounted" => inv.return_value(Some(&(mounted.get(),).to_variant())),
+                "mountAndWait" | "startBrowsing" => {
+                    eprintln!("demo: {method}");
+                    mounted.set(true);
+                    // Like the phone: the mount takes a moment.
+                    let (conn, path, iface) = (conn.clone(), path.to_string(), iface.unwrap().to_string());
+                    glib::timeout_add_local_once(std::time::Duration::from_millis(1500), move || {
+                        conn.emit_signal(None, &path, &iface, "mounted", None).unwrap();
+                        inv.return_value(Some(&(true,).to_variant()));
+                    });
+                }
+                "mountPoint" => inv.return_value(Some(&(mount.as_str(),).to_variant())),
+                "getMountError" => inv.return_value(Some(&("",).to_variant())),
+                "getDirectories" => {
+                    let dirs = glib::VariantDict::new(None);
+                    dirs.insert_value(&format!("{mount}/storage/emulated/0"), &"All files".to_variant());
+                    dirs.insert_value(&format!("{mount}/storage/emulated/0/DCIM/Camera"), &"Camera pictures".to_variant());
+                    inv.return_value(Some(&glib::Variant::tuple_from_iter([dirs.end()])));
+                }
+                _ => inv.return_value(None),
+            })
+            .build()
+            .unwrap();
 
         let tablet = device_path(TABLET);
         conn.register_object(&tablet, &dev.lookup_interface(IFACE_DEVICE).unwrap())

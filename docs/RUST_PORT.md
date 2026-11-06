@@ -226,6 +226,27 @@ Branch `rust-phase4` (worktree), merged into `rust-port` when done.
 - Not here: close-to-tray (Phase 6; close quits for now), the Files tab's
   pull on reconnect/resume/show (Phase 5).
 
+## Phase 5 status (Files tab)
+- [x] `core/files.rs` (tested): Locations order (`_directory_sort_key`),
+  storage base, the recent-photo scan (5 folders + one level of subfolders,
+  200 newest, dotfiles skipped), listings (folders first), sizes, icons,
+  "Phone /…" path label, Go up limits, `_N` save names (first error stops
+  the batch), `text/uri-list`, the 30 s refresh limit, and "an empty rescan
+  over a live grid is ignored".
+- [x] `ui/files_page.rs`: status / mounting / content; auto-mount with the
+  `startBrowsing` fallback (10 polls, 0.5 s) and "Mount failed: …"; Recent
+  Photos grid with 160 px tiles decoded off the main thread one at a time
+  (stale scans dropped by a generation number), click selects, double click
+  opens, right click Open / Copy / Save As…; select all, save to folder,
+  copy (Ctrl+C too); Browse with Go up, Refresh and right-click; Send File
+  to Phone (one or many); "Received: name" from the window's `shareReceived`.
+- [x] Pulls on reconnect, resume and window show (`refresh_from_phone`).
+- Changes from Python: the "Click Mount Phone in the sidebar" text is gone
+  (no such button). Thumbnails are a centered square crop, upright (EXIF),
+  drawn at exactly 160 px. `mounted` / `unmounted` are subscribed on the
+  `/sftp` object; Python subscribed on the device object, so they never
+  reached it.
+
 ## Reported GitHub issues (as of 2026-11-05)
 | # | Issue | Plan |
 |---|---|---|

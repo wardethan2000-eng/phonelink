@@ -1,7 +1,7 @@
 //! Main window: header (device switcher, tabs, battery, Find Phone,
 //! notifications, settings), the tabs, the notifications sidebar and the
-//! window-wide toasts. Port of `phonelink/ui/main_window.py`; the Files tab
-//! and the settings panel come in Phases 5 and 6.
+//! window-wide toasts. Port of `phonelink/ui/main_window.py`; the settings
+//! panel comes in Phase 6.
 
 use std::cell::{Cell, RefCell};
 use std::rc::Rc;
@@ -9,6 +9,7 @@ use std::rc::Rc;
 use adw::prelude::*;
 
 use super::clipboard_page::ClipboardPage;
+use super::files_page::FilesPage;
 use super::icons;
 use super::messages_page::MessagesPage;
 use super::notifications_model::NotificationsModel;
@@ -73,6 +74,7 @@ pub struct Window {
     toasts: adw::ToastOverlay,
     notif_toggle: gtk::ToggleButton,
     messages: Rc<MessagesPage>,
+    files: Rc<FilesPage>,
     clipboard: Rc<ClipboardPage>,
     notif_panel: Rc<NotificationsPanel>,
     notifications: Rc<NotificationsModel>,
@@ -200,6 +202,9 @@ impl Window {
         messages.use_toasts(&toasts);
         let page = stack.add_titled(&messages.widget, Some("sms"), "Messages");
         page.set_icon_name(Some("mail-unread-symbolic"));
+        let files = FilesPage::new();
+        let page = stack.add_titled(&files.widget, Some("files"), "Files");
+        page.set_icon_name(Some("folder-symbolic"));
         let clipboard = ClipboardPage::new(toast.clone());
         let page = stack.add_titled(&clipboard.widget, Some("clipboard"), "Clipboard");
         page.set_icon_name(Some("edit-paste-symbolic"));
@@ -249,6 +254,7 @@ impl Window {
             toasts,
             notif_toggle,
             messages,
+            files,
             clipboard,
             notif_panel,
             notifications,
@@ -457,6 +463,7 @@ impl Window {
         self.messages.set_device(client, dev.as_ref());
         self.notifications.set_device(client, dev.as_ref(), became_reachable);
         self.notif_panel.set_device(dev.as_ref());
+        self.files.set_device(client, dev.as_ref());
         self.clipboard.set_device(client, dev.as_ref());
     }
 
@@ -555,6 +562,7 @@ impl Window {
             let share = format!("{base}/share");
             subs.push(signals::subscribe(client.bus(), &share, IFACE_SHARE, "shareReceived", move |p| {
                 let (Some(this), Some((url,))) = (weak.upgrade(), p.get::<(String,)>()) else { return };
+                this.files.share_received(&url);
                 if !(url.starts_with("http://") || url.starts_with("https://")) {
                     return;
                 }
@@ -567,9 +575,10 @@ impl Window {
         *self.device_subs.borrow_mut() = subs;
     }
 
-    /// Catch up on texts the phone didn't push (Files joins in Phase 5).
+    /// Catch up on texts and photos the phone didn't push.
     fn pull_from_phone(&self, min_interval: f64) {
         self.messages.catch_up(min_interval);
+        self.files.refresh_from_phone();
     }
 
     fn ring(&self) {

@@ -4,6 +4,7 @@ pub mod compat;
 pub mod attachments;
 pub mod clipboard;
 pub mod contacts;
+pub mod files;
 pub mod hidden_texts;
 pub mod message;
 pub mod messages;

@@ -3,6 +3,7 @@
 
 pub mod clipboard_page;
 pub mod conversation_list;
+pub mod files_page;
 pub mod icons;
 pub mod messages_page;
 pub mod notifications_model;
@@ -58,6 +59,38 @@ pub fn clear_list_box(list: &gtk::ListBox) {
     while let Some(child) = list.first_child() {
         list.remove(&child);
     }
+}
+
+/// A menu entry: label and what it does.
+pub type MenuItem<'a> = (&'a str, std::rc::Rc<dyn Fn()>);
+
+/// A small right-click menu of plain buttons at (x, y) on `anchor`.
+pub fn popup_menu(anchor: &gtk::Widget, x: f64, y: f64, items: Vec<MenuItem>) {
+    let popover = gtk::Popover::new();
+    popover.set_has_arrow(false);
+    popover.set_parent(anchor);
+    popover.set_pointing_to(Some(&gtk::gdk::Rectangle::new(x as i32, y as i32, 1, 1)));
+    let menu = gtk::Box::new(gtk::Orientation::Vertical, 2);
+    for (label, action) in items {
+        let b = gtk::Button::with_label(label);
+        b.add_css_class("flat");
+        if let Some(l) = b.child().and_downcast::<gtk::Label>() {
+            l.set_xalign(0.0);
+        }
+        let pop = popover.clone();
+        b.connect_clicked(move |_| {
+            pop.popdown();
+            action();
+        });
+        menu.append(&b);
+    }
+    popover.set_child(Some(&menu));
+    // A popover must be unparented before its anchor goes away.
+    popover.connect_closed(|p| {
+        let p = p.clone();
+        glib::idle_add_local_once(move || p.unparent());
+    });
+    popover.popup();
 }
 
 const EXTRA_CSS: &str = "
