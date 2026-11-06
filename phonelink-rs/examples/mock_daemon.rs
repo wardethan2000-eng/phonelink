@@ -501,6 +501,50 @@ fn main() {
             .build()
             .unwrap();
 
+        // A stand-in StatusNotifierWatcher (the tray host): it reads the
+        // app's tray item and menu back and prints what it got.
+        const WATCHER_XML: &str = r#"<node><interface name="org.kde.StatusNotifierWatcher">
+  <method name="RegisterStatusNotifierItem"><arg type="s" direction="in"/></method>
+</interface></node>"#;
+        let watcher = gio::DBusNodeInfo::for_xml(WATCHER_XML).unwrap();
+        conn.register_object("/StatusNotifierWatcher", &watcher.lookup_interface("org.kde.StatusNotifierWatcher").unwrap())
+            .method_call(|conn, sender, _, _, _, params, inv| {
+                inv.return_value(None);
+                let service = params.child_value(0).get::<String>().unwrap_or_default();
+                eprintln!("demo: tray registered by {service} (sender {})", sender.unwrap_or(""));
+                let conn = conn.clone();
+                glib::spawn_future_local(async move {
+                    let props = conn
+                        .call_future(Some(&service), "/StatusNotifierItem", "org.freedesktop.DBus.Properties", "GetAll",
+                            Some(&("org.kde.StatusNotifierItem",).to_variant()), None, gio::DBusCallFlags::NONE, 3000)
+                        .await;
+                    match props {
+                        Ok(v) => {
+                            let m = glib::VariantDict::new(Some(&v.child_value(0)));
+                            let n = v.child_value(0).n_children();
+                            let icon = m.lookup_value("IconName", None).map(|v| v.print(false).to_string()).unwrap_or_default();
+                            let pix = m.lookup_value("IconPixmap", None).map(|v| v.n_children()).unwrap_or(0);
+                            eprintln!("demo: tray item has {n} properties, IconName {icon}, {pix} pixmaps");
+                        }
+                        Err(e) => eprintln!("demo: tray GetAll failed: {e}"),
+                    }
+                    let layout = conn
+                        .call_future(Some(&service), "/MenuBar", "com.canonical.dbusmenu", "GetLayout",
+                            Some(&(0i32, -1i32, Vec::<String>::new()).to_variant()), None, gio::DBusCallFlags::NONE, 3000)
+                        .await;
+                    match layout {
+                        Ok(v) => eprintln!("demo: tray menu {}", v.print(false)),
+                        Err(e) => eprintln!("demo: tray GetLayout failed: {e}"),
+                    }
+                });
+            })
+            .build()
+            .unwrap();
+        let _ = conn
+            .call_future(Some("org.freedesktop.DBus"), "/org/freedesktop/DBus", "org.freedesktop.DBus", "RequestName",
+                Some(&("org.kde.StatusNotifierWatcher", 4u32).to_variant()), None, gio::DBusCallFlags::NONE, 5000)
+            .await;
+
         let reply = conn
             .call_future(
                 Some("org.freedesktop.DBus"),

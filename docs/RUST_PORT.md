@@ -247,6 +247,36 @@ Branch `rust-phase4` (worktree), merged into `rust-port` when done.
   `/sftp` object; Python subscribed on the device object, so they never
   reached it.
 
+## Phase 6 status (tray, settings, autostart, Google Contacts)
+- [x] Tray (`ui/tray.rs`): StatusNotifierItem + DBusMenu over gio on the
+  app's connection, "Show Phone Link" / "Quit", click toggles the window.
+  It registers whenever a StatusNotifierWatcher is on the bus, also one that
+  appears later (a panel that starts after the app at login; Python only
+  tried once). The icon is sent as pixmaps too, so it shows before any icon
+  is installed. Checked against a stand-in watcher in the mock daemon.
+- [x] Close hides to the tray only while a tray host has the icon; without
+  one, close quits (Python stranded the window). A second launch, or the
+  tray, shows it again.
+- [x] Settings panel (`ui/settings_page.rs`): General, Google Contacts,
+  Appearance ("Color Scheme"), Notifications (on/off, hidden apps), Back.
+  Same `settings.json` keys. Notification changes re-filter the sidebar.
+- [ ] Autostart: "Open on Login" is shown but disabled until the Phase 7
+  switch-over (`settings_page::AUTOSTART_WIRED`), so a test run can't take
+  the autostart entry from the Python app.
+- [x] Google Contacts (`core/google.rs`, tested with a fake HTTP client and a
+  real loopback sign-in round trip): same client config (env or
+  `~/.config/phonelink/google_oauth.json`) and the same token file in
+  google-auth's format (refresh 3m45s early; a failed refresh disconnects),
+  browser sign-in on 127.0.0.1 with PKCE, People API import (names, photos
+  for chat numbers only, stale photos removed), rename write-back
+  (update by last-10-digit match, else create), daily background sync on
+  (re)connect, Connect / Refresh Now / Disconnect, the Python dialogs and
+  toasts. Messages: "Sync Contacts" offers Google / file, and the rename
+  dialog says it will update Google. **Not yet tried against Google itself**
+  (needs Ethan's sign-in on the laptop).
+- Text change: the "Sync Contacts" steps say "your phone", not "your Galaxy
+  S25" (the repo is public and the app is for any phone).
+
 ## Reported GitHub issues (as of 2026-11-05)
 | # | Issue | Plan |
 |---|---|---|

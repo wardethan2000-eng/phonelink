@@ -16,6 +16,7 @@ use adw::prelude::*;
 use glib::Variant;
 
 use super::conversation_list::{ConversationList, ListEvent};
+use super::google_sync::GoogleSync;
 use super::notifications_model::{NoteEvent, NotificationsModel, Props};
 use super::thread_view::{BubbleActions, ThreadView};
 use crate::core::attachments::full_cache_dir;
@@ -107,6 +108,8 @@ pub struct MessagesPage {
     notifications: Rc<NotificationsModel>,
     /// The window's toast overlay, once set; until then, the page's own.
     toasts: RefCell<Option<adw::ToastOverlay>>,
+    /// Google Contacts (import choice, rename write-back), once the window sets it.
+    google: RefCell<Option<Rc<GoogleSync>>>,
     inner: RefCell<Inner>,
 }
 
@@ -162,6 +165,7 @@ impl MessagesPage {
             thread,
             notifications: notifications.clone(),
             toasts: RefCell::default(),
+            google: RefCell::default(),
             inner: RefCell::new(Inner {
                 m: Messages::new(),
                 store,
@@ -547,7 +551,14 @@ impl MessagesPage {
         let dialog = adw::MessageDialog::new(
             self.parent_window().as_ref(),
             Some("Set Contact Name"),
-            Some(&format!("Enter a name for {address}:")),
+            Some(&format!(
+                "Enter a name for {address}:{}",
+                if self.google.borrow().as_ref().is_some_and(|g| g.is_connected()) {
+                    "\n\nThis will also update your connected Google Contacts account."
+                } else {
+                    ""
+                }
+            )),
         );
         dialog.add_responses(&[("cancel", "Cancel"), ("save", "Save")]);
         dialog.set_response_appearance("save", adw::ResponseAppearance::Suggested);
@@ -563,12 +574,17 @@ impl MessagesPage {
                 return;
             }
             let Some(this) = weak.upgrade() else { return };
+            let name = entry.text().trim().to_string();
             let effects = {
                 let mut guard = this.inner.borrow_mut();
                 let i = &mut *guard;
-                i.m.rename_contact(&address, &entry.text(), &i.store)
+                i.m.rename_contact(&address, &name, &i.store)
             };
-            // TODO(Phase 6): also update Google Contacts when connected, as Python.
+            if !name.is_empty()
+                && let Some(g) = this.google.borrow().as_ref()
+            {
+                g.push_rename(&address, &name);
+            }
             this.list.set_contacts(this.inner.borrow().m.contact_map.clone());
             this.run(effects);
         });
@@ -620,9 +636,74 @@ impl MessagesPage {
         });
     }
 
-    /// Import contacts from a VCF or Google Contacts CSV file.
-    /// TODO(Phase 6): the "Import Google Contacts" choice, as Python.
+    /// "Sync Contacts": Google Contacts, a share from the phone, or a file.
     fn import_dialog(self: &Rc<Self>) {
+        let dialog = adw::MessageDialog::new(
+            self.parent_window().as_ref(),
+            Some("Sync Contacts"),
+            Some(
+                "Choose how to load your full contact list:\n\n\
+                 Google Contacts:\nAuthorize in your browser and import directly into Phone Link.\n\n\
+                 Phone share:\n1. Open Contacts on your phone\n2. Tap ⋮ menu → Share\n3. Select all contacts\n\
+                 4. Share via KDE Connect to this PC\n\n\
+                 Manual file:\nImport a VCF or Google Contacts CSV if you already have one.",
+            ),
+        );
+        dialog.add_responses(&[("cancel", "Cancel"), ("google", "Import Google Contacts"), ("file", "Import File…")]);
+        dialog.set_response_appearance("google", adw::ResponseAppearance::Suggested);
+        dialog.set_response_appearance("file", adw::ResponseAppearance::Suggested);
+        let weak = Rc::downgrade(self);
+        dialog.connect_response(None, move |_, response| {
+            let Some(this) = weak.upgrade() else { return };
+            match response {
+                "google" => {
+                    if let Some(g) = this.google.borrow().clone() {
+                        g.sync_now();
+                    }
+                }
+                "file" => this.contact_file_dialog(),
+                _ => {}
+            }
+        });
+        dialog.present();
+    }
+
+    pub fn set_google(&self, google: Rc<GoogleSync>) {
+        *self.google.borrow_mut() = Some(google);
+    }
+
+    /// Every number in the current conversations (Google photos are fetched
+    /// for these only).
+    pub fn chat_numbers(&self) -> std::collections::HashSet<String> {
+        let i = self.inner.borrow();
+        i.m.index
+            .conversations
+            .values()
+            .flat_map(|c| std::iter::once(c.address.clone()).chain(c.addresses.iter().cloned()))
+            .filter(|a| !a.is_empty())
+            .collect()
+    }
+
+    /// Names learned elsewhere (Google): saved and shown. Returns how many
+    /// were new or changed.
+    pub fn learn_contacts(self: &Rc<Self>, found: std::collections::HashMap<String, String>) -> usize {
+        let found: std::collections::HashMap<String, String> = {
+            let i = self.inner.borrow();
+            found.into_iter().filter(|(k, v)| i.m.contact_map.get(k) != Some(v)).collect()
+        };
+        let changed = found.len();
+        let effects = {
+            let mut guard = self.inner.borrow_mut();
+            let i = &mut *guard;
+            i.m.learn_contacts(found, &i.store)
+        };
+        self.list.set_contacts(self.inner.borrow().m.contact_map.clone());
+        self.run(effects);
+        changed
+    }
+
+    /// Import contacts from a VCF or Google Contacts CSV file.
+    fn contact_file_dialog(self: &Rc<Self>) {
         let dialog = gtk::FileDialog::new();
         dialog.set_title("Import Contacts");
         let filter = gtk::FileFilter::new();
