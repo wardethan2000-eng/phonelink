@@ -637,6 +637,27 @@ impl Messages {
         changed
     }
 
+    /// Contact names learned elsewhere (a call, a shared or imported
+    /// contacts file): saved and applied. `found` is normalized number →
+    /// name.
+    pub fn learn_contacts(&mut self, found: HashMap<String, String>, store: &MessageStore) -> Vec<Effect> {
+        if found.is_empty() {
+            return Vec::new();
+        }
+        store.batch(|store| {
+            for (phone, name) in &found {
+                store.save_contact(phone, name);
+            }
+        });
+        self.contact_map.extend(found);
+        self.refresh_names();
+        let mut out = vec![Effect::RefreshList];
+        if let Some(active) = self.active {
+            out.push(Effect::ShowThread(active));
+        }
+        out
+    }
+
     /// Normalized numbers that already have a conversation (for contact
     /// suggestions).
     pub fn conversation_phones(&self) -> Vec<String> {

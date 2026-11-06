@@ -27,7 +27,10 @@ use crate::core::settings::Settings;
 use crate::core::store::MessageStore;
 use crate::core::sync::{self, Action, SIGNAL_BATCH_SIZE};
 use crate::dbus::signals::{self, Subscription};
-use crate::dbus::{Client, IFACE_CONVERSATIONS, IFACE_NOTIFICATIONS, device_path, variant};
+use crate::dbus::{
+    Client, IFACE_CONTACTS, IFACE_CONVERSATIONS, IFACE_NOTIFICATIONS, IFACE_SHARE, IFACE_TELEPHONY, device_path,
+    variant,
+};
 
 fn epoch_now() -> f64 {
     std::time::SystemTime::now().duration_since(std::time::UNIX_EPOCH).map_or(0.0, |d| d.as_secs_f64())
@@ -77,6 +80,12 @@ struct Inner {
     draining: bool,
     timer: Option<glib::SourceId>,
     hidden_check: Option<glib::SourceId>,
+    /// Debounced reload after conversationLoaded (as Python, 500 ms).
+    loaded_reload: Option<glib::SourceId>,
+    /// Reachability at the last set_device, to spot a reconnect.
+    reachable_seen: bool,
+    /// Devices already warned that KDE Connect synced no contacts.
+    contact_sync_warned: std::collections::HashSet<String>,
 }
 
 pub struct MessagesPage {
@@ -150,9 +159,21 @@ impl MessagesPage {
                 draining: false,
                 timer: None,
                 hidden_check: None,
+                loaded_reload: None,
+                reachable_seen: false,
+                contact_sync_warned: Default::default(),
             }),
         });
         *download_target.borrow_mut() = Rc::downgrade(&this);
+        let saved_scale = this.inner.borrow().settings.message_font_scale();
+        let weak = Rc::downgrade(&this);
+        this.thread.set_zoom(saved_scale, move |scale| {
+            if let Some(this) = weak.upgrade()
+                && let Err(e) = this.inner.borrow_mut().settings.set_message_font_scale(scale)
+            {
+                log::warn!("saving the text size failed: {e}");
+            }
+        });
         let weak = Rc::downgrade(&this);
         this.list.connect_event(move |e| {
             if let Some(this) = weak.upgrade() {
@@ -186,6 +207,7 @@ impl MessagesPage {
             i.m.device_id() == device.map(|d| d.id.as_str())
         };
         if same {
+            let was = std::mem::replace(&mut self.inner.borrow_mut().reachable_seen, reachable);
             self.inner.borrow_mut().m.set_reachable(reachable);
             if reachable {
                 self.inner.borrow_mut().m.catch_up.catch_up(
@@ -193,6 +215,13 @@ impl MessagesPage {
                     sync::CATCH_UP_DELAY_SECONDS,
                     sync::CATCH_UP_MIN_INTERVAL_SECONDS,
                 );
+                if !was {
+                    // Back after a disconnect: refresh as on first connect.
+                    self.reload_contacts();
+                    self.request_contact_sync();
+                    self.load_active();
+                    self.load_notifications();
+                }
             }
             self.reschedule();
             return;
@@ -217,6 +246,8 @@ impl MessagesPage {
             self.list.set_contacts(i.m.contact_map.clone());
             i.subs = self.subscribe(client, &dev.id);
             i.subs.extend(self.subscribe_notifications(client, &dev.id));
+            i.subs.extend(self.subscribe_contact_sources(client, &dev.id));
+            i.reachable_seen = reachable;
             let mut effects = i.m.load_cached(&i.store);
             effects.push(Effect::RefreshList);
             i.m.catch_up.catch_up(now(), sync::CATCH_UP_STARTUP_DELAY_SECONDS, 0.0);
@@ -228,9 +259,17 @@ impl MessagesPage {
 
         self.load_notifications();
 
-        // The daemon's cached newest-message-per-thread list.
-        let (weak, client, id) = (Rc::downgrade(self), client.clone(), dev.id.clone());
-        glib::spawn_future_local(async move {
+        self.load_active();
+        if reachable {
+            self.request_contact_sync();
+        }
+        self.scan_downloads_for_vcf();
+    }
+
+    /// The daemon's cached newest-message-per-thread list.
+    fn load_active(self: &Rc<Self>) {
+        let weak = Rc::downgrade(self);
+        self.with_device(move |client, id| async move {
             let entries = client.active_conversations(&id).await;
             let raw: Vec<_> = entries.iter().filter_map(variant::parse_message).collect();
             let Some(this) = weak.upgrade() else { return };
@@ -266,6 +305,19 @@ impl MessagesPage {
             let effects = this.inner.borrow_mut().m.on_conversation_loaded(tid, now());
             this.run(effects);
             this.reschedule();
+            // As Python: a debounced reload of the daemon's list and the
+            // notification names, 500 ms after the last load.
+            if let Some(old) = this.inner.borrow_mut().loaded_reload.take() {
+                old.remove();
+            }
+            let weak = Rc::downgrade(&this);
+            let id = glib::timeout_add_local_once(Duration::from_millis(500), move || {
+                let Some(this) = weak.upgrade() else { return };
+                this.inner.borrow_mut().loaded_reload = None;
+                this.load_active();
+                this.load_notifications();
+            });
+            this.inner.borrow_mut().loaded_reload = Some(id);
         }));
         let weak = Rc::downgrade(self);
         subs.push(signals::subscribe(bus, &path, IFACE_CONVERSATIONS, "attachmentReceived", move |p| {
@@ -555,28 +607,130 @@ impl MessagesPage {
         let weak = Rc::downgrade(self);
         dialog.open(self.parent_window().as_ref(), gio::Cancellable::NONE, move |res| {
             let (Some(this), Some(path)) = (weak.upgrade(), res.ok().and_then(|f| f.path())) else { return };
-            let mut found = std::collections::HashMap::new();
-            let is_csv = path.extension().is_some_and(|e| e.eq_ignore_ascii_case("csv"));
-            let count = if is_csv {
-                crate::core::contacts::import_google_csv(&path, &mut found)
-            } else {
-                crate::core::contacts::import_vcf_file(&path, &mut found)
-            };
-            {
-                let mut guard = this.inner.borrow_mut();
-                let i = &mut *guard;
-                i.store.batch(|store| {
-                    for (phone, name) in &found {
-                        store.save_contact(phone, name);
-                    }
-                });
-                i.m.contact_map.extend(found);
-                i.m.refresh_names();
-            }
-            this.list.set_contacts(this.inner.borrow().m.contact_map.clone());
-            this.run(vec![Effect::RefreshList]);
+            let count = this.import_contacts_file(&path);
             this.toast(&format!("Imported {count} contacts"));
         });
+    }
+
+    // ── contacts from other sources ────────────────────────────────
+
+    fn subscribe_contact_sources(self: &Rc<Self>, client: &Client, device_id: &str) -> Vec<Subscription> {
+        let base = device_path(device_id);
+        let mut subs = Vec::new();
+        // KDE Connect finished syncing the phone's contacts (vCards).
+        let weak = Rc::downgrade(self);
+        subs.push(signals::subscribe(client.bus(), &format!("{base}/contacts"), IFACE_CONTACTS, "localCacheSynchronized", move |_| {
+            if let Some(this) = weak.upgrade() {
+                this.reload_contacts();
+            }
+        }));
+        // Incoming and missed calls name their caller.
+        let weak = Rc::downgrade(self);
+        subs.push(signals::subscribe(client.bus(), &format!("{base}/telephony"), IFACE_TELEPHONY, "callReceived", move |p| {
+            let Some(this) = weak.upgrade() else { return };
+            let Some((event, number, name)) = p.get::<(String, String, String)>() else { return };
+            if !matches!(event.as_str(), "ringing" | "missedCall") {
+                return;
+            }
+            if let Some((norm, name)) = crate::core::contacts::harvest_contact_from_telephony_signal(&number, &name) {
+                let effects = {
+                    let mut guard = this.inner.borrow_mut();
+                    let i = &mut *guard;
+                    i.m.learn_contacts([(norm, name)].into(), &i.store)
+                };
+                this.list.set_contacts(this.inner.borrow().m.contact_map.clone());
+                this.run(effects);
+            }
+        }));
+        // A contacts file shared from the phone is imported.
+        let weak = Rc::downgrade(self);
+        subs.push(signals::subscribe(client.bus(), &format!("{base}/share"), IFACE_SHARE, "shareReceived", move |p| {
+            let (Some(this), Some((url,))) = (weak.upgrade(), p.get::<(String,)>()) else { return };
+            let path = if url.starts_with("file://") {
+                gio::File::for_uri(&url).path()
+            } else {
+                Some(std::path::PathBuf::from(&url))
+            };
+            if let Some(path) = path.filter(|p| p.extension().is_some_and(|e| e.eq_ignore_ascii_case("vcf"))) {
+                this.import_contacts_file(&path);
+            }
+        }));
+        subs
+    }
+
+    /// Re-read the contact names (vCards + saved) and redraw.
+    fn reload_contacts(self: &Rc<Self>) {
+        let effects = {
+            let mut guard = self.inner.borrow_mut();
+            let i = &mut *guard;
+            let Some(dev) = i.m.device_id().map(str::to_string) else { return };
+            i.m.contact_map = load_contact_map(&dev, i.store.load_contacts());
+            i.m.refresh_names();
+            let mut e = vec![Effect::RefreshList];
+            if let Some(a) = i.m.active_thread() {
+                e.push(Effect::ShowThread(a));
+            }
+            e
+        };
+        self.list.set_contacts(self.inner.borrow().m.contact_map.clone());
+        self.run(effects);
+    }
+
+    /// Ask KDE Connect to sync the phone's contacts; warn once if, 8 s
+    /// later, it has synced none (as Python).
+    fn request_contact_sync(self: &Rc<Self>) {
+        self.with_device(|c, d| async move {
+            c.sync_contacts(&d).await;
+        });
+        let weak = Rc::downgrade(self);
+        glib::timeout_add_seconds_local_once(8, move || {
+            let Some(this) = weak.upgrade() else { return };
+            let Some(dev) = this.inner.borrow().m.device_id().map(str::to_string) else { return };
+            if crate::core::contacts::synced_vcard_count(&dev) > 0 || !this.inner.borrow_mut().contact_sync_warned.insert(dev) {
+                return;
+            }
+            this.toast(
+                "KDE Connect did not populate desktop contacts. Check the phone's Contacts permission or import a contacts file.",
+            );
+        });
+    }
+
+    /// First run with almost no contacts: import the newest contacts file in
+    /// ~/Downloads (often shared from the phone), as Python.
+    fn scan_downloads_for_vcf(self: &Rc<Self>) {
+        if self.inner.borrow().m.contact_map.len() > 5 {
+            return;
+        }
+        let downloads = crate::core::settings::home_dir().join("Downloads");
+        let Ok(entries) = std::fs::read_dir(&downloads) else { return };
+        let newest = entries
+            .flatten()
+            .map(|e| e.path())
+            .filter(|p| p.extension().is_some_and(|e| e.eq_ignore_ascii_case("vcf")))
+            .max_by_key(|p| std::fs::metadata(p).and_then(|m| m.modified()).ok());
+        if let Some(path) = newest {
+            self.import_contacts_file(&path);
+        }
+    }
+
+    /// Import a VCF or Google CSV file; returns how many contacts it had.
+    fn import_contacts_file(self: &Rc<Self>, path: &std::path::Path) -> usize {
+        let mut found = std::collections::HashMap::new();
+        let is_csv = path.extension().is_some_and(|e| e.eq_ignore_ascii_case("csv"));
+        let count = if is_csv {
+            crate::core::contacts::import_google_csv(path, &mut found)
+        } else {
+            crate::core::contacts::import_vcf_file(path, &mut found)
+        };
+        let effects = {
+            let mut guard = self.inner.borrow_mut();
+            let i = &mut *guard;
+            i.m.learn_contacts(found, &i.store)
+        };
+        self.list.set_contacts(self.inner.borrow().m.contact_map.clone());
+        self.run(effects);
+        log::info!("imported {count} contacts from {}", path.display());
+        count
     }
 
     fn toast(&self, text: &str) {
