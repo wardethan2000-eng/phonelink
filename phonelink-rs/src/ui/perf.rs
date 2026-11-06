@@ -63,3 +63,21 @@ pub fn watch_main_loop() {
         glib::ControlFlow::Continue
     });
 }
+
+/// Times a block; logs it if it took over 10 ms (with PHONELINK_PERF=1).
+pub struct Span(Option<(&'static str, Instant)>);
+
+pub fn span(name: &'static str) -> Span {
+    Span(enabled().then(|| (name, Instant::now())))
+}
+
+impl Drop for Span {
+    fn drop(&mut self) {
+        if let Some((name, t)) = self.0.take() {
+            let ms = t.elapsed().as_secs_f64() * 1000.0;
+            if ms > 10.0 {
+                log::info!("perf: {name} took {ms:.1} ms");
+            }
+        }
+    }
+}

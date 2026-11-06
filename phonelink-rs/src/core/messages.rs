@@ -666,16 +666,23 @@ impl Messages {
 
     // ── full-resolution images ─────────────────────────────────────
 
-    /// Image attachments in a conversation that only have the thumbnail, to
-    /// ask the phone for (`requestAttachmentFile(part_id, unique_id)`). Each
-    /// is returned once per session, and none while the phone is away.
-    pub fn take_full_image_requests(&mut self, thread_id: i64, cache_dir: &std::path::Path) -> Vec<(i64, String)> {
+    /// Image attachments that only have the thumbnail, among the messages
+    /// `uids` (those on screen, as Python: a whole 2,000-message thread at
+    /// once swamped the daemon), to ask the phone for
+    /// (`requestAttachmentFile(part_id, unique_id)`). Each is returned once
+    /// per session, and none while the phone is away.
+    pub fn take_full_image_requests(
+        &mut self,
+        thread_id: i64,
+        uids: &HashSet<i64>,
+        cache_dir: &std::path::Path,
+    ) -> Vec<(i64, String)> {
         if !self.reachable || thread_id < 0 {
             return Vec::new();
         }
         let Some(conv) = self.index.get(thread_id) else { return Vec::new() };
         let mut out = Vec::new();
-        for att in conv.messages.iter().flat_map(|m| &m.attachments) {
+        for att in conv.messages.iter().filter(|m| uids.contains(&m.uid)).flat_map(|m| &m.attachments) {
             if !attachments::is_image(att) || att.part_id == 0 || attachments::existing_full_in(cache_dir, att).is_some() {
                 continue;
             }
@@ -1204,9 +1211,12 @@ mod tests {
         let mut p = Panel::new();
         p.merge(with_image(1, 10, 7, "PART_7.jpg"));
         p.merge(with_image(2, 10, 8, "PART_8.jpg"));
-        let asked = p.m.take_full_image_requests(10, &cache);
-        assert_eq!(asked, vec![(7, "PART_7.jpg".to_string()), (8, "PART_8.jpg".to_string())]);
-        assert!(p.m.take_full_image_requests(10, &cache).is_empty(), "asked twice");
+        // Only the messages on screen.
+        assert_eq!(p.m.take_full_image_requests(10, &HashSet::from([2]), &cache), vec![(8, "PART_8.jpg".to_string())]);
+        let mut asked = p.m.take_full_image_requests(10, &HashSet::from([1, 2]), &cache);
+        asked.sort();
+        assert_eq!(asked, vec![(7, "PART_7.jpg".to_string())]);
+        assert!(p.m.take_full_image_requests(10, &HashSet::from([1, 2]), &cache).is_empty(), "asked twice");
 
         // The phone sends PART_7 back.
         let sent = dir.path().join("download.jpg");
@@ -1229,9 +1239,9 @@ mod tests {
         let mut p = Panel::new();
         p.merge(with_image(1, 10, 7, "PART_7.jpg"));
         p.m.set_reachable(false);
-        assert!(p.m.take_full_image_requests(10, dir.path()).is_empty());
+        assert!(p.m.take_full_image_requests(10, &HashSet::from([1]), dir.path()).is_empty());
         p.m.set_reachable(true);
-        assert_eq!(p.m.take_full_image_requests(10, dir.path()).len(), 1);
+        assert_eq!(p.m.take_full_image_requests(10, &HashSet::from([1]), dir.path()).len(), 1);
     }
 
     #[test]

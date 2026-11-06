@@ -87,6 +87,12 @@ struct Inner {
     reachable_seen: bool,
     /// Devices already warned that KDE Connect synced no contacts.
     contact_sync_warned: std::collections::HashSet<String>,
+    /// Full pictures to ask the phone for, one at a time (22 at once
+    /// timed out the daemon on the laptop).
+    full_queue: VecDeque<(i64, String)>,
+    full_pumping: bool,
+    /// A full picture arrived: redraw once things settle.
+    redraw_pending: Option<glib::SourceId>,
 }
 
 pub struct MessagesPage {
@@ -169,6 +175,9 @@ impl MessagesPage {
                 loaded_reload: None,
                 reachable_seen: false,
                 contact_sync_warned: Default::default(),
+                full_queue: VecDeque::new(),
+                full_pumping: false,
+                redraw_pending: None,
             }),
         });
         *download_target.borrow_mut() = Rc::downgrade(&this);
@@ -191,6 +200,12 @@ impl MessagesPage {
         this.list.connect_event(move |e| {
             if let Some(this) = weak.upgrade() {
                 this.list_event(e);
+            }
+        });
+        let weak = Rc::downgrade(&this);
+        this.thread.connect_rendered(move |tid, uids| {
+            if let Some(this) = weak.upgrade() {
+                this.want_full_pictures(tid, uids);
             }
         });
         let weak = Rc::downgrade(&this);
@@ -289,6 +304,7 @@ impl MessagesPage {
                 if i.m.device_id() != Some(id.as_str()) {
                     return;
                 }
+                let _t = super::perf::span("merging activeConversations");
                 i.m.apply_active(&raw, &i.store, &mut *i.settings.borrow_mut(), now())
             };
             log::info!("activeConversations: {} entries, {} parsed", entries.len(), raw.len());
@@ -376,6 +392,7 @@ impl MessagesPage {
             let mut settings = i.settings.borrow_mut();
             let (m, settings) = (&mut i.m, &mut *settings);
             let t = now();
+            let _t = super::perf::span("merging a signal batch");
             let effects = i.store.batch(|store| {
                 let mut effects = Vec::new();
                 for p in &batch {
@@ -471,6 +488,7 @@ impl MessagesPage {
         }
         if refresh {
             let i = self.inner.borrow();
+            let _t = super::perf::span("refreshing the conversation list");
             self.list.set_conversations(&i.m.visible(&*i.settings.borrow()));
         }
     }
@@ -876,21 +894,40 @@ impl MessagesPage {
     }
 
     fn show_thread(&self, tid: i64) {
-        let requests = {
+        let i = self.inner.borrow();
+        let Some(conv) = i.m.index.get(tid) else { return };
+        self.list.select_thread(conv.thread_id);
+        let _t = super::perf::span("updating the open chat");
+        self.thread.sync(conv, &|uid| i.m.route_of(uid));
+    }
+
+    /// Messages just went on screen: ask the phone for their full pictures
+    /// (once each), one request at a time.
+    fn want_full_pictures(self: &Rc<Self>, thread_id: i64, uids: Vec<i64>) {
+        let more = {
             let mut guard = self.inner.borrow_mut();
             let i = &mut *guard;
-            let Some(conv) = i.m.index.get(tid) else { return };
-            self.list.select_thread(conv.thread_id);
-            self.thread.sync(conv, &|uid| i.m.route_of(uid));
-            // Pictures here only as the phone's small preview: ask for the
-            // full files (once each).
-            i.m.take_full_image_requests(tid, &full_cache_dir())
+            let uids: std::collections::HashSet<i64> = uids.into_iter().collect();
+            let reqs = i.m.take_full_image_requests(thread_id, &uids, &full_cache_dir());
+            i.full_queue.extend(reqs);
+            !i.full_queue.is_empty() && !std::mem::replace(&mut i.full_pumping, true)
         };
-        for (part, uid) in requests {
-            self.with_device(move |c, d| async move {
-                c.request_attachment_file(&d, part, &uid).await;
-            });
+        if !more {
+            return;
         }
+        let weak = Rc::downgrade(self);
+        self.with_device(move |c, d| async move {
+            loop {
+                let Some(this) = weak.upgrade() else { return };
+                let next = this.inner.borrow_mut().full_queue.pop_front();
+                let Some((part, uid)) = next else {
+                    this.inner.borrow_mut().full_pumping = false;
+                    return;
+                };
+                drop(this);
+                c.request_attachment_file(&d, part, &uid).await;
+            }
+        });
     }
 
     /// The user asked for a file (Download, or a picture still loading).
@@ -906,7 +943,7 @@ impl MessagesPage {
         });
     }
 
-    fn attachment_received(&self, file_path: &str, file_name: &str) {
+    fn attachment_received(self: &Rc<Self>, file_path: &str, file_name: &str) {
         let tid = {
             let mut guard = self.inner.borrow_mut();
             let i = &mut *guard;
@@ -917,12 +954,27 @@ impl MessagesPage {
             log::info!("the phone sent {file_name} ({file_path})");
             return;
         };
-        let i = self.inner.borrow();
-        if let Some(active) = i.m.active_thread()
-            && i.m.index.primary_for(active) == i.m.index.primary_for(tid)
-            && let Some(conv) = i.m.index.get(active)
-        {
-            self.thread.redraw(conv, &|uid| i.m.route_of(uid));
+        let concerns_open_chat = {
+            let i = self.inner.borrow();
+            i.m.active_thread().is_some_and(|a| i.m.index.primary_for(a) == i.m.index.primary_for(tid))
+        };
+        if !concerns_open_chat {
+            return;
         }
+        // Pictures tend to arrive in a burst: one redraw after the last.
+        if let Some(old) = self.inner.borrow_mut().redraw_pending.take() {
+            old.remove();
+        }
+        let weak = Rc::downgrade(self);
+        let id = glib::timeout_add_local_once(Duration::from_millis(300), move || {
+            let Some(this) = weak.upgrade() else { return };
+            this.inner.borrow_mut().redraw_pending = None;
+            let i = this.inner.borrow();
+            if let Some(conv) = i.m.active_thread().and_then(|a| i.m.index.get(a)) {
+                let _t = super::perf::span("redrawing the chat for new pictures");
+                this.thread.redraw(conv, &|uid| i.m.route_of(uid));
+            }
+        });
+        self.inner.borrow_mut().redraw_pending = Some(id);
     }
 }

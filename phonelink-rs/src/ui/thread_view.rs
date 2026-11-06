@@ -673,6 +673,8 @@ pub struct ThreadView {
     zoom_base: Cell<f64>,
     font_provider: gtk::CssProvider,
     on_zoom: RefCell<Option<ZoomHandler>>,
+    /// Told the uids of messages just put on screen (for full pictures).
+    on_rendered: RefCell<Option<RenderedHandler>>,
     actions: BubbleActions,
     state: RefCell<State>,
 }
@@ -795,6 +797,7 @@ impl ThreadView {
             zoom_base: Cell::new(1.0),
             font_provider: gtk::CssProvider::new(),
             on_zoom: RefCell::default(),
+            on_rendered: RefCell::default(),
             actions,
             state: RefCell::new(State { window: THREAD_WINDOW, pinned: true, ..Default::default() }),
         });
@@ -931,6 +934,19 @@ impl ThreadView {
         }
         if persist && let Some(f) = self.on_zoom.borrow().as_ref() {
             f(self.font_scale.get());
+        }
+    }
+
+    /// `f(thread, uids)` after messages are put on screen. Called from an
+    /// idle callback, so it may borrow whatever the caller of `sync` holds.
+    pub fn connect_rendered(&self, f: impl Fn(i64, Vec<i64>) + 'static) {
+        *self.on_rendered.borrow_mut() = Some(Rc::new(f));
+    }
+
+    fn rendered(&self, uids: Vec<i64>) {
+        let (Some(tid), Some(f)) = (self.state.borrow().thread_id, self.on_rendered.borrow().clone()) else { return };
+        if !uids.is_empty() {
+            glib::idle_add_local_once(move || f(tid, uids));
         }
     }
 
@@ -1132,6 +1148,7 @@ impl ThreadView {
             self.messages_box.append(&b.widget);
             bubbles.push(b);
         }
+        self.rendered(shown.iter().map(|m| m.uid).filter(|u| *u != 0).collect());
         {
             let mut st = self.state.borrow_mut();
             st.rendered = shown.iter().map(|m| m.uid).filter(|u| *u != 0).collect();
@@ -1217,6 +1234,7 @@ impl ThreadView {
         }
         let b = Bubble::new(m, true, route, &self.actions);
         self.messages_box.append(&b.widget);
+        self.rendered(vec![m.uid]);
         let mut st = self.state.borrow_mut();
         st.bubbles.push(b);
         if m.uid != 0 {
@@ -1240,6 +1258,7 @@ impl ThreadView {
 
 type SendHandler = Box<dyn Fn(i64, &str, Option<&Path>) -> bool>;
 type ZoomHandler = Box<dyn Fn(f64)>;
+type RenderedHandler = Rc<dyn Fn(i64, Vec<i64>)>;
 
 const IMAGE_FILE_EXTS: &[&str] = &["png", "jpg", "jpeg", "webp", "gif", "bmp", "tiff", "tif", "heic", "heif"];
 
