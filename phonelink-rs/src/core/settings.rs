@@ -143,7 +143,7 @@ pub fn desktop_entry_text(exec: &str) -> String {
          Name=Phone Link\n\
          Comment=Connect your Android phone - SMS, notifications, and files\n\
          Exec={exec}\n\
-         Icon=phonelink\n\
+         Icon={APPLICATION_ID}\n\
          Terminal=false\n\
          Type=Application\n\
          Categories=Utility;Communication;\n\
