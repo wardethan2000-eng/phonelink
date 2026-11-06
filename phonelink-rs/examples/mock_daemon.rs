@@ -224,6 +224,24 @@ fn demo_start_ms() -> i64 {
     *START.get_or_init(now_ms)
 }
 
+/// `DEMO_EXTRA=N` adds N one-message filler chats (to try a big list).
+fn extra_threads() -> usize {
+    std::env::var("DEMO_EXTRA").ok().and_then(|v| v.parse().ok()).unwrap_or(0)
+}
+
+fn thread_count() -> usize {
+    THREADS.len() + extra_threads()
+}
+
+/// Filler chat `index` (≥ THREADS.len()): thread 1000+, one old text.
+fn filler_message(index: usize) -> Variant {
+    let n = index - THREADS.len();
+    let thread = 1000 + n as i64;
+    let addr = format!("+1555550{:04}", 2000 + n);
+    let date = demo_start_ms() - (3 + n as i64) * 24 * 60 * 60_000;
+    message(thread, 500_000 + n as i32, &[addr.as_str()], "Filler chat", date, false, true)
+}
+
 fn now_ms() -> i64 {
     SystemTime::now().duration_since(UNIX_EPOCH).map_or(0, |d| d.as_millis() as i64)
 }
@@ -262,6 +280,9 @@ fn message_with(
 /// Every message of a thread, oldest first. Threads are spread over the last
 /// two weeks so the list shows times, weekdays and dates.
 fn thread_messages(index: usize) -> Vec<Variant> {
+    if index >= THREADS.len() {
+        return vec![filler_message(index)];
+    }
     let (thread, addrs, unread, lines) = THREADS[index];
     let base = demo_start_ms() - (index as i64) * (index as i64) * 90 * 60_000;
     let mut out = Vec::new();
@@ -323,7 +344,7 @@ fn main() {
         conn.register_object(&path, &dev.lookup_interface(IFACE_CONVERSATIONS).unwrap())
             .method_call(|conn, _, path, iface, method, params, inv| match method {
                 "activeConversations" => {
-                    let latest: Vec<Variant> = (0..THREADS.len())
+                    let latest: Vec<Variant> = (0..thread_count())
                         .map(|i| Variant::from_variant(thread_messages(i).last().unwrap()))
                         .collect();
                     inv.return_value(Some(&(latest,).to_variant()));
@@ -559,7 +580,7 @@ fn main() {
             .await
             .unwrap();
         assert_eq!(reply.get::<(u32,)>(), Some((1,)), "{BUS_NAME} is already owned");
-        eprintln!("demo org.kde.kdeconnect running (device {DEVICE}, {} conversations)", THREADS.len());
+        eprintln!("demo org.kde.kdeconnect running (device {DEVICE}, {} conversations)", thread_count());
         std::future::pending::<()>().await;
     });
 }

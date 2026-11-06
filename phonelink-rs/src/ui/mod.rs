@@ -134,9 +134,20 @@ pub fn run() -> glib::ExitCode {
             w.present();
             return;
         }
-        perf::watch_main_loop();
+        let started = std::time::Instant::now();
         let win = window::Window::new(app);
         win.window.present();
+        // Stalls are counted from the first frame on; startup is reported
+        // on its own (the Python baselines did not include it).
+        let frames = std::cell::Cell::new(0);
+        win.window.add_tick_callback(move |_, _| {
+            frames.set(frames.get() + 1);
+            if frames.get() < 2 {
+                return glib::ControlFlow::Continue;
+            }
+            perf::started(started);
+            glib::ControlFlow::Break
+        });
         // The window owns everything through its signal handlers; keep the
         // controller alive for the app's lifetime.
         std::mem::forget(win);

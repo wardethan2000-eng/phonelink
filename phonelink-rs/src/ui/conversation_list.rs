@@ -45,11 +45,26 @@ fn initial(name: &str, phone: &str) -> String {
 
 fn build_avatar(name: &str, phone: &str, is_group: bool, group_count: usize) -> gtk::Widget {
     if !is_group && let Some(path) = contact_photo_path(phone) {
-        let picture = gtk::Picture::for_filename(path);
+        let picture = gtk::Picture::new();
         picture.set_size_request(40, 40);
         picture.set_can_shrink(true);
         picture.set_content_fit(gtk::ContentFit::Cover);
         picture.add_css_class("conversation-avatar-photo");
+        // Decoded off the main thread at 2× (80 px): full-size contact
+        // photos decoded per row made the first list build stall.
+        let target = picture.clone();
+        glib::spawn_future_local(async move {
+            let decoded = gtk::gio::spawn_blocking(move || {
+                let pb = gtk::gdk_pixbuf::Pixbuf::from_file_at_scale(&path, 80, 80, true).ok()?;
+                Some((pb.read_pixel_bytes(), pb.width(), pb.height(), pb.rowstride() as usize, pb.has_alpha()))
+            })
+            .await;
+            if let Ok(Some((bytes, w, h, stride, alpha))) = decoded {
+                let format = if alpha { gtk::gdk::MemoryFormat::R8g8b8a8 } else { gtk::gdk::MemoryFormat::R8g8b8 };
+                let tex = gtk::gdk::MemoryTexture::new(w, h, format, &bytes, stride);
+                target.set_paintable(Some(&tex));
+            }
+        });
         return picture.upcast();
     }
     let label = gtk::Label::new(None);
@@ -201,6 +216,10 @@ struct State {
     rebuilding: bool,
     last_emitted: Option<i64>,
 }
+
+/// Rows created in the first fill, then per later call.
+const FIRST_ROWS: usize = 30;
+const MORE_ROWS: usize = 15;
 
 type SelectedHandler = Box<dyn Fn(i64)>;
 
@@ -458,8 +477,11 @@ impl ConversationList {
     }
 
     /// Show `conversations` (any order; sorted newest first here), updating
-    /// rows in place.
-    pub fn set_conversations(&self, conversations: &[&Conversation]) {
+    /// rows in place. New rows are created at most [`FIRST_ROWS`] on the
+    /// first call and [`MORE_ROWS`] per call after; returns true while rows
+    /// are still missing, and the caller calls again from an idle callback.
+    /// (Building all 326 rows at once stalled startup 496 ms on the laptop.)
+    pub fn set_conversations(&self, conversations: &[&Conversation]) -> bool {
         let mut convs: Vec<&Conversation> = conversations.to_vec();
         convs.sort_by_key(|c| std::cmp::Reverse(c.sort_key()));
 
@@ -485,8 +507,18 @@ impl ConversationList {
             .filter(|n| !n.is_empty())
             .collect();
 
-        for (pos, c) in convs.iter().enumerate() {
+        let mut budget = if st.rows.is_empty() { FIRST_ROWS } else { MORE_ROWS };
+        let mut pending = false;
+        let mut pos = 0usize;
+        for c in &convs {
             let tid = c.thread_id;
+            if !st.rows.contains_key(&tid) {
+                if budget == 0 {
+                    pending = true;
+                    continue;
+                }
+                budget -= 1;
+            }
             let summary = Summary::of(c);
             // A different avatar means a new row.
             if st.rows.get(&tid).is_some_and(|r| r.summary.avatar_key != summary.avatar_key)
@@ -518,6 +550,7 @@ impl ConversationList {
             }
             let row = &st.rows[&tid];
             row.row.set_visible(row.summary.matches(&st.search));
+            pos += 1;
         }
 
         // Keep the selection on the same conversation after moves.
@@ -533,6 +566,7 @@ impl ConversationList {
         if searching {
             self.update_suggestions();
         }
+        pending
     }
 
     /// Select a row without telling the listener (the caller already knows).

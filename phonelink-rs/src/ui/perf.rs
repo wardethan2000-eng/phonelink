@@ -38,6 +38,15 @@ pub fn revealed() {
     }
 }
 
+/// The window's first frame is on screen: report startup, then start
+/// watching for stalls.
+pub fn started(since: Instant) {
+    if enabled() {
+        log::info!("perf: window on screen {:.0} ms after start", since.elapsed().as_secs_f64() * 1000.0);
+        watch_main_loop();
+    }
+}
+
 /// Watch the main loop: a 10 ms timer that notes how late it fires. Logs any
 /// stall over 20 ms, and every 30 s the worst one seen.
 pub fn watch_main_loop() {

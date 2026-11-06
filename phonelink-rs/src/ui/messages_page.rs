@@ -491,9 +491,20 @@ impl MessagesPage {
             }
         }
         if refresh {
-            let i = self.inner.borrow();
-            let _t = super::perf::span("refreshing the conversation list");
-            self.list.set_conversations(&i.m.visible(&*i.settings.borrow()));
+            let more = {
+                let i = self.inner.borrow();
+                let _t = super::perf::span("refreshing the conversation list");
+                self.list.set_conversations(&i.m.visible(&*i.settings.borrow()))
+            };
+            if more {
+                // The rest of the rows, a batch per idle callback.
+                let weak = Rc::downgrade(self);
+                glib::idle_add_local_once(move || {
+                    if let Some(this) = weak.upgrade() {
+                        this.run(vec![Effect::RefreshList]);
+                    }
+                });
+            }
         }
     }
 
