@@ -178,7 +178,10 @@ const THREADS: &[(i64, &[&str], bool, &[&str])] = &[
 /// Thread 11 gets a long history (to show the 60-message window and
 /// "Show earlier messages") and one photo.
 const LONG_THREAD: i64 = 11;
-const LONG_THREAD_LEN: usize = 150;
+/// `DEMO_LONG=N` sets its length (default 150; Ethan's biggest is ~2,226).
+fn long_thread_len() -> usize {
+    std::env::var("DEMO_LONG").ok().and_then(|v| v.parse().ok()).unwrap_or(150)
+}
 
 /// A small solid-color PNG, base64, like KDE Connect's inline thumbnails.
 fn thumbnail_png() -> String {
@@ -233,13 +236,26 @@ fn thread_count() -> usize {
     THREADS.len() + extra_threads()
 }
 
-/// Filler chat `index` (≥ THREADS.len()): thread 1000+, one old text.
-fn filler_message(index: usize) -> Variant {
+/// `DEMO_FILLER_MSGS=N` texts per filler chat (default 1).
+fn filler_len() -> usize {
+    std::env::var("DEMO_FILLER_MSGS").ok().and_then(|v| v.parse().ok()).unwrap_or(1).max(1)
+}
+
+/// Filler chat `index` (≥ THREADS.len()): thread 1000+, old texts.
+fn filler_messages(index: usize) -> Vec<Variant> {
     let n = index - THREADS.len();
     let thread = 1000 + n as i64;
     let addr = format!("+1555550{:04}", 2000 + n);
-    let date = demo_start_ms() - (3 + n as i64) * 24 * 60 * 60_000;
-    message(thread, 500_000 + n as i32, &[addr.as_str()], "Filler chat", date, false, true)
+    let newest = demo_start_ms() - (3 + n as i64) * 24 * 60 * 60_000;
+    let len = filler_len();
+    (0..len)
+        .map(|k| {
+            let date = newest - ((len - 1 - k) as i64) * 20 * 60_000;
+            let uid = 500_000 + (n * len + k) as i32;
+            let body = format!("Filler text {k} with a few more words so it looks like a real message");
+            message(thread, uid, &[addr.as_str()], &body, date, k % 2 == 1, true)
+        })
+        .collect()
 }
 
 fn now_ms() -> i64 {
@@ -281,7 +297,7 @@ fn message_with(
 /// two weeks so the list shows times, weekdays and dates.
 fn thread_messages(index: usize) -> Vec<Variant> {
     if index >= THREADS.len() {
-        return vec![filler_message(index)];
+        return filler_messages(index);
     }
     let (thread, addrs, unread, lines) = THREADS[index];
     let base = demo_start_ms() - (index as i64) * (index as i64) * 90 * 60_000;
@@ -290,12 +306,13 @@ fn thread_messages(index: usize) -> Vec<Variant> {
         // Older history in bursts like real chats (5 texts a couple of
         // minutes apart, then a few hours' gap), with a photo.
         let chatter = ["ok", "sounds good", "on my way", "see you there", "haha", "did you see that?", "yes", "tomorrow works"];
-        for k in 0..LONG_THREAD_LEN {
-            let (burst, within) = ((LONG_THREAD_LEN - k) as i64 / 5, (k % 5) as i64);
+        for k in 0..long_thread_len() {
+            let (burst, within) = ((long_thread_len() - k) as i64 / 5, (k % 5) as i64);
             let date = base - burst * 5 * 60 * 60_000 - 10 * 60_000 + within * 2 * 60_000;
             let uid = 5000 + k as i32;
             let body = chatter[k % chatter.len()];
-            let atts = if k == LONG_THREAD_LEN - 3 {
+            // A photo every 60 texts (and one near the end).
+            let atts = if k == long_thread_len() - 3 || k % 60 == 57 {
                 vec![(uid as i64, "image/png".to_string(), thumbnail_png(), format!("PART_{uid}.png"))]
             } else {
                 Vec::new()
@@ -352,7 +369,11 @@ fn main() {
                 "requestConversation" => {
                     let (thread, _start, _end) = params.get::<(i64, i32, i32)>().unwrap();
                     inv.return_value(None);
-                    let Some(i) = THREADS.iter().position(|t| t.0 == thread) else { return };
+                    let i = match THREADS.iter().position(|t| t.0 == thread) {
+                        Some(i) => i,
+                        None if thread >= 1000 => THREADS.len() + (thread - 1000) as usize,
+                        None => return,
+                    };
                     let msgs = thread_messages(i);
                     for m in &msgs {
                         let p = Variant::tuple_from_iter([Variant::from_variant(m)]);
@@ -360,6 +381,19 @@ fn main() {
                     }
                     let loaded = (thread, msgs.len() as u64).to_variant();
                     conn.emit_signal(None, path, iface.unwrap(), "conversationLoaded", Some(&loaded)).unwrap();
+                }
+                "requestAllConversationThreads" => {
+                    // Like the phone after connecting: every message again.
+                    inv.return_value(None);
+                    let (conn, path, iface) = (conn.clone(), path.to_string(), iface.unwrap().to_string());
+                    glib::idle_add_local_once(move || {
+                        for i in 0..thread_count() {
+                            for m in thread_messages(i) {
+                                let p = Variant::tuple_from_iter([Variant::from_variant(&m)]);
+                                conn.emit_signal(None, &path, &iface, "conversationUpdated", Some(&p)).unwrap();
+                            }
+                        }
+                    });
                 }
                 "replyToConversation" => {
                     let thread = params.child_value(0).get::<i64>().unwrap();
