@@ -175,6 +175,13 @@ fn echo_sent(conn: &gio::DBusConnection, thread: i64, text: String) {
     });
 }
 
+/// History dates are fixed at startup: a real phone's don't move, and
+/// moving ones make every reload look like new texts.
+fn demo_start_ms() -> i64 {
+    static START: std::sync::OnceLock<i64> = std::sync::OnceLock::new();
+    *START.get_or_init(now_ms)
+}
+
 fn now_ms() -> i64 {
     SystemTime::now().duration_since(UNIX_EPOCH).map_or(0, |d| d.as_millis() as i64)
 }
@@ -214,7 +221,7 @@ fn message_with(
 /// two weeks so the list shows times, weekdays and dates.
 fn thread_messages(index: usize) -> Vec<Variant> {
     let (thread, addrs, unread, lines) = THREADS[index];
-    let base = now_ms() - (index as i64) * (index as i64) * 90 * 60_000;
+    let base = demo_start_ms() - (index as i64) * (index as i64) * 90 * 60_000;
     let mut out = Vec::new();
     if thread == LONG_THREAD {
         // Older history in bursts like real chats (5 texts a couple of

@@ -668,6 +668,11 @@ pub struct ThreadView {
     /// `(thread_id, text, picture)` → whether it was taken (then the compose
     /// bar clears).
     on_send: RefCell<Option<SendHandler>>,
+    /// Message-text zoom (pinch, Ctrl+scroll, Ctrl +/−/0).
+    font_scale: Cell<f64>,
+    zoom_base: Cell<f64>,
+    font_provider: gtk::CssProvider,
+    on_zoom: RefCell<Option<ZoomHandler>>,
     actions: BubbleActions,
     state: RefCell<State>,
 }
@@ -786,6 +791,10 @@ impl ThreadView {
             preview_picture,
             pending_image: RefCell::default(),
             on_send: RefCell::default(),
+            font_scale: Cell::new(1.0),
+            zoom_base: Cell::new(1.0),
+            font_provider: gtk::CssProvider::new(),
+            on_zoom: RefCell::default(),
             actions,
             state: RefCell::new(State { window: THREAD_WINDOW, pinned: true, ..Default::default() }),
         });
@@ -822,6 +831,66 @@ impl ThreadView {
         });
         this.entry.add_controller(keys);
 
+        // Just above the app stylesheet, so the zoom wins.
+        if let Some(display) = gdk::Display::default() {
+            gtk::style_context_add_provider_for_display(
+                &display,
+                &this.font_provider,
+                gtk::STYLE_PROVIDER_PRIORITY_APPLICATION + 1,
+            );
+        }
+        let pinch = gtk::GestureZoom::new();
+        let weak = Rc::downgrade(&this);
+        pinch.connect_begin(move |_, _| {
+            if let Some(this) = weak.upgrade() {
+                this.zoom_base.set(this.font_scale.get());
+            }
+        });
+        let weak = Rc::downgrade(&this);
+        pinch.connect_scale_changed(move |_, scale| {
+            if let Some(this) = weak.upgrade() {
+                this.set_font_scale(this.zoom_base.get() * scale, false);
+            }
+        });
+        let weak = Rc::downgrade(&this);
+        pinch.connect_end(move |_, _| {
+            if let Some(this) = weak.upgrade() {
+                this.set_font_scale(this.font_scale.get(), true);
+            }
+        });
+        scroll.add_controller(pinch);
+        let wheel = gtk::EventControllerScroll::new(gtk::EventControllerScrollFlags::VERTICAL);
+        wheel.set_propagation_phase(gtk::PropagationPhase::Capture);
+        let weak = Rc::downgrade(&this);
+        wheel.connect_scroll(move |c, _, dy| {
+            let Some(this) = weak.upgrade() else { return glib::Propagation::Proceed };
+            if !c.current_event_state().contains(gdk::ModifierType::CONTROL_MASK) || dy == 0.0 {
+                return glib::Propagation::Proceed; // a normal scroll
+            }
+            this.set_font_scale(this.font_scale.get() + if dy < 0.0 { 0.1 } else { -0.1 }, true);
+            glib::Propagation::Stop
+        });
+        scroll.add_controller(wheel);
+        // Ctrl +/−/0 work anywhere in the window, as in Python (global
+        // shortcuts, so focus doesn't have to be in the thread).
+        let shortcuts = gtk::ShortcutController::new();
+        shortcuts.set_scope(gtk::ShortcutScope::Global);
+        for (trigger, step) in [
+            ("<Control>plus|<Control>equal|<Control>KP_Add", 0.1),
+            ("<Control>minus|<Control>KP_Subtract", -0.1),
+            ("<Control>0|<Control>KP_0", 0.0),
+        ] {
+            let weak = Rc::downgrade(&this);
+            let action = gtk::CallbackAction::new(move |_, _| {
+                let Some(this) = weak.upgrade() else { return glib::Propagation::Proceed };
+                let next = if step == 0.0 { 1.0 } else { this.font_scale.get() + step };
+                this.set_font_scale(next, true);
+                glib::Propagation::Stop
+            });
+            shortcuts.add_shortcut(gtk::Shortcut::new(gtk::ShortcutTrigger::parse_string(trigger), Some(action)));
+        }
+        this.widget.add_controller(shortcuts);
+
         // Pinned to the bottom unless the user scrolled up; stay there while
         // content grows (images sizing in).
         let adj = scroll.vadjustment();
@@ -842,6 +911,27 @@ impl ThreadView {
             }
         });
         this
+    }
+
+    /// Start at the saved scale; `persist` is called with each settled one.
+    pub fn set_zoom(&self, scale: f64, persist: impl Fn(f64) + 'static) {
+        *self.on_zoom.borrow_mut() = Some(Box::new(persist));
+        self.font_scale.set(f64::NAN); // force the first apply
+        self.set_font_scale(scale, false);
+    }
+
+    fn set_font_scale(&self, scale: f64, persist: bool) {
+        use crate::core::settings::{MESSAGE_FONT_SCALE_MAX, MESSAGE_FONT_SCALE_MIN};
+        let scale = scale.clamp(MESSAGE_FONT_SCALE_MIN, MESSAGE_FONT_SCALE_MAX);
+        let old = self.font_scale.get();
+        if old.is_nan() || (scale - old).abs() >= 0.001 {
+            self.font_scale.set(scale);
+            let pct = (scale * 100.0).round() as i64;
+            self.font_provider.load_from_data(&format!(".message-zoomable {{ font-size: {pct}%; }}"));
+        }
+        if persist && let Some(f) = self.on_zoom.borrow().as_ref() {
+            f(self.font_scale.get());
+        }
     }
 
     pub fn connect_send(&self, f: impl Fn(i64, &str, Option<&Path>) -> bool + 'static) {
@@ -1004,6 +1094,12 @@ impl ThreadView {
 
     /// Rebuild from `state.all`, rendering the newest `state.window`.
     fn set_messages(self: &Rc<Self>, keep_scroll: bool) {
+        if !keep_scroll {
+            super::perf::opening(self.state.borrow().all.len());
+        }
+        // A rebuild in place (a full picture arrived, older history) must
+        // not lose "pinned to the bottom": clearing the box scrolls it.
+        let was_pinned = self.state.borrow().pinned;
         self.clear();
         let (shown, hidden, routes) = {
             let st = self.state.borrow();
@@ -1045,7 +1141,12 @@ impl ThreadView {
         }
         self.widget.set_visible_child_name("thread");
         if !keep_scroll {
+            super::perf::built();
             self.reveal_at_bottom();
+        } else if was_pinned {
+            self.state.borrow_mut().pinned = true;
+            let adj = self.scroll.vadjustment();
+            glib::idle_add_local_once(move || adj.set_value(adj.upper() - adj.page_size()));
         }
     }
 
@@ -1097,6 +1198,7 @@ impl ThreadView {
             let adj = widget.vadjustment();
             adj.set_value(adj.upper() - adj.page_size());
             widget.set_opacity(1.0);
+            super::perf::revealed();
             if let Some(this) = weak.upgrade() {
                 this.state.borrow_mut().revealing = false;
             }
@@ -1137,6 +1239,7 @@ impl ThreadView {
 }
 
 type SendHandler = Box<dyn Fn(i64, &str, Option<&Path>) -> bool>;
+type ZoomHandler = Box<dyn Fn(f64)>;
 
 const IMAGE_FILE_EXTS: &[&str] = &["png", "jpg", "jpeg", "webp", "gif", "bmp", "tiff", "tif", "heic", "heif"];
 

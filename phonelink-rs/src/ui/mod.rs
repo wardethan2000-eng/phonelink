@@ -7,6 +7,7 @@ pub mod icons;
 pub mod messages_page;
 pub mod notifications_model;
 pub mod notifications_panel;
+pub mod perf;
 pub mod thread_view;
 pub mod window;
 
@@ -89,6 +90,7 @@ pub fn run() -> glib::ExitCode {
             w.present();
             return;
         }
+        perf::watch_main_loop();
         let win = window::Window::new(app);
         win.window.present();
         // The window owns everything through its signal handlers; keep the
