@@ -313,6 +313,10 @@ Branch `rust-phase4` (worktree), merged into `rust-port` when done.
   few weeks after.
 
 ## Phases
+Status 2026-11-06: phases 0–6 done and on `rust-port`. Phase 3 was signed
+off by Ethan after three laptop speed runs: chat build 1–3 ms, at most one
+20–50 ms stall per chat open (GTK layout; Ethan: "feels fine"), and memory
+as in "Memory" above. Phase 7 (switching autostart) still needs his OK.
 0. This note. 1. Core with ported tests. 2. D-Bus client + read-only
 `phonelink-rs --dump`. 3. Messages tab. 4. Notifications, clipboard,
 header/battery, ring, share. 5. Files tab. 6. Tray, settings, autostart,
