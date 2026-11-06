@@ -57,6 +57,12 @@ pub fn watch_main_loop() {
         worst.set(worst.get().max(late));
         if since_report.get().elapsed() >= Duration::from_secs(30) {
             log::info!("perf: worst main-loop stall in the last 30 s: {:.0} ms", worst.get().as_secs_f64() * 1000.0);
+            let (pictures, bytes) = super::thread_view::image_cache_stats();
+            log::info!(
+                "perf: memory {} MB resident; {pictures} decoded pictures ≈ {} MB",
+                rss_kb() / 1024,
+                bytes / (1024 * 1024)
+            );
             worst.set(Duration::ZERO);
             since_report.set(now);
         }
@@ -80,4 +86,13 @@ impl Drop for Span {
             }
         }
     }
+}
+
+/// Resident memory in KB, from /proc/self/statm.
+fn rss_kb() -> usize {
+    let page_kb = 4; // x86_64 Linux
+    std::fs::read_to_string("/proc/self/statm")
+        .ok()
+        .and_then(|s| s.split_whitespace().nth(1).and_then(|p| p.parse::<usize>().ok()))
+        .map_or(0, |pages| pages * page_kb)
 }

@@ -48,6 +48,12 @@ const THUMB_IMAGE_UPSCALE_CAP: f64 = 2.2;
 const ATTACHMENT_THUMBNAIL_MAX: i32 = 256;
 const IMAGE_DECODE_SCALE: i32 = 2;
 const IMAGE_CACHE_MAX: usize = 64;
+/// Opening a chat lays out this many of the newest bubbles at once; the rest
+/// of the window is added above in batches of [`BUILD_BATCH`], one per idle
+/// callback, so no frame waits on 60 bubbles (laptop, 2026-11-06: 80–155 ms
+/// stalls per open, almost all GTK layout).
+const FIRST_BATCH: usize = 15;
+const BUILD_BATCH: usize = 8;
 
 // ── pure helpers ───────────────────────────────────────────────────
 
@@ -652,6 +658,11 @@ struct State {
     earlier: Option<gtk::Button>,
     pinned: bool,
     revealing: bool,
+    /// Bumped on every rebuild, so a stale batch of older bubbles stops.
+    generation: u64,
+    /// While older bubbles are added above: the scroll distance from the
+    /// bottom to hold.
+    anchor_from_bottom: Option<f64>,
 }
 
 pub struct ThreadView {
@@ -907,9 +918,12 @@ impl ThreadView {
         });
         let weak = Rc::downgrade(&this);
         adj.connect_changed(move |a| {
-            if let Some(this) = weak.upgrade()
-                && this.state.try_borrow().is_ok_and(|st| st.pinned)
-            {
+            let Some(this) = weak.upgrade() else { return };
+            let Ok(st) = this.state.try_borrow() else { return };
+            if let Some(from_bottom) = st.anchor_from_bottom {
+                // Older bubbles going in above: keep what is on screen still.
+                a.set_value(a.upper() - from_bottom);
+            } else if st.pinned {
                 a.set_value(a.upper() - a.page_size());
             }
         });
@@ -1116,6 +1130,7 @@ impl ThreadView {
         // A rebuild in place (a full picture arrived, older history) must
         // not lose "pinned to the bottom": clearing the box scrolls it.
         let was_pinned = self.state.borrow().pinned;
+        self.state.borrow_mut().anchor_from_bottom = None;
         self.clear();
         let (shown, hidden, routes) = {
             let st = self.state.borrow();
@@ -1137,9 +1152,14 @@ impl ThreadView {
             self.state.borrow_mut().earlier = Some(btn);
         }
 
-        let mut bubbles = Vec::new();
+        // Fresh opens build the newest few now and the rest in batches; an
+        // in-place rebuild builds everything (its scroll is restored at once).
+        let first = if keep_scroll { shown.len() } else { FIRST_BATCH.min(shown.len()) };
+        let split = shown.len() - first;
         let today = today();
-        for (i, m) in shown.iter().enumerate() {
+        let mut bubbles = Vec::new();
+        for i in split..shown.len() {
+            let m = &shown[i];
             if let Some(line) = time_line(i.checked_sub(1).map(|j| &shown[j]), m, today) {
                 self.messages_box.append(&date_separator(&line));
             }
@@ -1148,13 +1168,20 @@ impl ThreadView {
             self.messages_box.append(&b.widget);
             bubbles.push(b);
         }
-        self.rendered(shown.iter().map(|m| m.uid).filter(|u| *u != 0).collect());
-        {
+        self.rendered(shown[split..].iter().map(|m| m.uid).filter(|u| *u != 0).collect());
+        let generation = {
             let mut st = self.state.borrow_mut();
+            // All of the window counts as rendered (the rest is on its way),
+            // so `sync` never appends one of them at the bottom.
             st.rendered = shown.iter().map(|m| m.uid).filter(|u| *u != 0).collect();
             st.last_rendered_date = shown.last().map_or(0, |m| m.date);
             st.window_first_date = shown.first().map_or(0, |m| m.date);
             st.bubbles = bubbles;
+            st.generation += 1;
+            st.generation
+        };
+        if split > 0 {
+            self.build_older(Rc::new(shown), routes, split, generation);
         }
         self.widget.set_visible_child_name("thread");
         if !keep_scroll {
@@ -1167,8 +1194,71 @@ impl ThreadView {
         }
     }
 
-    /// Redraw the open conversation in place (a full picture arrived),
-    /// keeping the scroll position.
+    /// Add `shown[..upto]` above what is built, newest first, a batch per
+    /// idle callback, until done or the chat is rebuilt.
+    fn build_older(
+        self: &Rc<Self>,
+        shown: Rc<Vec<SmsMessage>>,
+        routes: std::collections::HashMap<i64, SendRoute>,
+        upto: usize,
+        generation: u64,
+    ) {
+        let weak = Rc::downgrade(self);
+        let remaining = Cell::new(upto);
+        glib::idle_add_local(move || {
+            let Some(this) = weak.upgrade() else { return glib::ControlFlow::Break };
+            if this.state.borrow().generation != generation {
+                return glib::ControlFlow::Break;
+            }
+            let k = remaining.get();
+            let j = k.saturating_sub(BUILD_BATCH);
+            {
+                let adj = this.scroll.vadjustment();
+                let mut st = this.state.borrow_mut();
+                // At the bottom (or before the first layout) hold the
+                // bottom; otherwise hold where the user scrolled to.
+                st.anchor_from_bottom = Some(if st.pinned { 0.0 } else { adj.upper() - adj.value() });
+            }
+            let today = today();
+            // Insert in order just below the "Show earlier" button (or at
+            // the very top).
+            let mut anchor: Option<gtk::Widget> = this.state.borrow().earlier.clone().map(|b| b.upcast());
+            let mut put = |w: &gtk::Widget| {
+                this.messages_box.insert_child_after(w, anchor.as_ref());
+                anchor = Some(w.clone());
+            };
+            let mut batch = Vec::new();
+            for i in j..k {
+                let m = &shown[i];
+                if let Some(line) = time_line(i.checked_sub(1).map(|x| &shown[x]), m, today) {
+                    put(date_separator(&line).upcast_ref());
+                }
+                let b = Bubble::new(m, false, routes.get(&m.uid).copied(), &this.actions);
+                put(b.widget.upcast_ref());
+                batch.push(b);
+            }
+            this.rendered(shown[j..k].iter().map(|m| m.uid).filter(|u| *u != 0).collect());
+            this.state.borrow_mut().bubbles.splice(0..0, batch);
+            remaining.set(j);
+            if j > 0 {
+                return glib::ControlFlow::Continue;
+            }
+            // Let the last batch be laid out before letting go of the anchor.
+            let weak = Rc::downgrade(&this);
+            glib::timeout_add_local_once(std::time::Duration::from_millis(250), move || {
+                if let Some(this) = weak.upgrade() {
+                    let mut st = this.state.borrow_mut();
+                    if st.generation == generation {
+                        st.anchor_from_bottom = None;
+                    }
+                }
+            });
+            glib::ControlFlow::Break
+        });
+    }
+
+    /// Full pictures arrived: swap only the bubbles whose attachments
+    /// changed (a full rebuild re-laid out all 60, ~100 ms on the laptop).
     pub fn redraw(self: &Rc<Self>, conv: &Conversation, route: &dyn Fn(i64) -> Option<SendRoute>) {
         if self.state.borrow().thread_id != Some(conv.thread_id) {
             return;
@@ -1178,7 +1268,31 @@ impl ThreadView {
             st.all = sorted(&conv.messages);
             st.routes = conv.messages.iter().filter_map(|m| route(m.uid).map(|r| (m.uid, r))).collect();
         }
-        self.set_messages(true);
+        let changed: Vec<(usize, SmsMessage)> = {
+            let st = self.state.borrow();
+            st.bubbles
+                .iter()
+                .enumerate()
+                .filter_map(|(i, b)| {
+                    conv.messages
+                        .iter()
+                        .find(|m| m.uid == b.message.uid && m.attachments != b.message.attachments)
+                        .map(|m| (i, m.clone()))
+                })
+                .collect()
+        };
+        let pinned = self.state.borrow().pinned;
+        for (i, m) in changed {
+            let old = self.state.borrow().bubbles[i].clone();
+            let fresh = Bubble::new(&m, old.revealer.reveals_child(), route(m.uid), &self.actions);
+            self.messages_box.insert_child_after(&fresh.widget, Some(&old.widget));
+            self.messages_box.remove(&old.widget);
+            self.state.borrow_mut().bubbles[i] = fresh;
+        }
+        if pinned {
+            let adj = self.scroll.vadjustment();
+            glib::idle_add_local_once(move || adj.set_value(adj.upper() - adj.page_size()));
+        }
     }
 
     fn show_earlier(self: &Rc<Self>) {
@@ -1224,6 +1338,8 @@ impl ThreadView {
     }
 
     fn append_message(self: &Rc<Self>, m: &SmsMessage, route: Option<SendRoute>) {
+        // A new message wins over holding the position for older ones.
+        self.state.borrow_mut().anchor_from_bottom = None;
         let prev = self.state.borrow().bubbles.last().cloned();
         // Only the newest bubble shows its time.
         if let Some(prev) = &prev {
@@ -1254,6 +1370,14 @@ impl ThreadView {
             self.messages_box.remove(&child);
         }
     }
+}
+
+/// Decoded pictures held: (count, approximate bytes).
+pub fn image_cache_stats() -> (usize, usize) {
+    IMAGES.with_borrow(|c| {
+        let bytes = c.textures.iter().map(|(_, t)| t.width() as usize * t.height() as usize * 4).sum();
+        (c.textures.len(), bytes)
+    })
 }
 
 type SendHandler = Box<dyn Fn(i64, &str, Option<&Path>) -> bool>;
