@@ -803,12 +803,8 @@ impl FilesPage {
         check.add_css_class("photo-check");
         check.set_visible(false);
         overlay.add_overlay(&check);
-        let name = gtk::Label::new(path.file_name().map(|n| n.to_string_lossy()).as_deref());
-        name.set_ellipsize(gtk::pango::EllipsizeMode::End);
-        name.set_halign(gtk::Align::Fill);
-        name.set_valign(gtk::Align::End);
-        name.add_css_class("photo-label");
-        overlay.add_overlay(&name);
+        // No name label over the photo (Ethan, 2026-11-06); it shows on hover.
+        overlay.set_tooltip_text(path.file_name().map(|n| n.to_string_lossy()).as_deref());
 
         let child = gtk::FlowBoxChild::new();
         child.set_size_request(THUMB_SIZE, THUMB_SIZE);
@@ -839,33 +835,52 @@ impl FilesPage {
         Tile { path: path.to_path_buf(), child, stack, picture, check, selected: false }
     }
 
-    /// One decode at a time, off the main thread, at 2× tile size; stops as
-    /// soon as a newer scan starts.
+    /// Decode off the main thread at 2× tile size, several at once (one at a
+    /// time was visibly slow: each read is a full camera photo over sshfs).
+    /// The first screenful goes in one batch; tiles fill in batch order.
+    /// Stops as soon as a newer scan starts.
     fn load_thumbnails(self: &Rc<Self>, generation: u64, paths: Vec<PathBuf>) {
+        const FIRST_BATCH: usize = 12;
+        const BATCH: usize = 8;
         let weak = Rc::downgrade(self);
         glib::spawn_future_local(async move {
             let total = paths.len();
-            for (i, path) in paths.into_iter().enumerate() {
-                let alive = |w: &std::rc::Weak<Self>| w.upgrade().filter(|t| t.state.borrow().photo_generation == generation);
+            let alive = |w: &std::rc::Weak<Self>| w.upgrade().filter(|t| t.state.borrow().photo_generation == generation);
+            let mut done = 0;
+            let mut start = 0;
+            while start < total {
                 if alive(&weak).is_none() {
                     return;
                 }
-                let p = path.clone();
-                let decoded = gio::spawn_blocking(move || decode_thumbnail(&p)).await.ok().flatten();
-                let Some(this) = alive(&weak) else { return };
-                if let Some((bytes, w, h, stride, alpha)) = decoded {
-                    let format = if alpha { gdk::MemoryFormat::R8g8b8a8 } else { gdk::MemoryFormat::R8g8b8 };
-                    let tex: gdk::Texture = gdk::MemoryTexture::new(w, h, format, &bytes, stride).upcast();
-                    if let Some(t) = this.state.borrow().tiles.get(i).filter(|t| t.path == path) {
-                        t.picture.set_paintable(Some(&tex));
-                        t.stack.set_visible_child_name("image");
+                let end = (start + if start == 0 { FIRST_BATCH } else { BATCH }).min(total);
+                // All of the batch is decoding in the thread pool at once.
+                let jobs: Vec<_> = paths[start..end]
+                    .iter()
+                    .map(|p| {
+                        let p = p.clone();
+                        gio::spawn_blocking(move || decode_thumbnail(&p))
+                    })
+                    .collect();
+                for (offset, job) in jobs.into_iter().enumerate() {
+                    let decoded = job.await.ok().flatten();
+                    let Some(this) = alive(&weak) else { return };
+                    let i = start + offset;
+                    if let Some((bytes, w, h, stride, alpha)) = decoded {
+                        let format = if alpha { gdk::MemoryFormat::R8g8b8a8 } else { gdk::MemoryFormat::R8g8b8 };
+                        let tex: gdk::Texture = gdk::MemoryTexture::new(w, h, format, &bytes, stride).upcast();
+                        if let Some(t) = this.state.borrow().tiles.get(i).filter(|t| t.path == paths[i]) {
+                            t.picture.set_paintable(Some(&tex));
+                            t.stack.set_visible_child_name("image");
+                        }
                     }
+                    done += 1;
                 }
-                if (i + 1) % 5 == 0 || i + 1 == total {
-                    this.photo_status.set_label(&format!("Loading {}/{total} photos…", i + 1));
+                if let Some(this) = alive(&weak) {
+                    this.photo_status.set_label(&format!("Loading {done}/{total} photos…"));
                 }
+                start = end;
             }
-            if let Some(this) = weak.upgrade().filter(|t| t.state.borrow().photo_generation == generation) {
+            if let Some(this) = alive(&weak) {
                 this.photo_status.set_label(&format!("{total} photos"));
             }
         });

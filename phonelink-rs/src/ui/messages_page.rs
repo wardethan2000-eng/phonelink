@@ -91,7 +91,8 @@ struct Inner {
     /// Full pictures to ask the phone for, one at a time (22 at once
     /// timed out the daemon on the laptop).
     full_queue: VecDeque<(i64, String)>,
-    full_pumping: bool,
+    /// Requests to the phone in flight (at most FULL_PICTURE_WORKERS).
+    full_pumping: usize,
     /// A full picture arrived: redraw once things settle.
     redraw_pending: Option<glib::SourceId>,
     /// Threads we just asked the daemon to replay (their conversationLoaded
@@ -183,7 +184,7 @@ impl MessagesPage {
                 reachable_seen: false,
                 contact_sync_warned: Default::default(),
                 full_queue: VecDeque::new(),
-                full_pumping: false,
+                full_pumping: 0,
                 redraw_pending: None,
                 recent_requests: Default::default(),
             }),
@@ -1037,30 +1038,34 @@ impl MessagesPage {
     /// Messages just went on screen: ask the phone for their full pictures
     /// (once each), one request at a time.
     fn want_full_pictures(self: &Rc<Self>, thread_id: i64, uids: Vec<i64>) {
-        let more = {
+        // A few at a time: one by one was slow, 22 at once timed out the
+        // daemon (laptop, 2026-11-06).
+        const FULL_PICTURE_WORKERS: usize = 3;
+        let start = {
             let mut guard = self.inner.borrow_mut();
             let i = &mut *guard;
             let uids: std::collections::HashSet<i64> = uids.into_iter().collect();
             let reqs = i.m.take_full_image_requests(thread_id, &uids, &full_cache_dir());
             i.full_queue.extend(reqs);
-            !i.full_queue.is_empty() && !std::mem::replace(&mut i.full_pumping, true)
+            let start = FULL_PICTURE_WORKERS.saturating_sub(i.full_pumping).min(i.full_queue.len());
+            i.full_pumping += start;
+            start
         };
-        if !more {
-            return;
+        for _ in 0..start {
+            let weak = Rc::downgrade(self);
+            self.with_device(move |c, d| async move {
+                loop {
+                    let Some(this) = weak.upgrade() else { return };
+                    let next = this.inner.borrow_mut().full_queue.pop_front();
+                    let Some((part, uid)) = next else {
+                        this.inner.borrow_mut().full_pumping -= 1;
+                        return;
+                    };
+                    drop(this);
+                    c.request_attachment_file(&d, part, &uid).await;
+                }
+            });
         }
-        let weak = Rc::downgrade(self);
-        self.with_device(move |c, d| async move {
-            loop {
-                let Some(this) = weak.upgrade() else { return };
-                let next = this.inner.borrow_mut().full_queue.pop_front();
-                let Some((part, uid)) = next else {
-                    this.inner.borrow_mut().full_pumping = false;
-                    return;
-                };
-                drop(this);
-                c.request_attachment_file(&d, part, &uid).await;
-            }
-        });
     }
 
     /// The user asked for a file (Download, or a picture still loading).
