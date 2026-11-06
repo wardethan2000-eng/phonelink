@@ -577,7 +577,10 @@ impl Messages {
         if norm.is_empty() || name.is_empty() {
             return Vec::new();
         }
-        store.save_contact(&norm, name);
+        // Typed by hand: beats the phone's contacts too (contact_overrides).
+        store.save_contact_override(&norm, name);
+        let key = super::contacts::phone_key(&norm);
+        self.contact_map.retain(|k, _| super::contacts::phone_key(k) != key);
         self.contact_map.insert(norm, name.to_string());
         self.refresh_names();
         let mut out = vec![Effect::RefreshList];
@@ -1251,7 +1254,8 @@ mod tests {
         let effects = p.m.rename_contact("+1 316 555 1111", " Alex ", &p.store);
         assert_eq!(effects, vec![Effect::RefreshList]);
         assert_eq!(p.m.index.get(10).unwrap().display_name, "Alex");
-        assert_eq!(p.store.load_contacts().get("13165551111").map(String::as_str), Some("Alex"));
+        assert_eq!(p.store.load_contact_overrides().get("13165551111").map(String::as_str), Some("Alex"));
+        assert!(p.store.load_contacts().is_empty());
         assert!(p.m.rename_contact("+13165551111", "  ", &p.store).is_empty());
     }
 

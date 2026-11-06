@@ -79,13 +79,6 @@ fn last_chars(s: &str, n: usize) -> &str {
     &s[i..]
 }
 
-fn first_chars(s: &str, n: usize) -> &str {
-    match s.char_indices().nth(n) {
-        Some((i, _)) => &s[..i],
-        None => s,
-    }
-}
-
 /// Last 10 digits of a number (or all of them when shorter).
 pub fn phone_key(number: &str) -> String {
     let norm = normalize_phone(number);
@@ -112,11 +105,13 @@ pub fn photo_suffix(content_type: Option<&str>) -> &'static str {
     }
 }
 
-/// True when the text is effectively just a phone number. (ASCII digits only;
+/// True when the text is effectively just a phone number, punctuation and
+/// spaces aside. (ASCII digits only;
 /// Python's `isdigit` also accepts exotic digit characters.)
 pub fn looks_like_phone_number(text: &str) -> bool {
     let cleaned = clean_text(text);
-    let candidate: String = cleaned.chars().filter(|c| !matches!(c, '+' | '-' | ' ')).collect();
+    // "(775) 566-0568" and "775.566.0568" are numbers too, not names.
+    let candidate: String = cleaned.chars().filter(|c| !matches!(c, '+' | '-' | ' ' | '(' | ')' | '.')).collect();
     !candidate.is_empty() && candidate.chars().all(|c| c.is_ascii_digit())
 }
 
@@ -689,33 +684,55 @@ fn vcf_files(vcard_dir: &Path) -> Vec<PathBuf> {
     files
 }
 
-/// Normalised phone -> display name: KDE Connect vCards under `vcard_base`
-/// (lower priority) overridden by `local` contacts.
+/// Normalised phone -> display name, strongest source last:
+/// 1. `guessed` (names learned from notifications, calls, imported files),
+/// 2. the phone's own contacts (KDE Connect vCards under `vcard_base`),
+/// 3. `manual` (typed with "Set contact name").
+///
+/// Sources are compared by the last 10 digits, so a guess stored as
+/// `13165551234` cannot beat the phone's `3165551234` through
+/// `resolve_name`'s exact-key lookup. Guesses that are only a number are
+/// dropped.
 pub fn load_contact_map_in(
     vcard_base: &Path,
     device_id: &str,
-    local: HashMap<String, String>,
+    guessed: HashMap<String, String>,
+    manual: HashMap<String, String>,
 ) -> HashMap<String, String> {
-    let mut contact_map = HashMap::new();
+    let mut phone_contacts = HashMap::new();
     let vcard_dir = vcard_base.join(format!("kdeconnect-{device_id}"));
     if vcard_dir.is_dir() {
         for entry in vcf_files(&vcard_dir) {
             let (name, phones) = parse_vcard_name(&entry);
             if !name.is_empty() {
                 for phone in phones {
-                    contact_map.insert(phone, name.clone());
+                    phone_contacts.insert(phone, name.clone());
                 }
             }
         }
     }
-    contact_map.extend(local);
+    let known: std::collections::HashSet<String> = phone_contacts.keys().map(|k| phone_key(k)).collect();
+    let mut contact_map: HashMap<String, String> = guessed
+        .into_iter()
+        .filter(|(phone, name)| !name.trim().is_empty() && !looks_like_phone_number(name) && !known.contains(&phone_key(phone)))
+        .collect();
+    contact_map.extend(phone_contacts);
+    for (phone, name) in manual {
+        let key = phone_key(&phone);
+        contact_map.retain(|k, _| phone_key(k) != key);
+        contact_map.insert(phone, name);
+    }
     contact_map
 }
 
-/// `load_contact_map` at the default vCard location; `local` is
-/// `MessageStore::load_contacts()`.
-pub fn load_contact_map(device_id: &str, local: HashMap<String, String>) -> HashMap<String, String> {
-    load_contact_map_in(&vcard_base(&home_dir()), device_id, local)
+/// `load_contact_map_in` at the default vCard location; `guessed` is
+/// `MessageStore::load_contacts()`, `manual` is `load_contact_overrides()`.
+pub fn load_contact_map(
+    device_id: &str,
+    guessed: HashMap<String, String>,
+    manual: HashMap<String, String>,
+) -> HashMap<String, String> {
+    load_contact_map_in(&vcard_base(&home_dir()), device_id, guessed, manual)
 }
 
 pub fn synced_vcard_count_in(vcard_base: &Path, device_id: &str) -> usize {
@@ -843,17 +860,12 @@ pub fn harvest_contacts_from_notifications(
     for props in notifications {
         let Some((title, msg_text)) = messaging_title_and_text(props) else { continue };
 
-        let mut matched = body_to_addr.get(&msg_text).filter(|a| !a.is_empty());
-        if matched.is_none() {
-            matched = body_to_addr
-                .iter()
-                .find(|(body, _)| body.starts_with(&msg_text) || msg_text.starts_with(body))
-                .map(|(_, addr)| addr)
-                .filter(|a| !a.is_empty());
-        }
+        // Exact text only: a prefix match let "Ok" name whichever chat said it.
+        let matched = body_to_addr.get(&msg_text).filter(|a| !a.is_empty());
         if let Some(addr) = matched {
             let norm = normalize_phone(addr);
-            if !norm.is_empty() && existing.get(&norm) != Some(&title) {
+            // A guess only fills a gap; it never renames a known number.
+            if !norm.is_empty() && !has_name(existing, &norm) {
                 existing.insert(norm, title);
                 new_count += 1;
             }
@@ -862,41 +874,50 @@ pub fn harvest_contacts_from_notifications(
     new_count
 }
 
+/// Is there already a name for this number (any form of it)?
+fn has_name(contact_map: &HashMap<String, String>, norm: &str) -> bool {
+    let key = phone_key(norm);
+    contact_map.contains_key(norm) || contact_map.keys().any(|k| phone_key(k) == key)
+}
+
 /// Match one notification's already-fetched props against in-memory
 /// conversations. Returns `(normalized_phone, contact_name)` for a new
 /// mapping; the caller persists it (`MessageStore::save_contact`).
 ///
-/// Covers both Python's `match_contact_from_notification_props` and
-/// `harvest_contact_from_notification_signal` (identical apart from fetching
-/// the props over D-Bus and calling `save_contact`).
+/// Strict, because a wrong guess puts someone's name on another person's
+/// chat: only 1:1 chats (a group's address is just its first member, not
+/// the sender), only an exact copy of a received text, only when exactly one
+/// number matches, and only for a number with no name yet.
 pub fn match_contact_from_notification_props<'a>(
     props: &Props,
     conversations: impl IntoIterator<Item = &'a Conversation>,
     contact_map: &HashMap<String, String>,
 ) -> Option<(String, String)> {
     let (title, msg_text) = messaging_title_and_text(props)?;
-    let is_new = |norm: &str| !norm.is_empty() && contact_map.get(norm) != Some(&title);
-
+    let mut found: Option<String> = None;
     for conv in conversations {
-        let last = conv.last_message.trim();
-        if !conv.last_message.is_empty()
-            && (last == msg_text || msg_text.starts_with(first_chars(last, 30)))
-        {
-            let norm = normalize_phone(&conv.address);
-            if is_new(&norm) {
-                return Some((norm, title.clone()));
-            }
+        if conv.is_group() {
+            continue;
         }
-        for msg in &conv.messages {
-            if msg.msg_type == 1 && !msg.body.is_empty() && msg.body.trim() == msg_text {
-                let norm = normalize_phone(&conv.address);
-                if is_new(&norm) {
-                    return Some((norm, title.clone()));
-                }
-            }
+        let said_it = conv.last_message.trim() == msg_text
+            || conv.messages.iter().any(|m| m.msg_type == 1 && m.body.trim() == msg_text);
+        if !said_it {
+            continue;
+        }
+        let norm = normalize_phone(&conv.address);
+        if norm.is_empty() {
+            continue;
+        }
+        match &found {
+            Some(prev) if phone_key(prev) != phone_key(&norm) => return None,
+            _ => found = Some(norm),
         }
     }
-    None
+    let norm = found?;
+    if has_name(contact_map, &norm) {
+        return None;
+    }
+    Some((norm, title))
 }
 
 /// Contact learned from a telephony event (incoming/missed call). Returns
@@ -978,6 +999,85 @@ mod tests {
              END:VCARD\n",
         );
         assert_eq!(got, entries("Doe, Jane", &["3165550000"]));
+    }
+
+    fn names(pairs: &[(&str, &str)]) -> HashMap<String, String> {
+        pairs.iter().map(|(k, v)| (k.to_string(), v.to_string())).collect()
+    }
+
+    #[test]
+    fn phone_contacts_beat_guesses_and_typed_names_beat_both() {
+        let base = tempfile::tempdir().unwrap();
+        let dir = base.path().join("kdeconnect-dev");
+        fs::create_dir_all(&dir).unwrap();
+        fs::write(dir.join("a.vcf"), "BEGIN:VCARD\nFN:Dad\nTEL:3165550001\nEND:VCARD\n").unwrap();
+        fs::write(dir.join("b.vcf"), "BEGIN:VCARD\nFN:Mom\nTEL:3165550002\nEND:VCARD\n").unwrap();
+        let guessed = names(&[
+            ("13165550001", "Trent Fair"),     // wrong guess, other form of Dad's number
+            ("13165550003", "(775) 566-0568"), // a number, not a name
+            ("13165550004", "Alex"),           // fills a gap
+        ]);
+        let manual = names(&[("13165550002", "Mother")]);
+        let map = load_contact_map_in(base.path(), "dev", guessed, manual);
+        assert_eq!(resolve_name(&map, "+13165550001"), "Dad");
+        assert_eq!(resolve_name(&map, "3165550001"), "Dad");
+        assert_eq!(resolve_name(&map, "+13165550002"), "Mother");
+        assert_eq!(resolve_name(&map, "3165550002"), "Mother");
+        assert_eq!(resolve_name(&map, "+13165550003"), "+13165550003");
+        assert_eq!(resolve_name(&map, "+13165550004"), "Alex");
+    }
+
+    #[test]
+    fn numbers_with_brackets_or_dots_are_not_names() {
+        assert!(looks_like_phone_number("(775) 566-0568"));
+        assert!(looks_like_phone_number("775.566.0568"));
+        assert!(looks_like_phone_number("+1 316-555-0000"));
+        assert!(!looks_like_phone_number("Dad"));
+        assert!(!looks_like_phone_number("(Work)"));
+    }
+
+    fn texted(thread_id: i64, addresses: &[&str], body: &str) -> Conversation {
+        let mut conv = Conversation::new(thread_id);
+        conv.address = addresses[0].to_string();
+        conv.addresses = addresses.iter().map(|a| a.to_string()).collect();
+        conv.last_message = body.to_string();
+        conv
+    }
+
+    fn notification(title: &str, text: &str) -> Props {
+        [("appName", "Messages"), ("title", title), ("text", text)]
+            .into_iter()
+            .map(|(k, v)| (k.to_string(), Value::from(v)))
+            .collect()
+    }
+
+    #[test]
+    fn notification_guesses_only_safe_matches() {
+        let none = HashMap::new();
+        let one = [texted(1, &["+13165550001"], "See you at the game tonight")];
+        assert_eq!(
+            match_contact_from_notification_props(&notification("Alex", "See you at the game tonight"), &one, &none),
+            Some(("13165550001".to_string(), "Alex".to_string()))
+        );
+        // A group's address is only its first member, not the sender.
+        let group = [texted(2, &["+13165550001", "+13165550002"], "Dinner at six")];
+        assert_eq!(match_contact_from_notification_props(&notification("Mom", "Dinner at six"), &group, &none), None);
+        // The same text in two people's chats: can't tell who.
+        let two = [texted(3, &["+13165550001"], "Ok"), texted(4, &["+13165550002"], "Ok")];
+        assert_eq!(match_contact_from_notification_props(&notification("Sam", "Ok"), &two, &none), None);
+        // Only part of the text: no longer enough.
+        assert_eq!(match_contact_from_notification_props(&notification("Sam", "See you"), &one, &none), None);
+        // A number that already has a name keeps it.
+        let known = names(&[("3165550001", "Dad")]);
+        assert_eq!(
+            match_contact_from_notification_props(&notification("Alex", "See you at the game tonight"), &one, &known),
+            None
+        );
+        // A title that is only a number teaches nothing.
+        assert_eq!(
+            match_contact_from_notification_props(&notification("(775) 566-0568", "See you at the game tonight"), &one, &none),
+            None
+        );
     }
 
     #[test]

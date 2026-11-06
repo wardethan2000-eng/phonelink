@@ -50,6 +50,10 @@ CREATE TABLE IF NOT EXISTS contacts (
     phone TEXT PRIMARY KEY,
     name  TEXT
 );
+CREATE TABLE IF NOT EXISTS contact_overrides (
+    phone TEXT PRIMARY KEY,
+    name  TEXT
+);
 CREATE TABLE IF NOT EXISTS meta (
     key   TEXT PRIMARY KEY,
     value TEXT
@@ -406,10 +410,34 @@ impl MessageStore {
 
     // ── contacts (normalised phone → display name) ─────────────────
 
+    /// Names learned by guessing (notifications, calls, imported files).
+    /// The phone's own contacts beat these; see `load_contact_map`.
     pub fn load_contacts(&self) -> HashMap<String, String> {
+        self.load_name_table("contacts")
+    }
+
+    /// Names typed by hand ("Set contact name"): beat everything.
+    pub fn load_contact_overrides(&self) -> HashMap<String, String> {
+        self.load_name_table("contact_overrides")
+    }
+
+    pub fn save_contact_override(&self, phone: &str, name: &str) {
+        if phone.is_empty() {
+            return;
+        }
+        self.write("save_contact_override", |c| {
+            c.execute(
+                "INSERT OR REPLACE INTO contact_overrides (phone, name) VALUES (?, ?)",
+                params![phone, name],
+            )?;
+            Ok(())
+        });
+    }
+
+    fn load_name_table(&self, table: &str) -> HashMap<String, String> {
         let Some(conn) = self.conn.as_ref() else { return HashMap::new() };
         let result = (|| -> Result<HashMap<String, String>, rusqlite::Error> {
-            let mut stmt = conn.prepare("SELECT phone, name FROM contacts")?;
+            let mut stmt = conn.prepare(&format!("SELECT phone, name FROM {table}"))?;
             let rows = stmt.query_map([], |r| Ok((text(r, 0), text(r, 1))))?;
             let mut out = HashMap::new();
             for row in rows {
@@ -421,7 +449,7 @@ impl MessageStore {
             Ok(out)
         })();
         result.unwrap_or_else(|e| {
-            log::warn!("store.load_contacts failed: {e}");
+            log::warn!("store.load {table} failed: {e}");
             HashMap::new()
         })
     }

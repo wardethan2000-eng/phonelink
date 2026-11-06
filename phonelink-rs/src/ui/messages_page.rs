@@ -279,7 +279,7 @@ impl MessagesPage {
             i.queue.clear();
             i.client = Some(client.clone());
             i.m.reset_for_device(Some(&dev.id), reachable);
-            i.m.contact_map = load_contact_map(&dev.id, i.store.load_contacts());
+            i.m.contact_map = load_contact_map(&dev.id, i.store.load_contacts(), i.store.load_contact_overrides());
             self.list.set_contacts(i.m.contact_map.clone());
             i.subs = self.subscribe(client, &dev.id);
             i.subs.extend(self.subscribe_contact_sources(client, &dev.id));
@@ -827,7 +827,7 @@ impl MessagesPage {
             let mut guard = self.inner.borrow_mut();
             let i = &mut *guard;
             let Some(dev) = i.m.device_id().map(str::to_string) else { return };
-            i.m.contact_map = load_contact_map(&dev, i.store.load_contacts());
+            i.m.contact_map = load_contact_map(&dev, i.store.load_contacts(), i.store.load_contact_overrides());
             i.m.refresh_names();
             let mut e = vec![Effect::RefreshList];
             if let Some(a) = i.m.active_thread() {
