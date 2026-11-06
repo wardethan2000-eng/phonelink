@@ -215,6 +215,8 @@ struct State {
     /// Set while the list is being rearranged, so moves don't count as clicks.
     rebuilding: bool,
     last_emitted: Option<i64>,
+    /// Where a Shift+click range starts: the last plain or Ctrl click.
+    anchor: Option<i64>,
 }
 
 /// Rows created in the first fill, then per later call.
@@ -229,6 +231,8 @@ pub enum ListEvent {
     Start { address: String, name: String },
     Rename { thread_id: i64, address: String },
     Delete { thread_id: i64 },
+    /// Several chats selected with Shift/Ctrl+click.
+    DeleteMany { thread_ids: Vec<i64> },
     ImportContacts,
 }
 
@@ -243,6 +247,9 @@ pub struct ConversationList {
     search_entry: gtk::SearchEntry,
     contacts_header: gtk::Label,
     contacts_list: gtk::ListBox,
+    /// "N selected · Cancel · Delete", while more than one chat is selected.
+    selection_bar: gtk::ActionBar,
+    selection_label: gtk::Label,
 }
 
 impl ConversationList {
@@ -274,7 +281,9 @@ impl ConversationList {
         widget.append(&scrolled);
 
         let listbox = gtk::ListBox::new();
-        listbox.set_selection_mode(gtk::SelectionMode::Single);
+        // Shift+click selects a range and Ctrl+click toggles, for deleting
+        // several chats at once; a plain click still opens one.
+        listbox.set_selection_mode(gtk::SelectionMode::Multiple);
         listbox.set_activate_on_single_click(true);
         listbox.set_placeholder(Some(&placeholder()));
         let scroll_box = gtk::Box::new(gtk::Orientation::Vertical, 0);
@@ -295,6 +304,18 @@ impl ConversationList {
         scroll_box.append(&contacts_list);
         scrolled.set_child(Some(&scroll_box));
 
+        let selection_bar = gtk::ActionBar::new();
+        let selection_label = gtk::Label::new(None);
+        selection_label.add_css_class("heading");
+        selection_bar.pack_start(&selection_label);
+        let delete_selected = gtk::Button::with_label("Delete");
+        delete_selected.add_css_class("destructive-action");
+        selection_bar.pack_end(&delete_selected);
+        let cancel_selection = gtk::Button::with_label("Cancel");
+        selection_bar.pack_end(&cancel_selection);
+        selection_bar.set_revealed(false);
+        widget.append(&selection_bar);
+
         let this = Rc::new(Self {
             widget,
             listbox: listbox.clone(),
@@ -304,7 +325,94 @@ impl ConversationList {
             search_entry: search.clone(),
             contacts_header,
             contacts_list: contacts_list.clone(),
+            selection_bar,
+            selection_label,
         });
+        let weak = Rc::downgrade(&this);
+        delete_selected.connect_clicked(move |_| {
+            if let Some(this) = weak.upgrade() {
+                let thread_ids = this.selected_threads();
+                this.emit(ListEvent::DeleteMany { thread_ids });
+            }
+        });
+        let weak = Rc::downgrade(&this);
+        cancel_selection.connect_clicked(move |_| {
+            if let Some(this) = weak.upgrade() {
+                this.collapse_selection();
+            }
+        });
+        // Shift+click selects from the last clicked chat to this one;
+        // Ctrl+click toggles one. Done here rather than by GtkListBox,
+        // whose range anchor is lost whenever rows move (they move on every
+        // new message).
+        let clicks = gtk::GestureClick::new();
+        clicks.set_button(gtk::gdk::BUTTON_PRIMARY);
+        clicks.set_propagation_phase(gtk::PropagationPhase::Capture);
+        let weak = Rc::downgrade(&this);
+        clicks.connect_pressed(move |g, _, _, y| {
+            let Some(this) = weak.upgrade() else { return };
+            let state = g.current_event_state();
+            let shift = state.contains(gtk::gdk::ModifierType::SHIFT_MASK);
+            let ctrl = state.contains(gtk::gdk::ModifierType::CONTROL_MASK);
+            let Some(row) = this.listbox.row_at_y(y as i32) else { return };
+            let Some(tid) = this.thread_of(&row) else { return };
+            g.set_state(gtk::EventSequenceState::Claimed);
+            if !shift && !ctrl {
+                // A plain click: just this chat, opened. (In multiple mode
+                // GtkListBox would add it to the selection instead.)
+                this.state.borrow_mut().anchor = Some(tid);
+                let only = this.selected_threads() == [tid];
+                if !only {
+                    this.listbox.unselect_all();
+                    this.listbox.select_row(Some(&row));
+                }
+                row.grab_focus();
+                return;
+            }
+            if ctrl && !shift {
+                if row.is_selected() {
+                    this.listbox.unselect_row(&row);
+                } else {
+                    this.listbox.select_row(Some(&row));
+                }
+                this.state.borrow_mut().anchor = Some(tid);
+                return;
+            }
+            let anchor = {
+                let st = this.state.borrow();
+                st.anchor.or(st.last_emitted)
+            };
+            let Some(from) = anchor.and_then(|a| this.state.borrow().rows.get(&a).map(|r| r.row.index())) else {
+                this.listbox.select_row(Some(&row));
+                return;
+            };
+            let (lo, hi) = (from.min(row.index()), from.max(row.index()));
+            if !ctrl {
+                this.listbox.unselect_all();
+            }
+            for i in lo..=hi {
+                if let Some(r) = this.listbox.row_at_index(i)
+                    && r.is_visible()
+                {
+                    this.listbox.select_row(Some(&r));
+                }
+            }
+        });
+        listbox.add_controller(clicks);
+
+        // Esc leaves multi-select, keeping the open chat selected.
+        let keys = gtk::EventControllerKey::new();
+        let weak = Rc::downgrade(&this);
+        keys.connect_key_pressed(move |_, key, _, _| {
+            match (key, weak.upgrade()) {
+                (gtk::gdk::Key::Escape, Some(this)) if this.selected_threads().len() > 1 => {
+                    this.collapse_selection();
+                    glib::Propagation::Stop
+                }
+                _ => glib::Propagation::Proceed,
+            }
+        });
+        listbox.add_controller(keys);
         let focus = search.clone();
         new_btn.connect_clicked(move |_| {
             focus.grab_focus();
@@ -341,20 +449,35 @@ impl ConversationList {
                 return;
             };
             g.set_state(gtk::EventSequenceState::Claimed);
-            this.listbox.select_row(Some(&row));
+            let selected = this.selected_threads();
+            if selected.len() > 1 && selected.contains(&tid) {
+                this.many_menu(selected, x, y);
+                return;
+            }
+            this.select_only(&row);
             this.row_menu(&row, tid, x, y);
         });
         listbox.add_controller(right);
 
         let weak = Rc::downgrade(&this);
-        listbox.connect_row_selected(move |_, row| {
-            if let (Some(this), Some(row)) = (weak.upgrade(), row) {
-                this.row_chosen(row);
+        listbox.connect_selected_rows_changed(move |lb| {
+            let Some(this) = weak.upgrade() else { return };
+            let rows = lb.selected_rows();
+            if let Ok(st) = this.state.try_borrow()
+                && st.rebuilding
+            {
+                return;
+            }
+            this.update_selection_bar(rows.len());
+            if let [only] = rows.as_slice() {
+                this.row_chosen(only);
             }
         });
         let weak = Rc::downgrade(&this);
-        listbox.connect_row_activated(move |_, row| {
-            if let Some(this) = weak.upgrade() {
+        listbox.connect_row_activated(move |lb, row| {
+            if let Some(this) = weak.upgrade()
+                && lb.selected_rows().len() <= 1
+            {
                 this.row_chosen(row);
             }
         });
@@ -380,6 +503,66 @@ impl ConversationList {
         if let Some(f) = handler {
             f(e);
         }
+    }
+
+    fn thread_of(&self, row: &gtk::ListBoxRow) -> Option<i64> {
+        let st = self.state.try_borrow().ok()?;
+        usize::try_from(row.index()).ok().and_then(|i| st.order.get(i).copied())
+    }
+
+    /// The selected chats, in list order.
+    pub fn selected_threads(&self) -> Vec<i64> {
+        let mut rows = self.listbox.selected_rows();
+        rows.sort_by_key(|r| r.index());
+        rows.iter().filter_map(|r| self.thread_of(r)).collect()
+    }
+
+    fn update_selection_bar(&self, count: usize) {
+        self.selection_label.set_label(&format!("{count} selected"));
+        self.selection_bar.set_revealed(count > 1);
+    }
+
+    fn select_only(&self, row: &gtk::ListBoxRow) {
+        if let Ok(mut st) = self.state.try_borrow_mut() {
+            st.rebuilding = true;
+        }
+        self.listbox.unselect_all();
+        if let Ok(mut st) = self.state.try_borrow_mut() {
+            st.rebuilding = false;
+        }
+        self.listbox.select_row(Some(row));
+    }
+
+    /// Back to one selected chat: the open one.
+    fn collapse_selection(&self) {
+        let open = self.state.borrow().last_emitted;
+        self.listbox.unselect_all();
+        self.update_selection_bar(0);
+        if let Some(tid) = open {
+            self.select_thread(tid);
+        }
+    }
+
+    fn many_menu(self: &Rc<Self>, thread_ids: Vec<i64>, x: f64, y: f64) {
+        let popover = gtk::Popover::new();
+        popover.set_parent(&self.listbox);
+        popover.set_pointing_to(Some(&gtk::gdk::Rectangle::new(x as i32, y as i32, 1, 1)));
+        let delete = gtk::Button::with_label(&format!("Delete {} conversations", thread_ids.len()));
+        delete.add_css_class("flat");
+        delete.add_css_class("destructive-action");
+        popover.set_child(Some(&delete));
+        let (weak, pop) = (Rc::downgrade(self), popover.clone());
+        delete.connect_clicked(move |_| {
+            pop.popdown();
+            if let Some(this) = weak.upgrade() {
+                this.emit(ListEvent::DeleteMany { thread_ids: thread_ids.clone() });
+            }
+        });
+        popover.connect_closed(|p| {
+            let p = p.clone();
+            glib::idle_add_local_once(move || p.unparent());
+        });
+        popover.popup();
     }
 
     fn row_menu(self: &Rc<Self>, row: &gtk::ListBoxRow, thread_id: i64, x: f64, y: f64) {
@@ -488,9 +671,12 @@ impl ConversationList {
         let mut guard = self.state.borrow_mut();
         let st = &mut *guard;
         st.rebuilding = true;
-        let selected = self.listbox.selected_row().and_then(|r| {
-            usize::try_from(r.index()).ok().and_then(|i| st.order.get(i).copied())
-        });
+        let selected: Vec<i64> = self
+            .listbox
+            .selected_rows()
+            .iter()
+            .filter_map(|r| usize::try_from(r.index()).ok().and_then(|i| st.order.get(i).copied()))
+            .collect();
 
         // Drop rows that went away.
         let wanted: std::collections::HashSet<i64> = convs.iter().map(|c| c.thread_id).collect();
@@ -553,12 +739,14 @@ impl ConversationList {
             pos += 1;
         }
 
-        // Keep the selection on the same conversation after moves.
-        if let Some(tid) = selected
-            && let Some(row) = st.rows.get(&tid)
-            && self.listbox.selected_row().as_ref() != Some(&row.row)
-        {
-            self.listbox.select_row(Some(&row.row));
+        // Keep the selection on the same conversations after moves (a
+        // moved row loses it).
+        for tid in &selected {
+            if let Some(row) = st.rows.get(tid)
+                && !row.row.is_selected()
+            {
+                self.listbox.select_row(Some(&row.row));
+            }
         }
         st.rebuilding = false;
         let searching = !st.search.is_empty();
@@ -573,11 +761,18 @@ impl ConversationList {
     pub fn select_thread(&self, thread_id: i64) {
         let row = self.state.borrow().rows.get(&thread_id).map(|r| r.row.clone());
         if let Some(row) = row {
+            // During a multi-selection the open chat is one of them already.
+            if row.is_selected() {
+                return;
+            }
             self.state.borrow_mut().rebuilding = true;
+            self.listbox.unselect_all();
             self.listbox.select_row(Some(&row));
             let mut st = self.state.borrow_mut();
             st.rebuilding = false;
             st.last_emitted = Some(thread_id);
+            drop(st);
+            self.update_selection_bar(1);
         }
     }
 }

@@ -658,6 +658,8 @@ struct State {
     earlier: Option<gtk::Button>,
     pinned: bool,
     revealing: bool,
+    /// A scroll correction is waiting for the next frame.
+    scroll_fix_queued: bool,
     /// Bumped on every rebuild, so a stale batch of older bubbles stops.
     generation: u64,
     /// While older bubbles are added above: the scroll distance from the
@@ -917,14 +919,9 @@ impl ThreadView {
             }
         });
         let weak = Rc::downgrade(&this);
-        adj.connect_changed(move |a| {
-            let Some(this) = weak.upgrade() else { return };
-            let Ok(st) = this.state.try_borrow() else { return };
-            if let Some(from_bottom) = st.anchor_from_bottom {
-                // Older bubbles going in above: keep what is on screen still.
-                a.set_value(a.upper() - from_bottom);
-            } else if st.pinned {
-                a.set_value(a.upper() - a.page_size());
+        adj.connect_changed(move |_| {
+            if let Some(this) = weak.upgrade() {
+                this.queue_scroll_fix();
             }
         });
         this
@@ -1042,6 +1039,40 @@ impl ThreadView {
         }
         self.preview_picture.set_filename(None::<&Path>);
         self.preview_bar.set_visible(false);
+    }
+
+    /// The content grew (older bubbles above, a picture sized in): put the
+    /// view back where it belongs at the start of the next frame. Setting the
+    /// value right in the adjustment's `changed` signal happens during the
+    /// layout pass, too late for the viewport: the scroll bar moved but the
+    /// content stayed put until the next scroll (Ethan, 2026-11-06).
+    fn queue_scroll_fix(self: &Rc<Self>) {
+        {
+            let Ok(mut st) = self.state.try_borrow_mut() else { return };
+            if st.scroll_fix_queued || (st.anchor_from_bottom.is_none() && !st.pinned) {
+                return;
+            }
+            st.scroll_fix_queued = true;
+        }
+        let weak = Rc::downgrade(self);
+        self.scroll.add_tick_callback(move |widget, _| {
+            let Some(this) = weak.upgrade() else { return glib::ControlFlow::Break };
+            let target = {
+                let Ok(mut st) = this.state.try_borrow_mut() else { return glib::ControlFlow::Continue };
+                st.scroll_fix_queued = false;
+                let a = widget.vadjustment();
+                match st.anchor_from_bottom {
+                    // Older bubbles going in above: keep what is on screen.
+                    Some(from_bottom) => Some(a.upper() - from_bottom),
+                    None if st.pinned => Some(a.upper() - a.page_size()),
+                    None => None,
+                }
+            };
+            if let Some(v) = target {
+                widget.vadjustment().set_value(v);
+            }
+            glib::ControlFlow::Break
+        });
     }
 
     pub fn show_empty(&self) {
@@ -1181,11 +1212,21 @@ impl ThreadView {
             st.generation
         };
         if split > 0 {
-            self.build_older(Rc::new(shown), routes, split, generation);
+            // A fresh open stays transparent until every batch is in, then
+            // appears at the bottom: no frame shows the chat shifting.
+            self.scroll.set_opacity(0.0);
+            self.state.borrow_mut().pinned = true;
+            self.build_older(Rc::new(shown), routes, split, generation, !keep_scroll);
         }
         self.widget.set_visible_child_name("thread");
         if !keep_scroll {
-            super::perf::built();
+            // With batches still to come, they reveal it when done.
+            if split == 0 {
+                super::perf::built();
+                self.reveal_at_bottom();
+            }
+        } else if self.scroll.opacity() == 0.0 && !self.state.borrow().revealing {
+            // A rebuild cut short a fresh open's batches: show it now.
             self.reveal_at_bottom();
         } else if was_pinned {
             self.state.borrow_mut().pinned = true;
@@ -1202,6 +1243,7 @@ impl ThreadView {
         routes: std::collections::HashMap<i64, SendRoute>,
         upto: usize,
         generation: u64,
+        reveal_when_done: bool,
     ) {
         let weak = Rc::downgrade(self);
         let remaining = Cell::new(upto);
@@ -1242,6 +1284,10 @@ impl ThreadView {
             remaining.set(j);
             if j > 0 {
                 return glib::ControlFlow::Continue;
+            }
+            if reveal_when_done {
+                super::perf::built();
+                this.reveal_at_bottom();
             }
             // Let the last batch be laid out before letting go of the anchor.
             let weak = Rc::downgrade(&this);

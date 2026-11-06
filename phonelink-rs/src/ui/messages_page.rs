@@ -545,7 +545,8 @@ impl MessagesPage {
                 self.run(effects);
             }
             ListEvent::Rename { thread_id, address } => self.rename_dialog(thread_id, address),
-            ListEvent::Delete { thread_id } => self.delete_dialog(thread_id),
+            ListEvent::Delete { thread_id } => self.delete_dialog(vec![thread_id]),
+            ListEvent::DeleteMany { thread_ids } => self.delete_dialog(thread_ids),
             ListEvent::ImportContacts => self.import_dialog(),
         }
     }
@@ -602,29 +603,41 @@ impl MessagesPage {
         dialog.present();
     }
 
-    fn delete_dialog(self: &Rc<Self>, thread_id: i64) {
+    /// Confirm, then delete one or several chats (here, and on the phone
+    /// when the daemon can).
+    fn delete_dialog(self: &Rc<Self>, thread_ids: Vec<i64>) {
+        if thread_ids.is_empty() {
+            return;
+        }
         let this = self.clone();
         let client = self.inner.borrow().client.clone();
         glib::spawn_future_local(async move {
             let device = this.inner.borrow().m.device_id().map(str::to_string);
+            let any_real = thread_ids.iter().any(|t| *t >= 0);
             let can_delete_on_phone = match (&client, &device) {
-                (Some(c), Some(d)) if thread_id >= 0 => c.supports_conversation_deletion(d).await,
+                (Some(c), Some(d)) if any_real => c.supports_conversation_deletion(d).await,
                 _ => false,
             };
-            let name = {
+            let (heading, mut body) = if let [thread_id] = thread_ids.as_slice() {
                 let i = this.inner.borrow();
-                i.m.index
-                    .get(thread_id)
+                let name = i.m.index
+                    .get(*thread_id)
                     .map(|c| if c.display_name.is_empty() { c.address.clone() } else { c.display_name.clone() })
-                    .unwrap_or_else(|| format!("Thread {thread_id}"))
-            };
-            let mut body = format!("Remove the conversation with {name} from Phone Link?");
-            body.push_str(if can_delete_on_phone {
-                "\n\nPhone Link will also ask your phone to delete it there."
+                    .unwrap_or_else(|| format!("Thread {thread_id}"));
+                ("Delete Conversation".to_string(), format!("Remove the conversation with {name} from Phone Link?"))
             } else {
-                "\n\nYour current KDE Connect build does not expose remote SMS deletion, so this will remove it only from Phone Link."
+                let n = thread_ids.len();
+                (format!("Delete {n} Conversations"), format!("Remove these {n} conversations from Phone Link?"))
+            };
+            body.push_str(if can_delete_on_phone {
+                "\n\nPhone Link will also ask your phone to delete them there."
+            } else {
+                "\n\nYour current KDE Connect build does not expose remote SMS deletion, so this will remove them only from Phone Link."
             });
-            let dialog = adw::MessageDialog::new(this.parent_window().as_ref(), Some("Delete Conversation"), Some(&body));
+            if thread_ids.len() == 1 {
+                body = body.replace("delete them there", "delete it there").replace("remove them only", "remove it only");
+            }
+            let dialog = adw::MessageDialog::new(this.parent_window().as_ref(), Some(&heading), Some(&body));
             dialog.add_responses(&[("cancel", "Cancel"), ("delete", "Delete")]);
             dialog.set_response_appearance("delete", adw::ResponseAppearance::Destructive);
             let weak = Rc::downgrade(&this);
@@ -637,7 +650,15 @@ impl MessagesPage {
                 let effects = {
                     let mut guard = this.inner.borrow_mut();
                     let i = &mut *guard;
-                    let mut effects = i.m.delete(thread_id, can_delete_on_phone, &i.store, &mut *i.settings.borrow_mut(), now_ms);
+                    let mut effects = Vec::new();
+                    i.store.batch(|store| {
+                        for &tid in &thread_ids {
+                            effects.extend(i.m.delete(tid, can_delete_on_phone, store, &mut *i.settings.borrow_mut(), now_ms));
+                        }
+                    });
+                    // One "only from Phone Link" note, not one per chat.
+                    let mut toasted = false;
+                    effects.retain(|e| !matches!(e, Effect::Toast(_)) || !std::mem::replace(&mut toasted, true));
                     effects.push(Effect::ShowEmpty);
                     effects
                 };
