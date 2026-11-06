@@ -280,9 +280,13 @@ Branch `rust-phase4` (worktree), merged into `rust-port` when done.
 - [x] Settings panel (`ui/settings_page.rs`): General, Google Contacts,
   Appearance ("Color Scheme"), Notifications (on/off, hidden apps), Back.
   Same `settings.json` keys. Notification changes re-filter the sidebar.
-- [ ] Autostart: "Open on Login" is shown but disabled until the Phase 7
-  switch-over (`settings_page::AUTOSTART_WIRED`), so a test run can't take
-  the autostart entry from the Python app.
+- [x] Autostart (Phase 7, Ethan, 2026-11-06): `AUTOSTART_WIRED` is on.
+  At startup the app rewrites any existing login entry (its own, or the
+  Python `dev.phonelink.app.desktop`) to start
+  `~/.local/bin/phonelink-rs`, or the running binary if that isn't
+  installed, and removes the Python one. Starting the Python app by hand
+  later may recreate its own entry, because it reads the same
+  `open_on_startup` key. Delete that entry if both start at login.
 - [x] Google Contacts (`core/google.rs`, tested with a fake HTTP client and a
   real loopback sign-in round trip): same client config (env or
   `~/.config/phonelink/google_oauth.json`) and the same token file in
@@ -316,7 +320,8 @@ Branch `rust-phase4` (worktree), merged into `rust-port` when done.
 Status 2026-11-06: phases 0–6 done and on `rust-port`. Phase 3 was signed
 off by Ethan after three laptop speed runs: chat build 1–3 ms, at most one
 20–50 ms stall per chat open (GTK layout; Ethan: "feels fine"), and memory
-as in "Memory" above. Phase 7 (switching autostart) still needs his OK.
+as in "Memory" above. Phase 7: Ethan switched autostart to the Rust app and
+made `rust-port` the GitHub `main` branch on 2026-11-06.
 0. This note. 1. Core with ported tests. 2. D-Bus client + read-only
 `phonelink-rs --dump`. 3. Messages tab. 4. Notifications, clipboard,
 header/battery, ring, share. 5. Files tab. 6. Tray, settings, autostart,

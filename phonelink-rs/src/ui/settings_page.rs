@@ -12,9 +12,18 @@ use super::icons;
 use crate::core::google;
 use crate::core::settings::Settings;
 
-/// Until the switch-over (Phase 7) the Python app owns the autostart entry;
-/// this build must not replace it.
-pub const AUTOSTART_WIRED: bool = false;
+/// Phase 7 switch-over (Ethan, 2026-11-06): this app owns the autostart
+/// entry and replaces the Python one.
+pub const AUTOSTART_WIRED: bool = true;
+
+/// The Exec for the autostart entry: the installed binary
+/// (`data/install-rust.sh` puts it in ~/.local/bin) when there is one, else
+/// whatever is running, so a test copy elsewhere doesn't get pinned.
+pub fn autostart_exec() -> String {
+    let installed = crate::core::settings::home_dir().join(".local/bin/phonelink-rs");
+    let path = if installed.is_file() { Some(installed) } else { std::env::current_exe().ok() };
+    path.map(|p| p.to_string_lossy().into_owned()).unwrap_or_default()
+}
 
 pub fn apply_color_scheme(scheme: &str) {
     let scheme = match scheme {
@@ -233,11 +242,10 @@ impl SettingsPage {
         }
         let s = settings.clone();
         open_on_login.connect_active_notify(move |r| {
-            if AUTOSTART_WIRED {
-                let exec = std::env::current_exe().map(|p| p.to_string_lossy().into_owned()).unwrap_or_default();
-                if let Err(e) = s.borrow_mut().set_open_on_startup(r.is_active(), &exec) {
-                    log::warn!("autostart: {e}");
-                }
+            if AUTOSTART_WIRED
+                && let Err(e) = s.borrow_mut().set_open_on_startup(r.is_active(), &autostart_exec())
+            {
+                log::warn!("autostart: {e}");
             }
         });
         let s = settings.clone();

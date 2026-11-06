@@ -1,6 +1,13 @@
 # Phone Link for Linux
 
-A desktop app that brings your Android phone's messages, notifications, and files to your Linux desktop — similar to Microsoft's Phone Link on Windows. Built with Python, GTK4, and Libadwaita, it uses [KDE Connect](https://kdeconnect.kde.org/) as the communication backend.
+A desktop app that brings your Android phone's messages, notifications, and files to your Linux desktop — similar to Microsoft's Phone Link on Windows. Built with GTK4 and Libadwaita, it uses [KDE Connect](https://kdeconnect.kde.org/) as the communication backend.
+
+> **New: Phone Link is now written in Rust** (`phonelink-rs/`). It does
+> everything the Python version does, with the same look, about 40% less
+> memory, and a single binary. It reads the same messages, contacts and
+> settings as the Python version, so you can switch either way. The Python version
+> (`phonelink/`, `run.py`) stays in the repository for now. See
+> [The Rust version](#the-rust-version) below.
 
 ![Python](https://img.shields.io/badge/python-3.8+-blue)
 ![GTK](https://img.shields.io/badge/GTK-4-green)
@@ -41,6 +48,34 @@ A desktop app that brings your Android phone's messages, notifications, and file
 | Python | 3.12 |
 
 ---
+
+## The Rust version
+
+Needs GTK 4.10+ and libadwaita 1.4+ (the app checks at startup and says so
+if they are older), KDE Connect, and a Rust toolchain (1.98+) to build.
+
+```bash
+# Fedora
+sudo dnf install kdeconnect gtk4-devel libadwaita-devel gcc
+# Debian / Ubuntu / Mint
+sudo apt install kdeconnect libgtk-4-dev libadwaita-1-dev build-essential
+
+git clone https://github.com/wardethan2000-eng/phonelink.git
+cd phonelink
+cargo build --release
+data/install-rust.sh target/release/phonelink-rs   # ~/.local/bin + menu entry
+phonelink-rs
+```
+
+Turn on **Settings → Open on Login** to start it at login; this replaces
+the Python version's login entry. Quit the Python version before starting
+the Rust one: both use the same message store, so only one may run at a
+time, and the Rust app refuses to start while the Python one is open.
+
+Google Contacts import needs a Google OAuth client, set up the same way as for
+the Python version (see below). Everything else works without one.
+
+The rest of this README describes the Python version.
 
 ## Installation
 

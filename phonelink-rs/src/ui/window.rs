@@ -108,6 +108,13 @@ impl Window {
         let mut settings = Settings::new();
         settings.load();
         settings_page::apply_color_scheme(settings.color_scheme());
+        // Phase 7: this app owns "Open on Login". If either app's entry is
+        // there, point it at this binary and drop the Python one.
+        if super::settings_page::AUTOSTART_WIRED
+            && let Err(e) = settings.sync_autostart_state(&super::settings_page::autostart_exec())
+        {
+            log::warn!("autostart: {e}");
+        }
         let settings = Rc::new(RefCell::new(settings));
 
         let window = adw::ApplicationWindow::new(app);
