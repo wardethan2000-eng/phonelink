@@ -83,7 +83,7 @@ his browser tab every few seconds. Instead:
   for it.
 
 ## Messages tab when linked
-**Recommendation (Ethan to confirm): while Google Messages is linked and
+**Decided (Ethan, 2026-11-05): while Google Messages is linked and
 working, it is the only source for the Messages tab.** Google Messages
 already holds every SMS, MMS and RCS on the phone, so one source means:
 - no dedupe;
@@ -162,9 +162,18 @@ sessions), so it may not keep working. Try it later, not first.
 5. **Packaging:** build the helper on the build box
    (`scripts/remote-build.sh` gets a `gm` target), install both together.
 
-## Open questions for Ethan
-1. When linked, should Google Messages be the only source for the Messages
-   tab (recommended), or only for RCS threads?
-2. Is it OK that Chromium is needed for linking?
-3. Keep the helper in this repo (an AGPL folder in an MIT repo), or give it
-   its own repo `phonelink-gm`? Recommendation: this repo, for now.
+## Decisions (Ethan, 2026-11-05)
+1. When linked, Google Messages is the only source for the Messages tab:
+   **yes**.
+2. Chromium needed for linking: **probably**. Size answer below. Any
+   Chromium-based browser works (Chrome, Chromium, Brave, Edge, Vivaldi),
+   because the helper drives it over the DevTools protocol. Firefox users
+   get the manual cURL route.
+3. The helper lives in this repo as an AGPL folder: **yes**.
+
+## Install size
+- Helper: one static Go binary, about 20-30 MB (estimate; gmcli, which also
+  bundles SQLite, is the upper bound). This is the only size the app adds.
+- Chromium is not part of the install. It is only needed on the machine
+  when linking, and when re-linking after about 14 days unused. On Fedora
+  it is roughly 350 MB if no Chromium-based browser is already there.
