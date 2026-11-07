@@ -102,6 +102,11 @@ const EXTRA_CSS: &str = "
 ";
 
 fn load_css() {
+    // No beeps: GTK's error bell sounds when a key does nothing (e.g. an
+    // arrow key at the end of the search text). Ethan: no noises at all.
+    if let Some(settings) = gtk::Settings::default() {
+        settings.set_gtk_error_bell(false);
+    }
     let provider = gtk::CssProvider::new();
     // The same stylesheet as the Python app, so both look identical.
     provider.load_from_data(include_str!("../../../phonelink/style.css"));
