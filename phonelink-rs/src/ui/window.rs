@@ -337,6 +337,28 @@ impl Window {
         tab_click.connect_pressed(move |_, _, _, _| leave());
         switcher.add_controller(tab_click);
         stack.connect_visible_child_notify(move |_| leave_settings());
+        // While Settings shows, no tab looks selected (the stack still has
+        // one, so a click on it comes back here) and the gear looks pressed.
+        {
+            let switcher = switcher.downgrade();
+            let gear = settings_btn.downgrade();
+            this.body.connect_visible_child_notify(move |b| {
+                let open = b.visible_child_name().as_deref() == Some("settings");
+                let mark = |w: &gtk::Widget, class: &str| {
+                    if open {
+                        w.add_css_class(class);
+                    } else {
+                        w.remove_css_class(class);
+                    }
+                };
+                if let Some(s) = switcher.upgrade() {
+                    mark(s.upcast_ref(), "in-settings");
+                }
+                if let Some(g) = gear.upgrade() {
+                    mark(g.upcast_ref(), "settings-open");
+                }
+            });
+        }
         let weak = Rc::downgrade(&this);
         this.header.device_list.connect_row_activated(move |_, row| {
             if let Some(this) = weak.upgrade() {
