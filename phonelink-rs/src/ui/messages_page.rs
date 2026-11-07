@@ -34,6 +34,11 @@ use crate::dbus::{
     variant,
 };
 
+/// Google Messages chats/messages merged per idle callback.
+const GM_BATCH_SIZE: usize = 60;
+/// Messages fetched when a chat is opened.
+const GM_FETCH_COUNT: u32 = 50;
+
 fn epoch_now() -> f64 {
     std::time::SystemTime::now().duration_since(std::time::UNIX_EPOCH).map_or(0.0, |d| d.as_secs_f64())
 }
@@ -99,6 +104,19 @@ struct Inner {
     /// Threads we just asked the daemon to replay (their conversationLoaded
     /// is ours, not news), with when.
     recent_requests: std::collections::HashMap<i64, f64>,
+    /// The KDE Connect device (contacts, calls, notifications, and the
+    /// Messages tab unless Google Messages is its source).
+    kde_device: Option<Device>,
+    /// Google Messages chats and messages waiting to be merged, a batch
+    /// per idle callback (about 240 chats arrive at connect).
+    gm_queue: VecDeque<crate::core::gm::Incoming>,
+    gm_draining: bool,
+}
+
+impl Inner {
+    fn kde_device_id(&self) -> Option<String> {
+        self.kde_device.as_ref().map(|d| d.id.clone())
+    }
 }
 
 pub struct MessagesPage {
@@ -109,6 +127,9 @@ pub struct MessagesPage {
     thread: Rc<ThreadView>,
     /// "Your phone is hiding some texts" (rule 1).
     hidden_banner: adw::Banner,
+    /// The Google Messages link's trouble (reconnecting, another browser,
+    /// signed out).
+    gm_banner: adw::Banner,
     /// The window's notifications (one subscription for the whole app).
     notifications: Rc<NotificationsModel>,
     /// The window's toast overlay, once set; until then, the page's own.
@@ -141,7 +162,9 @@ impl MessagesPage {
             b.clipboard().set_text(crate::core::hidden_texts::FIX_COMMAND);
             b.set_title("Fix copied: run it in a terminal with the phone plugged in (adb)");
         });
+        let gm_banner = adw::Banner::new("");
         let column = gtk::Box::new(gtk::Orientation::Vertical, 0);
+        column.append(&gm_banner);
         column.append(&hidden_banner);
         column.append(&stack);
         let widget = adw::ToastOverlay::new();
@@ -185,6 +208,7 @@ impl MessagesPage {
             widget,
             stack,
             hidden_banner,
+            gm_banner,
             list,
             thread,
             notifications: notifications.clone(),
@@ -211,6 +235,9 @@ impl MessagesPage {
                 full_pumping: 0,
                 redraw_pending: None,
                 recent_requests: Default::default(),
+                kde_device: None,
+                gm_queue: VecDeque::new(),
+                gm_draining: false,
             }),
         });
         *download_target.borrow_mut() = Rc::downgrade(&this);
@@ -220,6 +247,19 @@ impl MessagesPage {
                 this.gm_event(e);
             }
         });
+        let weak = Rc::downgrade(&this);
+        this.gm_banner.connect_button_clicked(move |_| {
+            if let Some(this) = weak.upgrade() {
+                this.gm_banner_clicked();
+            }
+        });
+        // Linked before: show Google Messages' chats from the store at once
+        // instead of KDE Connect's until the link connects.
+        let cached = this.inner.borrow().store.meta("gm_device").filter(|d| !d.is_empty());
+        if let Some(dev) = cached.filter(|_| this.gm.borrow().is_some()) {
+            this.switch_to_gm(&dev);
+            this.show_gm_banner("Connecting to Google Messages…", None);
+        }
         let saved_scale = this.inner.borrow().settings.borrow().message_font_scale();
         let weak = Rc::downgrade(&this);
         this.thread.set_zoom(saved_scale, move |scale| {
@@ -273,6 +313,29 @@ impl MessagesPage {
     /// The active device changed (or its reachability did).
     pub fn set_device(self: &Rc<Self>, client: &Client, device: Option<&Device>) {
         let reachable = device.is_some_and(|d| d.reachable);
+        if self.inner.borrow().m.is_gm() {
+            // Chats come from Google Messages; KDE Connect keeps contacts,
+            // calls and notifications.
+            let (changed, back) = {
+                let mut i = self.inner.borrow_mut();
+                let changed = i.kde_device_id().as_deref() != device.map(|d| d.id.as_str());
+                let back = reachable && !std::mem::replace(&mut i.reachable_seen, reachable);
+                i.client = Some(client.clone());
+                i.kde_device = device.cloned();
+                (changed, back)
+            };
+            if changed {
+                let subs = device.map(|d| self.subscribe_contact_sources(client, &d.id)).unwrap_or_default();
+                self.inner.borrow_mut().subs = subs;
+            }
+            if changed || back {
+                self.reload_contacts();
+                if reachable {
+                    self.request_contact_sync();
+                }
+            }
+            return;
+        }
         let same = {
             let i = self.inner.borrow();
             i.m.device_id() == device.map(|d| d.id.as_str())
@@ -302,6 +365,7 @@ impl MessagesPage {
             let mut i = self.inner.borrow_mut();
             i.subs.clear();
             i.queue.clear();
+            i.kde_device = None;
             i.m.reset_for_device(None, false);
             self.stack.set_visible_child_name("status");
             return;
@@ -312,6 +376,7 @@ impl MessagesPage {
             i.subs.clear();
             i.queue.clear();
             i.client = Some(client.clone());
+            i.kde_device = Some(dev.clone());
             i.m.reset_for_device(Some(&dev.id), reachable);
             i.m.contact_map = load_contact_map(&dev.id, i.store.load_contacts(), i.store.load_contact_overrides());
             self.list.set_contacts(i.m.contact_map.clone());
@@ -337,6 +402,9 @@ impl MessagesPage {
 
     /// The daemon's cached newest-message-per-thread list.
     fn load_active(self: &Rc<Self>) {
+        if self.inner.borrow().m.is_gm() {
+            return;
+        }
         let weak = Rc::downgrade(self);
         self.with_device(move |client, id| async move {
             let entries = client.active_conversations(&id).await;
@@ -508,12 +576,24 @@ impl MessagesPage {
         for e in effects {
             match e {
                 Effect::RefreshList => refresh = true,
+                Effect::Sync(_) if self.inner.borrow().m.is_gm() => {}
                 Effect::Sync(action) => self.sync(action),
                 Effect::MarkRead { thread_id } => {
                     self.mark_read_on_google(thread_id);
-                    self.with_device(move |c, d| async move {
-                        c.mark_conversation_as_read(&d, thread_id).await;
-                    })
+                    if !self.inner.borrow().m.is_gm() {
+                        self.with_device(move |c, d| async move {
+                            c.mark_conversation_as_read(&d, thread_id).await;
+                        })
+                    }
+                }
+                Effect::GmSend { thread_id: _, conv, text, tmp_id } => self.gm_send(conv, text, tmp_id),
+                Effect::GmFetch { thread_id } => self.gm_fetch(thread_id),
+                Effect::GmSendNew { addresses, text } => self.gm_send_new(addresses, text),
+                Effect::Redraw(tid) => {
+                    let i = self.inner.borrow();
+                    if let Some(conv) = i.m.index.get(tid) {
+                        self.thread.redraw(conv, &|uid| i.m.route_of(uid));
+                    }
                 }
                 Effect::ShowThread(tid) => self.show_thread(tid),
                 Effect::ShowEmpty => self.thread.show_empty(),
@@ -594,7 +674,7 @@ impl MessagesPage {
         Fut: std::future::Future<Output = ()> + 'static,
     {
         let i = self.inner.borrow();
-        if let (Some(c), Some(d)) = (i.client.clone(), i.m.device_id().map(str::to_string)) {
+        if let (Some(c), Some(d)) = (i.client.clone(), i.kde_device_id()) {
             glib::spawn_future_local(f(c, d));
         }
     }
@@ -685,6 +765,10 @@ impl MessagesPage {
     /// Delete chats on the phone: KDE Connect when the daemon can, else
     /// Google Messages.
     fn delete_on_phone(self: &Rc<Self>, chats: Vec<(i64, Vec<String>)>) {
+        if self.inner.borrow().m.is_gm() {
+            self.delete_on_google(chats);
+            return;
+        }
         let this = self.clone();
         glib::spawn_future_local(async move {
             let (client, device) = {
@@ -707,17 +791,274 @@ impl MessagesPage {
 
     fn gm_event(self: &Rc<Self>, e: crate::core::gm::Incoming) {
         use crate::core::gm::Incoming;
-        if let Incoming::Ready { me } = e {
-            self.inner.borrow_mut().m.gm_me = me;
-            return;
+        let gm_source = self.inner.borrow().m.is_gm();
+        match e {
+            Incoming::Ready { me } => {
+                self.inner.borrow_mut().m.gm_me = me.clone();
+                self.gm_banner.set_revealed(false);
+                // Linked: Google Messages becomes the tab's source.
+                let Some(dev) = crate::core::gm::device_id(&me) else { return };
+                if self.inner.borrow().m.device_id() != Some(dev.as_str()) {
+                    self.switch_to_gm(&dev);
+                }
+                self.inner.borrow_mut().m.set_reachable(true);
+            }
+            e @ (Incoming::Conversation(_) | Incoming::Message(_)) if gm_source => self.gm_enqueue(e),
+            Incoming::Conversation(c) => {
+                // KDE Connect is the source: only read state comes from here.
+                if c.unread {
+                    self.phone_read.borrow_mut().remove(&c.chat);
+                    return;
+                }
+                self.phone_read.borrow_mut().insert(c.chat, c.last_ts_ms);
+                self.apply_phone_read();
+            }
+            Incoming::Message(_) | Incoming::Reply(_) => {}
+            Incoming::Inactive => {
+                if gm_source {
+                    self.show_gm_banner("Google Messages is open in another browser", Some("Use here"));
+                }
+            }
+            Incoming::Phone { responding } => {
+                if !gm_source {
+                } else if responding {
+                    self.gm_banner.set_revealed(false);
+                } else {
+                    self.show_gm_banner("Your phone isn't answering Google Messages. Is it online?", None);
+                }
+            }
+            Incoming::Fatal { kind, message: _ } => {
+                if kind == "logged_out" {
+                    self.switch_to_kde();
+                    self.show_gm_banner("Google Messages signed out. Showing texts from KDE Connect.", None);
+                } else if gm_source {
+                    self.show_gm_banner("Reconnecting to Google Messages…", None);
+                }
+            }
         }
-        let Incoming::Conversation { chat, unread, last_ts_ms } = e else { return };
-        if unread {
-            self.phone_read.borrow_mut().remove(&chat);
-            return;
+    }
+
+    fn show_gm_banner(&self, title: &str, button: Option<&str>) {
+        self.gm_banner.set_title(title);
+        self.gm_banner.set_button_label(button);
+        self.gm_banner.set_revealed(true);
+    }
+
+    fn gm_banner_clicked(self: &Rc<Self>) {
+        let Some(gm) = self.gm.borrow().clone() else { return };
+        let weak = Rc::downgrade(self);
+        gm.request(crate::core::gm::set_active_request, move |r| {
+            let Some(this) = weak.upgrade() else { return };
+            if r.ok {
+                this.gm_banner.set_revealed(false);
+            } else {
+                log::warn!("Google Messages: taking the session back failed: {} {}", r.error, r.message);
+                this.toast("Couldn't take Google Messages back from the other browser");
+            }
+        });
+    }
+
+    /// Make Google Messages the tab's source (`dev` is its `gm:` device).
+    fn switch_to_gm(self: &Rc<Self>, dev: &str) {
+        log::info!("Messages: Google Messages is the source");
+        let effects = {
+            let mut guard = self.inner.borrow_mut();
+            let i = &mut *guard;
+            // KDE Connect's conversation signals go; its contacts and calls stay.
+            i.subs.clear();
+            i.queue.clear();
+            i.gm_queue.clear();
+            if let (Some(c), Some(d)) = (i.client.clone(), i.kde_device_id()) {
+                i.subs = self.subscribe_contact_sources(&c, &d);
+            }
+            if let Some(id) = i.timer.take() {
+                id.remove();
+            }
+            let me = std::mem::take(&mut i.m.gm_me);
+            i.m.reset_for_device(Some(dev), true);
+            i.m.gm_me = me;
+            let names_from = i.kde_device_id().unwrap_or_default();
+            i.m.contact_map = load_contact_map(&names_from, i.store.load_contacts(), i.store.load_contact_overrides());
+            self.list.set_contacts(i.m.contact_map.clone());
+            i.store.set_meta("gm_device", dev);
+            let mut effects = i.m.load_cached(&i.store);
+            effects.push(Effect::RefreshList);
+            effects
+        };
+        self.hidden_banner.set_revealed(false);
+        self.thread.show_empty();
+        self.stack.set_visible_child_name("content");
+        self.run(effects);
+    }
+
+    /// Google Messages is gone (signed out): back to KDE Connect.
+    fn switch_to_kde(self: &Rc<Self>) {
+        let (client, device) = {
+            let mut guard = self.inner.borrow_mut();
+            let i = &mut *guard;
+            if !i.m.is_gm() {
+                return;
+            }
+            log::info!("Messages: back to KDE Connect");
+            i.store.set_meta("gm_device", "");
+            i.gm_queue.clear();
+            i.m.reset_for_device(None, false);
+            (i.client.clone(), i.kde_device.clone())
+        };
+        self.thread.show_empty();
+        if let Some(client) = client {
+            self.set_device(&client, device.as_ref());
+        } else {
+            self.stack.set_visible_child_name("status");
         }
-        self.phone_read.borrow_mut().insert(chat, last_ts_ms);
-        self.apply_phone_read();
+    }
+
+    fn gm_enqueue(self: &Rc<Self>, e: crate::core::gm::Incoming) {
+        let start = {
+            let mut i = self.inner.borrow_mut();
+            i.gm_queue.push_back(e);
+            !std::mem::replace(&mut i.gm_draining, true)
+        };
+        if start {
+            let weak = Rc::downgrade(self);
+            glib::idle_add_local(move || match weak.upgrade() {
+                Some(this) => this.drain_gm(),
+                None => glib::ControlFlow::Break,
+            });
+        }
+    }
+
+    /// Merge a batch of Google Messages chats and messages in one store
+    /// transaction.
+    fn drain_gm(self: &Rc<Self>) -> glib::ControlFlow {
+        use crate::core::gm::Incoming;
+        let (effects, more) = {
+            let mut guard = self.inner.borrow_mut();
+            let i = &mut *guard;
+            let n = i.gm_queue.len().min(GM_BATCH_SIZE);
+            let batch: Vec<Incoming> = i.gm_queue.drain(..n).collect();
+            let mut settings = i.settings.borrow_mut();
+            let (m, settings) = (&mut i.m, &mut *settings);
+            let t = now();
+            let _t = super::perf::span("merging Google Messages");
+            let effects = i.store.batch(|store| {
+                let mut effects = Vec::new();
+                for e in &batch {
+                    match e {
+                        Incoming::Conversation(c) => {
+                            let tid = store.gm_local_id("conv", &c.conv);
+                            effects.extend(m.gm_conversation(c, tid, store, settings));
+                        }
+                        Incoming::Message(msg) => {
+                            let tid = store.gm_local_id("conv", &msg.conv);
+                            let uid = store.gm_local_id("msg", &msg.msg);
+                            effects.extend(m.gm_message(msg, tid, uid, store, settings, t));
+                        }
+                        _ => {}
+                    }
+                }
+                effects
+            });
+            let more = !i.gm_queue.is_empty();
+            if !more {
+                i.gm_draining = false;
+            }
+            let mut effects = effects;
+            if !batch.is_empty() {
+                effects.push(Effect::RefreshList);
+            }
+            // Many updates to one open chat redraw it once.
+            let mut shown = std::collections::HashSet::new();
+            effects.retain(|e| match e {
+                Effect::ShowThread(t) | Effect::Redraw(t) => shown.insert((matches!(e, Effect::Redraw(_)), *t)),
+                _ => true,
+            });
+            (effects, more)
+        };
+        self.run(effects);
+        if more { glib::ControlFlow::Continue } else { glib::ControlFlow::Break }
+    }
+
+    /// Send a text through Google Messages; its echo arrives as a message.
+    fn gm_send(self: &Rc<Self>, conv: String, text: String, tmp_id: String) {
+        let gm = self.gm.borrow().clone();
+        let weak = Rc::downgrade(self);
+        let tmp = tmp_id.clone();
+        let sent = gm.is_some_and(|gm| {
+            gm.request(
+                |id| crate::core::gm::send_text_request(id, &conv, &text, &tmp_id),
+                move |r| {
+                    let Some(this) = weak.upgrade() else { return };
+                    if r.ok {
+                        return;
+                    }
+                    log::warn!("Google Messages send failed: {} {}", r.error, r.message);
+                    let effects = this.inner.borrow_mut().m.gm_send_failed(&tmp);
+                    this.run(effects);
+                },
+            )
+        });
+        if !sent {
+            let effects = self.inner.borrow_mut().m.gm_send_failed(&tmp_id);
+            self.run(effects);
+        }
+    }
+
+    /// A text to a new chat: have the phone find or make it, then send.
+    fn gm_send_new(self: &Rc<Self>, addresses: Vec<String>, text: String) {
+        let gm = self.gm.borrow().clone();
+        let weak = Rc::downgrade(self);
+        let sent = gm.is_some_and(|gm| {
+            gm.request(
+                |id| crate::core::gm::open_conversation_request(id, &addresses),
+                move |r| {
+                    let Some(this) = weak.upgrade() else { return };
+                    if !r.ok || r.conv.is_empty() {
+                        log::warn!("Google Messages: couldn't open the chat: {} {}", r.error, r.message);
+                        this.toast(crate::core::messages::TOAST_GM_NOT_SENT);
+                        return;
+                    }
+                    // The chat's conversation event came first; let it merge.
+                    let weak = Rc::downgrade(&this);
+                    glib::idle_add_local_once(move || {
+                        let Some(this) = weak.upgrade() else { return };
+                        let effects = {
+                            let mut guard = this.inner.borrow_mut();
+                            let i = &mut *guard;
+                            let tid = i.store.gm_local_id("conv", &r.conv);
+                            i.m.gm_opened(tid, &r.conv, &text)
+                        };
+                        this.run(effects);
+                    });
+                },
+            )
+        });
+        if !sent {
+            self.toast(crate::core::messages::TOAST_GM_NOT_SENT);
+        }
+    }
+
+    /// Fetch a chat's newest messages (each of its Google chats).
+    fn gm_fetch(self: &Rc<Self>, thread_id: i64) {
+        let Some(gm) = self.gm.borrow().clone() else { return };
+        let convs = self.inner.borrow().m.gm_convs(thread_id);
+        for conv in convs {
+            let weak = Rc::downgrade(self);
+            gm.request(
+                |id| crate::core::gm::fetch_request(id, &conv, GM_FETCH_COUNT, None),
+                move |r| {
+                    let Some(this) = weak.upgrade() else { return };
+                    if !r.ok {
+                        log::info!("Google Messages fetch: {} {}", r.error, r.message);
+                        return;
+                    }
+                    for mut m in r.messages {
+                        m.old = true;
+                        this.gm_enqueue(crate::core::gm::Incoming::Message(m));
+                    }
+                },
+            );
+        }
     }
 
     /// Clear unread dots on chats read on the phone (once per idle, so the
@@ -746,6 +1087,20 @@ impl MessagesPage {
     /// Opened on the laptop: mark it read on the phone too.
     fn mark_read_on_google(&self, thread_id: i64) {
         let Some(gm) = self.gm.borrow().clone() else { return };
+        let convs = self.inner.borrow().m.gm_convs(thread_id);
+        if !convs.is_empty() {
+            for conv in convs {
+                gm.request(
+                    |id| crate::core::gm::mark_conv_read_request(id, &conv),
+                    |r| {
+                        if !r.ok {
+                            log::info!("mark read on the phone: {} {}", r.error, r.message);
+                        }
+                    },
+                );
+            }
+            return;
+        }
         let Some(key) = self.inner.borrow().m.gm_chat_key(thread_id) else { return };
         gm.request(
             |id| crate::core::gm::mark_read_request(id, &key),
@@ -818,10 +1173,11 @@ impl MessagesPage {
         let this = self.clone();
         let client = self.inner.borrow().client.clone();
         glib::spawn_future_local(async move {
-            let device = this.inner.borrow().m.device_id().map(str::to_string);
+            let device = this.inner.borrow().kde_device_id();
             let any_real = thread_ids.iter().any(|t| *t >= 0);
+            let gm_source = this.inner.borrow().m.is_gm();
             let kde_deletes = match (&client, &device) {
-                (Some(c), Some(d)) if any_real => c.supports_conversation_deletion(d).await,
+                (Some(c), Some(d)) if any_real && !gm_source => c.supports_conversation_deletion(d).await,
                 _ => false,
             };
             let google_deletes = any_real && !kde_deletes && crate::core::phone_delete::available();
@@ -1040,7 +1396,7 @@ impl MessagesPage {
         let effects = {
             let mut guard = self.inner.borrow_mut();
             let i = &mut *guard;
-            let Some(dev) = i.m.device_id().map(str::to_string) else { return };
+            let Some(dev) = i.kde_device_id().or_else(|| i.m.device_id().map(str::to_string)) else { return };
             i.m.contact_map = load_contact_map(&dev, i.store.load_contacts(), i.store.load_contact_overrides());
             i.m.refresh_names();
             let mut e = vec![Effect::RefreshList];
@@ -1062,7 +1418,7 @@ impl MessagesPage {
         let weak = Rc::downgrade(self);
         glib::timeout_add_seconds_local_once(8, move || {
             let Some(this) = weak.upgrade() else { return };
-            let Some(dev) = this.inner.borrow().m.device_id().map(str::to_string) else { return };
+            let Some(dev) = this.inner.borrow().kde_device_id() else { return };
             if crate::core::contacts::synced_vcard_count(&dev) > 0 || !this.inner.borrow_mut().contact_sync_warned.insert(dev) {
                 return;
             }
@@ -1199,7 +1555,9 @@ impl MessagesPage {
             }
         };
         self.run(effects);
-        if schedule {
+        // Google Messages hides nothing (the phone's restricted texts are a
+        // KDE Connect problem).
+        if schedule && !self.inner.borrow().m.is_gm() {
             self.schedule_hidden_check();
         }
     }
@@ -1212,6 +1570,9 @@ impl MessagesPage {
     /// Catch up on texts the phone never pushed (resume, window shown,
     /// reconnect), at most once per `min_interval` seconds.
     pub fn catch_up(self: &Rc<Self>, min_interval: f64) {
+        if self.inner.borrow().m.is_gm() {
+            return;
+        }
         self.inner.borrow_mut().m.catch_up.catch_up(now(), sync::CATCH_UP_DELAY_SECONDS, min_interval);
         self.reschedule();
     }
@@ -1258,6 +1619,10 @@ impl MessagesPage {
         // A few at a time: one by one was slow, 22 at once timed out the
         // daemon (laptop, 2026-11-06).
         const FULL_PICTURE_WORKERS: usize = 3;
+        // Google Messages pictures are fetched another way (not yet).
+        if self.inner.borrow().m.is_gm() {
+            return;
+        }
         let start = {
             let mut guard = self.inner.borrow_mut();
             let i = &mut *guard;

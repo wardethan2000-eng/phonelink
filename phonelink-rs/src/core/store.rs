@@ -66,6 +66,12 @@ CREATE TABLE IF NOT EXISTS meta (
     key   TEXT PRIMARY KEY,
     value TEXT
 );
+CREATE TABLE IF NOT EXISTS gm_ids (
+    kind     TEXT    NOT NULL,
+    gm_id    TEXT    NOT NULL,
+    local_id INTEGER NOT NULL,
+    PRIMARY KEY (kind, gm_id)
+);
 ";
 
 const UPSERT_CONVERSATION: &str = "
@@ -100,6 +106,8 @@ pub struct MessageStore {
     batch_depth: Cell<u32>,
     /// Number of commits issued (autocommit writes, transactions, batch ends).
     commits: Cell<u64>,
+    /// Google Messages ids already looked up (`gm_local_id`).
+    gm_cache: std::cell::RefCell<HashMap<(String, String), i64>>,
 }
 
 impl MessageStore {
@@ -115,7 +123,7 @@ impl MessageStore {
                 None
             }
         };
-        let store = Self { path, conn, batch_depth: Cell::new(0), commits: Cell::new(0) };
+        let store = Self { path, conn, batch_depth: Cell::new(0), commits: Cell::new(0), gm_cache: Default::default() };
         if store.conn.is_some() {
             store.migrate_contacts_json_logged();
         }
@@ -419,6 +427,67 @@ impl MessageStore {
                 "DELETE FROM messages WHERE device_id=? AND thread_id=?",
                 params![device_id, thread_id],
             )?;
+            Ok(())
+        });
+    }
+
+    // ── Google Messages ids (the Python app doesn't know this table) ──
+
+    /// The local number for one of Google Messages' string ids (`kind` is
+    /// "conv" or "msg"), allocated on first sight (1, 2, ...) and kept.
+    pub fn gm_local_id(&self, kind: &str, gm_id: &str) -> i64 {
+        let key = (kind.to_string(), gm_id.to_string());
+        if let Some(&id) = self.gm_cache.borrow().get(&key) {
+            return id;
+        }
+        let found = self.conn.as_ref().and_then(|c| {
+            c.query_row("SELECT local_id FROM gm_ids WHERE kind=? AND gm_id=?", params![kind, gm_id], |r| r.get::<_, i64>(0))
+                .optional()
+                .unwrap_or_else(|e| {
+                    log::warn!("store.gm_local_id failed: {e}");
+                    None
+                })
+        });
+        let id = match found {
+            Some(id) => id,
+            None => {
+                let in_db = self
+                    .conn
+                    .as_ref()
+                    .and_then(|c| c.query_row("SELECT MAX(local_id) FROM gm_ids WHERE kind=?", params![kind], |r| r.get::<_, Option<i64>>(0)).ok().flatten())
+                    .unwrap_or(0);
+                let in_memory = self.gm_cache.borrow().iter().filter(|((k, _), _)| k == kind).map(|(_, &v)| v).max().unwrap_or(0);
+                let id = in_db.max(in_memory) + 1;
+                self.write("gm_local_id", |c| {
+                    c.execute("INSERT OR REPLACE INTO gm_ids (kind, gm_id, local_id) VALUES (?, ?, ?)", params![kind, gm_id, id])?;
+                    Ok(())
+                });
+                id
+            }
+        };
+        self.gm_cache.borrow_mut().insert(key, id);
+        id
+    }
+
+    pub fn meta(&self, key: &str) -> Option<String> {
+        let conn = self.conn.as_ref()?;
+        conn.query_row("SELECT value FROM meta WHERE key=?", params![key], |r| r.get::<_, Option<String>>(0))
+            .optional()
+            .ok()
+            .flatten()
+            .flatten()
+    }
+
+    pub fn set_meta(&self, key: &str, value: &str) {
+        self.write("set_meta", |c| {
+            c.execute("INSERT OR REPLACE INTO meta (key, value) VALUES (?, ?)", params![key, value])?;
+            Ok(())
+        });
+    }
+
+    pub fn delete_message(&self, device_id: &str, uid: i64) {
+        self.write("delete_message", |c| {
+            c.execute("DELETE FROM messages WHERE device_id=? AND uid=?", params![device_id, uid])?;
             Ok(())
         });
     }
@@ -820,6 +889,28 @@ mod tests {
             thread_id,
             ..Default::default()
         }
+    }
+
+    #[test]
+    fn gm_ids_are_allocated_once_and_kept() {
+        let dir = std::env::temp_dir().join(format!("phonelink-gm-ids-{}", std::process::id()));
+        std::fs::create_dir_all(&dir).unwrap();
+        let path = dir.join("m.db");
+        {
+            let s = MessageStore::open(&path);
+            assert_eq!(s.gm_local_id("conv", "1"), 1);
+            assert_eq!(s.gm_local_id("conv", "77"), 2);
+            assert_eq!(s.gm_local_id("conv", "1"), 1);
+            // Kinds count separately.
+            assert_eq!(s.gm_local_id("msg", "1"), 1);
+            s.set_meta("gm_device", "gm:3165550000");
+        }
+        let s = MessageStore::open(&path);
+        assert_eq!(s.gm_local_id("conv", "77"), 2);
+        assert_eq!(s.gm_local_id("conv", "new"), 3);
+        assert_eq!(s.meta("gm_device").as_deref(), Some("gm:3165550000"));
+        assert_eq!(s.meta("missing"), None);
+        std::fs::remove_dir_all(&dir).ok();
     }
 
     // ── encoder matches Python json.dumps byte-for-byte ────────────

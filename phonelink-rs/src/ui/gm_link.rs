@@ -165,6 +165,7 @@ impl GmLink {
         for (id, done) in pending {
             done(Reply { id, message: "the Google Messages link stopped".into(), ..Default::default() });
         }
+        (self.on_event)(Incoming::Fatal { kind: "exited".into(), message: "the helper stopped".into() });
         self.schedule_restart();
     }
 

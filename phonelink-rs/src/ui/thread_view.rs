@@ -293,6 +293,8 @@ struct Bubble {
     /// The send route on its own, shown while the time is hidden.
     route_tag: Option<gtk::Label>,
     message: SmsMessage,
+    /// The route it was drawn with (a delivery change redraws it).
+    route: Option<SendRoute>,
 }
 
 impl Bubble {
@@ -376,7 +378,7 @@ impl Bubble {
         });
 
         let body = (!has_links && !msg.body.is_empty()).then_some(body);
-        let bubble = Rc::new(Self { widget, body, revealer, route_tag, message: msg.clone() });
+        let bubble = Rc::new(Self { widget, body, revealer, route_tag, message: msg.clone(), route });
         bubble.set_timestamp_visible(show_time);
         if !has_links {
             // Tap a bubble to show or hide its time.
@@ -420,7 +422,7 @@ impl Bubble {
         }
         widget.append(&line);
         let revealer = gtk::Revealer::new();
-        Rc::new(Self { widget, body: None, revealer, route_tag: None, message: msg.clone() })
+        Rc::new(Self { widget, body: None, revealer, route_tag: None, message: msg.clone(), route: None })
     }
 
     /// Outline the bubble and bold `needle` in its text (None clears).
@@ -1535,7 +1537,7 @@ impl ThreadView {
                 .filter_map(|(i, b)| {
                     conv.messages
                         .iter()
-                        .find(|m| m.uid == b.message.uid && m.attachments != b.message.attachments)
+                        .find(|m| m.uid == b.message.uid && (m.attachments != b.message.attachments || route(m.uid) != b.route))
                         .map(|m| (i, m.clone()))
                 })
                 .collect()

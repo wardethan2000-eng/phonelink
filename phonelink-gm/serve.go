@@ -15,6 +15,9 @@ package main
 //	                                                       -> ok when the phone took it; the message then
 //	                                                          arrives as a message event with this tmp_id
 //	{"id":6, "op":"set_active"}                            take the web session back from another browser
+//	{"id":7, "op":"open_conversation", "numbers":["+13165551234"]}
+//	                                                       -> "conv":ID of the chat with exactly them (made if new);
+//	                                                          its conversation event comes first
 //
 // Events have no id:
 //
@@ -67,6 +70,7 @@ type request struct {
 	Count      int64    `json:"count,omitempty"`
 	BeforeID   string   `json:"before_id,omitempty"`
 	BeforeTSms int64    `json:"before_ts_ms,omitempty"`
+	Numbers    []string `json:"numbers,omitempty"`
 }
 
 type cursor struct {
@@ -83,6 +87,7 @@ type reply struct {
 	Messages []msgEvent   `json:"messages,omitempty"`
 	Cursor   *cursor      `json:"cursor,omitempty"`
 	TmpID    string       `json:"tmp_id,omitempty"`
+	Conv     string       `json:"conv,omitempty"`
 }
 
 func failed(id int64, kind string, format string, a ...any) reply {
@@ -396,6 +401,28 @@ func serve(l *link, timeout time.Duration) int {
 				return failed(req.ID, "failed", "the phone answered %s", resp.GetStatus())
 			}
 			return reply{ID: req.ID, OK: true, TmpID: tmp}
+		case "open_conversation":
+			if len(req.Numbers) == 0 {
+				return failed(req.ID, "usage", "open_conversation needs numbers")
+			}
+			var nums []*gmproto.ContactNumber
+			for _, n := range req.Numbers {
+				// As the mautrix bridge starts chats.
+				nums = append(nums, &gmproto.ContactNumber{MysteriousInt: 2, Number: n, Number2: n})
+			}
+			resp, err := l.cli.GetOrCreateConversation(ctx, &gmproto.GetOrCreateConversationRequest{Numbers: nums})
+			if err != nil {
+				return failed(req.ID, "failed", "%v", err)
+			}
+			conv := resp.GetConversation()
+			if conv.GetConversationID() == "" {
+				return failed(req.ID, "failed", "the phone made no chat (%s)", resp.GetStatus())
+			}
+			state.set(conv)
+			if ev, ok := conversationEvent(conv); ok {
+				out.put(ev)
+			}
+			return reply{ID: req.ID, OK: true, Conv: conv.GetConversationID()}
 		case "set_active":
 			if err := takeBack(ctx); err != nil {
 				return failed(req.ID, "failed", "%v", err)

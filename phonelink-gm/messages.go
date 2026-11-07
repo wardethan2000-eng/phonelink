@@ -94,11 +94,24 @@ func members(conv *gmproto.Conversation) []member {
 }
 
 func conversationEvent(conv *gmproto.Conversation) (convEvent, bool) {
-	key := keySet(others(conv))
-	if key == "" || conv.GetStatus() == gmproto.ConversationStatus_DELETED {
+	if conv.GetStatus() == gmproto.ConversationStatus_DELETED {
 		return convEvent{}, false
 	}
+	key := keySet(others(conv))
 	ms := members(conv)
+	if key == "" {
+		// A chat with only me (texting my own number): I am its member.
+		var mine []string
+		for _, p := range conv.GetParticipants() {
+			if p.GetIsMe() && participantNumber(p) != "" {
+				mine = append(mine, participantNumber(p))
+			}
+		}
+		if key = keySet(mine); key == "" {
+			return convEvent{}, false
+		}
+		ms = []member{{Number: mine[0]}}
+	}
 	name := conv.GetName()
 	if !conv.GetIsGroupChat() && len(ms) == 1 && (name == ms[0].Number || name == "") {
 		name = ""

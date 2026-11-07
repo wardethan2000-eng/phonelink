@@ -83,6 +83,10 @@ func TestConversationEvent(t *testing.T) {
 	if !ok || ev.Chat != "3165551111" || ev.Conv != "7" || !ev.RCS || !ev.Unread || ev.LastTSms != 5000 || len(ev.Members) != 1 || ev.Members[0].Name != "Alice" {
 		t.Fatalf("conversation = %+v", ev)
 	}
+	self := &gmproto.Conversation{ConversationID: "8", Participants: []*gmproto.Participant{part("+13165550000", true)}, Status: gmproto.ConversationStatus_ACTIVE}
+	if ev, ok := conversationEvent(self); !ok || ev.Chat != "3165550000" || len(ev.Members) != 1 || ev.Members[0].Number != "+13165550000" {
+		t.Fatalf("chat with myself = %+v %v", ev, ok)
+	}
 	c.Status = gmproto.ConversationStatus_DELETED
 	if _, ok := conversationEvent(c); ok {
 		t.Fatal("deleted chats are skipped")

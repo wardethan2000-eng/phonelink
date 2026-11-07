@@ -40,8 +40,14 @@ fn last_ten(s: &str) -> String {
     }
 }
 
-/// The comparison key for a phone number (last 10 digits).
+/// The comparison key for a phone number (last 10 digits). Business chats
+/// (`name_agent@rbm.goog`) and e-mail addresses have no number: their key
+/// is the whole address in lower case, so two agents whose names share
+/// stray digits stay apart.
 pub fn phone_key(number: &str) -> String {
+    if number.contains('@') {
+        return number.trim().to_lowercase();
+    }
     last_ten(&normalize_phone(number))
 }
 

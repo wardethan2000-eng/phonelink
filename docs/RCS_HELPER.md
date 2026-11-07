@@ -1,10 +1,15 @@
 # phonelink-gm: Google Messages helper (Phase 9, Route B1)
 
-Design, 2026-11-05. **Built so far (2026-11-06):** a `serve` mode with
-`mark_read`, `delete` and per-chat unread events, used for read-state sync
-and deletes (see `phonelink-gm/serve.go`; requests use an `op` field and
-chats are matched by member keys, not ids). The rest is not built yet. Goal: full RCS in the Messages tab by
-pairing the app as a Google Messages "for web" device.
+Design, 2026-11-05. **Built so far (2026-11-07):** `serve` with `mark_read`,
+`delete`, `list`, `fetch`, `send_text` and `set_active`, plus `conversation`
+and `message` events. The protocol as built is the comment at the top of
+`phonelink-gm/serve.go` (it uses an `op` field; chats are named by Google's
+`conv` id, or by member key for `mark_read`/`delete`). When linked, the app's
+Messages tab runs on it (`core::messages` Google mode: device `gm:<my number
+key>`, ids mapped through `gm_ids`). Not built yet: linking inside the app
+(`pair`), new chats (`open_conversation`, so a brand-new chat still goes
+through KDE Connect as SMS), media, typing, reactions, and paging back past
+the newest 50 messages. The tables below are the original design.
 
 ## Why a separate helper
 libgm (the Google Messages web protocol, from mautrix-gmessages) is Go and
