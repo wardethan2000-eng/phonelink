@@ -100,6 +100,8 @@ pub fn popup_menu(anchor: &gtk::Widget, x: f64, y: f64, items: Vec<MenuItem>) {
 const EXTRA_CSS: &str = "
 .message-image { border-radius: 18px; background-color: alpha(currentColor, 0.06); }
 .message-file-chip { padding: 6px 4px; }
+.compose-image-preview-card { padding: 6px 6px 6px 6px; border-radius: 12px; background-color: alpha(currentColor, 0.05); }
+.compose-thumb { border-radius: 8px; }
 /* Settings open: no tab looks selected, the gear looks pressed instead. */
 viewswitcher.in-settings button:checked { background: none; box-shadow: none; }
 viewswitcher.in-settings button:checked:hover { background-color: alpha(currentColor, 0.07); }
