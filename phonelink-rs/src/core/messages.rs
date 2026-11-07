@@ -141,6 +141,7 @@ struct GmChat {
     /// The group's or business's own name.
     name: String,
     group: bool,
+    rcs: bool,
 }
 
 /// The Messages tab's state while Google Messages is its source.
@@ -151,8 +152,9 @@ pub struct GmMode {
     /// My messages' route and delivery, by uid.
     delivery: HashMap<i64, SendRoute>,
     /// Texts sent from here whose echo hasn't come: tmp id → (thread,
-    /// text). Real phones echo without the tmp id, so the text matches too.
-    sent_here: HashMap<String, (i64, String)>,
+    /// text, the uid of its bubble shown meanwhile, 0 before it shows).
+    /// Real phones echo without the tmp id, so the text matches too.
+    sent_here: HashMap<String, (i64, String, i64)>,
     /// Messages sent from here (their delivery is always shown).
     uids_sent_here: HashSet<i64>,
     /// Chats whose newest page was fetched this session.
@@ -1211,6 +1213,7 @@ impl Messages {
                     members: members.clone(),
                     name: c.name.clone(),
                     group: c.group,
+                    rcs: c.rcs,
                 },
             );
         }
@@ -1285,12 +1288,15 @@ impl Messages {
             changed = gm.delivery.insert(uid, route).is_some_and(|old| old != route);
         }
         let primary = self.index.primary_for(thread_id);
-        if m.from_me && !gm.uids_sent_here.contains(&uid) {
+        if m.from_me {
+            // Its bubble (shown at send time under `uid`), or a send with
+            // no bubble yet; never another send's bubble.
             let key = normalize_text(&m.text);
-            let mine = if gm.sent_here.contains_key(&m.tmp_id) {
+            let fits = |e: &(i64, String, i64)| e.2 == uid || (e.2 == 0 && !gm.uids_sent_here.contains(&uid));
+            let mine = if gm.sent_here.get(&m.tmp_id).is_some_and(fits) {
                 Some(m.tmp_id.clone())
             } else {
-                gm.sent_here.iter().find(|(_, (t, text))| *t == primary && *text == key).map(|(k, _)| k.clone())
+                gm.sent_here.iter().find(|(_, e)| e.0 == primary && e.1 == key && fits(e)).map(|(k, _)| k.clone())
             };
             if let Some(k) = mine {
                 gm.sent_here.remove(&k);
@@ -1345,7 +1351,7 @@ impl Messages {
         gm.sends += 1;
         let now_ms = chrono::Utc::now().timestamp_millis();
         let tmp_id = super::gm::new_tmp_id(now_ms, gm.sends % 1000);
-        gm.sent_here.insert(tmp_id.clone(), (primary, normalize_text(text)));
+        gm.sent_here.insert(tmp_id.clone(), (primary, normalize_text(text), 0));
         Effect::GmSend { thread_id: primary, conv, text: text.to_string(), tmp_id }
     }
 
@@ -1357,7 +1363,7 @@ impl Messages {
         gm.fetched.insert(primary);
         gm.sends += 1;
         let tmp_id = super::gm::new_tmp_id(chrono::Utc::now().timestamp_millis(), gm.sends % 1000);
-        gm.sent_here.insert(tmp_id.clone(), (primary, normalize_text(text)));
+        gm.sent_here.insert(tmp_id.clone(), (primary, normalize_text(text), 0));
         self.active = Some(primary);
         self.read_thread_ids.insert(primary);
         vec![
@@ -1367,12 +1373,81 @@ impl Messages {
         ]
     }
 
-    /// The phone didn't take a text sent through Google Messages.
-    pub fn gm_send_failed(&mut self, tmp_id: &str) -> Vec<Effect> {
-        if let Some(gm) = self.gm.as_mut() {
-            gm.sent_here.remove(tmp_id);
+    /// Show a text sent through Google Messages at once, as "Sending",
+    /// before the phone echoes it. `uid` is a fresh local id for it; the
+    /// echo takes the same uid ([`Messages::gm_pending_uid`]), so the bubble
+    /// stays put and only its label changes.
+    pub fn gm_add_pending(
+        &mut self,
+        tmp_id: &str,
+        text: &str,
+        uid: i64,
+        store: &MessageStore,
+        hidden: &mut dyn HiddenStore,
+        now: f64,
+    ) -> Vec<Effect> {
+        let Some(&(primary, _, _)) = self.gm.as_ref().and_then(|gm| gm.sent_here.get(tmp_id)) else { return Vec::new() };
+        let threads = self.conversation_threads(primary);
+        let Some(gm) = self.gm.as_mut() else { return Vec::new() };
+        if let Some(entry) = gm.sent_here.get_mut(tmp_id) {
+            entry.2 = uid;
         }
-        vec![Effect::Toast(TOAST_GM_NOT_SENT)]
+        let chat = threads.iter().filter_map(|t| gm.chats.get(t)).max_by_key(|c| c.last_ts);
+        let members = chat.map(|c| c.members.clone()).unwrap_or_default();
+        let rcs = chat.is_some_and(|c| c.rcs);
+        gm.delivery.insert(uid, SendRoute::Google { rcs, delivery: Delivery::Sending });
+        gm.uids_sent_here.insert(uid);
+        let row = SmsMessage {
+            uid,
+            body: text.to_string(),
+            address: members.first().cloned().unwrap_or_default(),
+            date: chrono::Utc::now().timestamp_millis(),
+            msg_type: super::models::MSG_TYPE_SENT,
+            read: 1,
+            thread_id: primary,
+            attachments: Vec::new(),
+            all_addresses: members,
+        };
+        let mut out = self.merge_message(row, store, hidden, now);
+        if self.active == Some(primary) && !out.contains(&Effect::ShowThread(primary)) {
+            out.push(Effect::ShowThread(primary));
+        }
+        if !out.contains(&Effect::RefreshList) {
+            out.push(Effect::RefreshList);
+        }
+        out
+    }
+
+    /// The uid already showing for this message: the bubble of a text sent
+    /// from here that this is the phone's copy of.
+    pub fn gm_pending_uid(&self, m: &GmMessage, thread_id: i64) -> Option<i64> {
+        let gm = self.gm.as_ref()?;
+        if !m.from_me {
+            return None;
+        }
+        if let Some(&(_, _, uid)) = gm.sent_here.get(&m.tmp_id) {
+            return (uid != 0).then_some(uid);
+        }
+        let primary = self.index.primary_for(thread_id);
+        let key = normalize_text(&m.text);
+        gm.sent_here.values().find(|(t, text, uid)| *t == primary && *text == key && *uid != 0).map(|e| e.2)
+    }
+
+    /// The phone didn't take a text sent through Google Messages: its
+    /// bubble stays for now, marked "Not sent", but isn't kept on disk.
+    pub fn gm_send_failed(&mut self, tmp_id: &str, store: &MessageStore) -> Vec<Effect> {
+        let mut out = vec![Effect::Toast(TOAST_GM_NOT_SENT)];
+        let dev = self.device_id.clone().unwrap_or_default();
+        if let Some(gm) = self.gm.as_mut()
+            && let Some((primary, _, uid)) = gm.sent_here.remove(tmp_id)
+            && uid != 0
+        {
+            store.delete_message(&dev, uid);
+            let rcs = matches!(gm.delivery.get(&uid), Some(SendRoute::Google { rcs: true, .. }));
+            gm.delivery.insert(uid, SendRoute::Google { rcs, delivery: Delivery::Failed });
+            out.push(Effect::Redraw(primary));
+        }
+        out
     }
 
     // ── catch-up plumbing ──────────────────────────────────────────
@@ -2269,6 +2344,64 @@ mod tests {
             let b = p.store.gm_local_id("conv", "biz");
             assert_eq!(p.m.index.get(b).unwrap().display_name, "The Shop");
             assert_eq!(p.m.send(b, "hi"), vec![Effect::Toast(TOAST_GM_READ_ONLY)]);
+        }
+
+        /// What the page does with a send: show it at once, then send.
+        fn send_now(p: &mut Panel, tid: i64, text: &str) -> (String, i64, Vec<Effect>) {
+            let e = p.m.send(tid, text);
+            let [Effect::GmSend { tmp_id, .. }] = e.as_slice() else { panic!("{e:?}") };
+            let uid = p.store.gm_local_id("msg", &format!("pending:{tmp_id}"));
+            let shown = p.m.gm_add_pending(tmp_id, text, uid, &p.store, &mut p.hidden, 0.0);
+            (tmp_id.clone(), uid, shown)
+        }
+
+        /// The page's id for an incoming message: a pending bubble's, if it's its echo.
+        fn echo(p: &mut Panel, m: &GmMessage) -> (i64, Vec<Effect>) {
+            let tid = p.store.gm_local_id("conv", &m.conv);
+            let uid = match (p.store.gm_known("msg", &m.msg), p.m.gm_pending_uid(m, tid)) {
+                (Some(uid), _) => uid,
+                (None, Some(uid)) => {
+                    p.store.gm_alias("msg", &m.msg, uid);
+                    uid
+                }
+                (None, None) => p.store.gm_local_id("msg", &m.msg),
+            };
+            (uid, p.m.gm_message(m, tid, uid, &p.store, &mut p.hidden, 0.0))
+        }
+
+        #[test]
+        fn a_sent_text_shows_at_once_and_its_echo_takes_the_same_bubble() {
+            let mut p = panel();
+            p.chat(&chat("a", &["+13165551111"], false, 2000));
+            let tid = p.store.gm_local_id("conv", "a");
+            p.m.select(tid, &p.store, 0.0);
+            let (_, uid, shown) = send_now(&mut p, tid, "on my way");
+            assert!(shown.contains(&Effect::ShowThread(tid)), "{shown:?}");
+            let conv = p.m.index.get(tid).unwrap();
+            assert_eq!(conv.messages.last().map(|m| (m.uid, m.body.as_str(), m.is_sent())), Some((uid, "on my way", true)));
+            assert_eq!(p.m.route_of(uid).map(SendRoute::label), Some("RCS · Sending"));
+            // Two of the same text: each echo takes its own bubble.
+            let (_, uid2, _) = send_now(&mut p, tid, "on my way");
+            assert_ne!(uid, uid2);
+            let mut e = gmsg("a", "50", true, 3000);
+            e.text = "on my way".into();
+            e.status = "sending".into();
+            let (got, _) = echo(&mut p, &e);
+            assert!(got == uid || got == uid2);
+            e.status = "delivered".into();
+            let (again, fx) = echo(&mut p, &e);
+            assert_eq!((again, fx), (got, vec![Effect::Redraw(tid)]));
+            let mut e2 = gmsg("a", "51", true, 3001);
+            e2.text = "on my way".into();
+            let (got2, _) = echo(&mut p, &e2);
+            assert_eq!([got, got2].iter().copied().collect::<HashSet<_>>(), [uid, uid2].into_iter().collect());
+            assert_eq!(p.m.index.get(tid).unwrap().messages.len(), 2, "no doubled bubbles");
+            assert_eq!(p.m.route_of(got).map(SendRoute::label), Some("RCS · Delivered"));
+            // A failed send keeps its bubble, marked, but not on disk.
+            let (tmp, uid3, _) = send_now(&mut p, tid, "nope");
+            let fx = p.m.gm_send_failed(&tmp, &p.store);
+            assert!(fx.contains(&Effect::Redraw(tid)) && fx.contains(&Effect::Toast(TOAST_GM_NOT_SENT)));
+            assert_eq!(p.m.route_of(uid3).map(SendRoute::label), Some("RCS · Not sent"));
         }
 
         #[test]

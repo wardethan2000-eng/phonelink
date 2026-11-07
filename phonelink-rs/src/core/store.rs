@@ -437,18 +437,7 @@ impl MessageStore {
     /// "conv" or "msg"), allocated on first sight (1, 2, ...) and kept.
     pub fn gm_local_id(&self, kind: &str, gm_id: &str) -> i64 {
         let key = (kind.to_string(), gm_id.to_string());
-        if let Some(&id) = self.gm_cache.borrow().get(&key) {
-            return id;
-        }
-        let found = self.conn.as_ref().and_then(|c| {
-            c.query_row("SELECT local_id FROM gm_ids WHERE kind=? AND gm_id=?", params![kind, gm_id], |r| r.get::<_, i64>(0))
-                .optional()
-                .unwrap_or_else(|e| {
-                    log::warn!("store.gm_local_id failed: {e}");
-                    None
-                })
-        });
-        let id = match found {
+        let id = match self.gm_known(kind, gm_id) {
             Some(id) => id,
             None => {
                 let in_db = self
@@ -467,6 +456,36 @@ impl MessageStore {
         };
         self.gm_cache.borrow_mut().insert(key, id);
         id
+    }
+
+    /// The local number already given to one of Google Messages' ids.
+    pub fn gm_known(&self, kind: &str, gm_id: &str) -> Option<i64> {
+        let key = (kind.to_string(), gm_id.to_string());
+        if let Some(&id) = self.gm_cache.borrow().get(&key) {
+            return Some(id);
+        }
+        let found = self.conn.as_ref().and_then(|c| {
+            c.query_row("SELECT local_id FROM gm_ids WHERE kind=? AND gm_id=?", params![kind, gm_id], |r| r.get::<_, i64>(0))
+                .optional()
+                .unwrap_or_else(|e| {
+                    log::warn!("store.gm_known failed: {e}");
+                    None
+                })
+        });
+        if let Some(id) = found {
+            self.gm_cache.borrow_mut().insert(key, id);
+        }
+        found
+    }
+
+    /// Make Google Messages' `gm_id` map to an existing local id: a text
+    /// sent from here was shown under its own id before the phone named it.
+    pub fn gm_alias(&self, kind: &str, gm_id: &str, local_id: i64) {
+        self.write("gm_alias", |c| {
+            c.execute("INSERT OR REPLACE INTO gm_ids (kind, gm_id, local_id) VALUES (?, ?, ?)", params![kind, gm_id, local_id])?;
+            Ok(())
+        });
+        self.gm_cache.borrow_mut().insert((kind.to_string(), gm_id.to_string()), local_id);
     }
 
     pub fn meta(&self, key: &str) -> Option<String> {

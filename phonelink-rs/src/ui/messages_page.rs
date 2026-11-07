@@ -586,7 +586,19 @@ impl MessagesPage {
                         })
                     }
                 }
-                Effect::GmSend { thread_id: _, conv, text, tmp_id } => self.gm_send(conv, text, tmp_id),
+                Effect::GmSend { thread_id: _, conv, text, tmp_id } => {
+                    // Show it at once as "Sending"; the phone's copy takes
+                    // over the same bubble.
+                    let shown = {
+                        let mut i = self.inner.borrow_mut();
+                        let i = &mut *i;
+                        let mut settings = i.settings.borrow_mut();
+                        let uid = i.store.gm_local_id("msg", &format!("pending:{tmp_id}"));
+                        i.m.gm_add_pending(&tmp_id, &text, uid, &i.store, &mut *settings, now())
+                    };
+                    self.run(shown);
+                    self.gm_send(conv, text, tmp_id);
+                }
                 Effect::GmFetch { thread_id } => self.gm_fetch(thread_id),
                 Effect::GmSendNew { addresses, text } => self.gm_send_new(addresses, text),
                 Effect::Redraw(tid) => {
@@ -951,7 +963,14 @@ impl MessagesPage {
                         }
                         Incoming::Message(msg) => {
                             let tid = store.gm_local_id("conv", &msg.conv);
-                            let uid = store.gm_local_id("msg", &msg.msg);
+                            let uid = match (store.gm_known("msg", &msg.msg), m.gm_pending_uid(msg, tid)) {
+                (Some(uid), _) => uid,
+                (None, Some(uid)) => {
+                    store.gm_alias("msg", &msg.msg, uid);
+                    uid
+                }
+                (None, None) => store.gm_local_id("msg", &msg.msg),
+            };
                             effects.extend(m.gm_message(msg, tid, uid, store, settings, t));
                         }
                         _ => {}
@@ -993,13 +1012,21 @@ impl MessagesPage {
                         return;
                     }
                     log::warn!("Google Messages send failed: {} {}", r.error, r.message);
-                    let effects = this.inner.borrow_mut().m.gm_send_failed(&tmp);
+                    let effects = {
+                        let mut i = this.inner.borrow_mut();
+                        let i = &mut *i;
+                        i.m.gm_send_failed(&tmp, &i.store)
+                    };
                     this.run(effects);
                 },
             )
         });
         if !sent {
-            let effects = self.inner.borrow_mut().m.gm_send_failed(&tmp_id);
+            let effects = {
+                let mut i = self.inner.borrow_mut();
+                let i = &mut *i;
+                i.m.gm_send_failed(&tmp_id, &i.store)
+            };
             self.run(effects);
         }
     }
