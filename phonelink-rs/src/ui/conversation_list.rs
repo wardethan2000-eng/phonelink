@@ -56,7 +56,7 @@ fn build_avatar(name: &str, phone: &str, is_group: bool, group_count: usize) -> 
         let target = picture.clone();
         glib::spawn_future_local(async move {
             let decoded = gtk::gio::spawn_blocking(move || {
-                super::decodable_image(&path)?;
+                super::decodable_image(std::path::Path::new(&path))?;
                 let pb = gtk::gdk_pixbuf::Pixbuf::from_file_at_scale(&path, 80, 80, true).ok()?;
                 Some((pb.read_pixel_bytes(), pb.width(), pb.height(), pb.rowstride() as usize, pb.has_alpha()))
             })
