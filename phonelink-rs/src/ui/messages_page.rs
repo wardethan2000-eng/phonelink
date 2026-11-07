@@ -168,6 +168,14 @@ impl MessagesPage {
                     }
                 })
             },
+            text_back: {
+                let target = download_target.clone();
+                Rc::new(move || {
+                    if let Some(page) = target.borrow().upgrade() {
+                        page.thread.entry.grab_focus();
+                    }
+                })
+            },
         });
         content.append(&thread.widget);
         stack.add_named(&content, Some("content"));
@@ -990,9 +998,17 @@ impl MessagesPage {
         subs.push(signals::subscribe(client.bus(), &format!("{base}/telephony"), IFACE_TELEPHONY, "callReceived", move |p| {
             let Some(this) = weak.upgrade() else { return };
             let Some((event, number, name)) = p.get::<(String, String, String)>() else { return };
-            if !matches!(event.as_str(), "ringing" | "missedCall") {
+            // KDE Connect 26.08 says "callReceived" for a ringing call.
+            if crate::core::calls::CallEvent::parse(&event).is_none() {
                 return;
             }
+            // The call, as a line in that number's chat.
+            let effects = {
+                let mut guard = this.inner.borrow_mut();
+                let i = &mut *guard;
+                i.m.call_event(&event, &number, chrono::Utc::now().timestamp_millis(), &i.store)
+            };
+            this.run(effects);
             if let Some((norm, name)) = crate::core::contacts::harvest_contact_from_telephony_signal(&number, &name) {
                 let effects = {
                     let mut guard = this.inner.borrow_mut();

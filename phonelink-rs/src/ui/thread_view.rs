@@ -281,6 +281,8 @@ thread_local! {
 pub struct BubbleActions {
     /// `(part_id, unique_identifier, file_name)`: ask the phone for the file.
     pub download: Rc<dyn Fn(i64, String, String)>,
+    /// "Text back" on a missed call: focus the compose box.
+    pub text_back: Rc<dyn Fn()>,
 }
 
 struct Bubble {
@@ -295,6 +297,9 @@ struct Bubble {
 
 impl Bubble {
     fn new(msg: &SmsMessage, show_time: bool, route: Option<SendRoute>, actions: &BubbleActions) -> Rc<Self> {
+        if msg.is_call() {
+            return Self::call(msg, actions);
+        }
         let sent = msg.is_sent();
         let widget = gtk::Box::new(gtk::Orientation::Vertical, 1);
         widget.set_halign(if sent { gtk::Align::End } else { gtk::Align::Start });
@@ -385,6 +390,37 @@ impl Bubble {
             frame.add_controller(click);
         }
         bubble
+    }
+
+    /// A call in the timeline: a centred line, "Missed call · 3:12 PM",
+    /// with "Text back" on a missed one.
+    fn call(msg: &SmsMessage, actions: &BubbleActions) -> Rc<Self> {
+        let missed = msg.msg_type == crate::core::models::MSG_TYPE_CALL_MISSED;
+        let widget = gtk::Box::new(gtk::Orientation::Vertical, 0);
+        widget.set_halign(gtk::Align::Center);
+        widget.set_margin_top(6);
+        widget.set_margin_bottom(6);
+        let line = gtk::Box::new(gtk::Orientation::Horizontal, 6);
+        line.add_css_class("call-line");
+        if missed {
+            line.add_css_class("call-missed");
+        }
+        let icon = gtk::Image::from_icon_name(if missed { "call-missed-symbolic" } else { "call-incoming-symbolic" });
+        let label = gtk::Label::new(Some(&format!("{} · {}", msg.body, clock(msg.timestamp()))));
+        label.add_css_class("caption");
+        line.append(&icon);
+        line.append(&label);
+        if missed {
+            let back = gtk::Button::with_label("Text back");
+            back.add_css_class("flat");
+            back.add_css_class("caption");
+            let text_back = actions.text_back.clone();
+            back.connect_clicked(move |_| text_back());
+            line.append(&back);
+        }
+        widget.append(&line);
+        let revealer = gtk::Revealer::new();
+        Rc::new(Self { widget, body: None, revealer, route_tag: None, message: msg.clone() })
     }
 
     /// Outline the bubble and bold `needle` in its text (None clears).
@@ -1259,6 +1295,8 @@ impl ThreadView {
     /// are appended; anything else rebuilds (keeping the scroll position).
     pub fn sync(self: &Rc<Self>, conv: &Conversation, route: &dyn Fn(i64) -> Option<SendRoute>) {
         self.set_header(conv);
+        // Texts and calls, in time order.
+        let timeline = conv.timeline();
         let same = self.state.borrow().thread_id == Some(conv.thread_id)
             && self.widget.visible_child_name().as_deref() == Some("thread");
         let changed = self.state.borrow().thread_id != Some(conv.thread_id);
@@ -1274,7 +1312,7 @@ impl ThreadView {
         if !same {
             let pending = {
                 let mut st = self.state.borrow_mut();
-                st.all = sorted(&conv.messages);
+                st.all = timeline.clone();
                 st.pending_find.take().filter(|(tid, _, _)| *tid == conv.thread_id)
             };
             match pending {
@@ -1287,9 +1325,8 @@ impl ThreadView {
         }
         let (rebuild, new_msgs) = {
             let st = self.state.borrow();
-            let current: HashSet<i64> = conv.messages.iter().map(|m| m.uid).filter(|u| *u != 0).collect();
-            let new: Vec<SmsMessage> = conv
-                .messages
+            let current: HashSet<i64> = timeline.iter().map(|m| m.uid).filter(|u| *u != 0).collect();
+            let new: Vec<SmsMessage> = timeline
                 .iter()
                 .filter(|m| m.uid != 0 && !st.rendered.contains(&m.uid) && m.date >= st.window_first_date)
                 .cloned()
@@ -1298,7 +1335,7 @@ impl ThreadView {
             let out_of_order = new.iter().any(|m| m.date < st.last_rendered_date);
             (removed || out_of_order, new)
         };
-        self.state.borrow_mut().all = sorted(&conv.messages);
+        self.state.borrow_mut().all = timeline;
         if rebuild {
             self.set_messages(true);
             self.refresh_find();
@@ -1487,7 +1524,7 @@ impl ThreadView {
         }
         {
             let mut st = self.state.borrow_mut();
-            st.all = sorted(&conv.messages);
+            st.all = conv.timeline();
             st.routes = conv.messages.iter().filter_map(|m| route(m.uid).map(|r| (m.uid, r))).collect();
         }
         let changed: Vec<(usize, SmsMessage)> = {
@@ -1825,11 +1862,6 @@ fn earlier_label(hidden: usize) -> String {
     format!("Show earlier messages ({hidden})")
 }
 
-fn sorted(messages: &[SmsMessage]) -> Vec<SmsMessage> {
-    let mut v = messages.to_vec();
-    v.sort_by_key(|m| m.date);
-    v
-}
 
 #[cfg(test)]
 mod tests {

@@ -242,6 +242,15 @@ app** is calls in the conversation timeline:
 
 Effort: small to medium. **Ethan: yes (2026-11-06).**
 
+**Status 2026-11-06: built** (`core/calls.rs`, `calls` table, call lines in
+the thread, call-only chats for numbers with no texts). KDE Connect 26.08.3
+emits `callReceived` with type `callReceived` (ringing) or `missedCall`, and
+nothing for answered or ended calls, so a call reads "Incoming call" and
+turns into "Missed call" if a miss follows within 10 minutes. The old name
+harvesting only accepted `ringing`, so rings never taught names; fixed.
+Checked on the mock daemon in Broadway (`DEMO_CALLS=1`). Waiting on a real
+call on the laptop.
+
 ---
 
 ## E. Phone media controls (reduced)

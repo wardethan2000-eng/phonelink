@@ -487,6 +487,24 @@ fn main() {
                 .build()
                 .unwrap();
         }
+        // `DEMO_CALLS=1`: a call rings and is missed in an existing chat
+        // (+15555550107), and a new number calls and is missed.
+        if std::env::var_os("DEMO_CALLS").is_some() {
+            let calls = conn.clone();
+            let tel = format!("{}/telephony", device_path(DEVICE));
+            let iface = phonelink_rs::dbus::IFACE_TELEPHONY;
+            for (secs, kind, number) in [
+                (20, "callReceived", "+15555550107"),
+                (22, "missedCall", "+15555550107"),
+                (23, "missedCall", "+15555550199"),
+            ] {
+                let (c, t) = (calls.clone(), tel.clone());
+                glib::timeout_add_seconds_local_once(secs, move || {
+                    let p = (kind, number, number).to_variant();
+                    c.emit_signal(None, &t, iface, "callReceived", Some(&p)).unwrap();
+                });
+            }
+        }
         // A new notification arrives a little later.
         let (late, late_conn) = (active.clone(), conn.clone());
         glib::timeout_add_seconds_local_once(20, move || {

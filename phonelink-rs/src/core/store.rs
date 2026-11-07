@@ -18,7 +18,7 @@ use std::path::{Path, PathBuf};
 use rusqlite::{Connection, OptionalExtension, Row, params};
 use serde_json::Value;
 
-use super::models::{Attachment, Conversation, SmsMessage};
+use super::models::{Attachment, Call, Conversation, SmsMessage};
 
 const SCHEMA: &str = "
 CREATE TABLE IF NOT EXISTS conversations (
@@ -53,6 +53,14 @@ CREATE TABLE IF NOT EXISTS contacts (
 CREATE TABLE IF NOT EXISTS contact_overrides (
     phone TEXT PRIMARY KEY,
     name  TEXT
+);
+CREATE TABLE IF NOT EXISTS calls (
+    device_id TEXT    NOT NULL,
+    number    TEXT    NOT NULL,
+    date      INTEGER NOT NULL,
+    missed    INTEGER NOT NULL DEFAULT 0,
+    seen      INTEGER NOT NULL DEFAULT 0,
+    PRIMARY KEY (device_id, number, date)
 );
 CREATE TABLE IF NOT EXISTS meta (
     key   TEXT PRIMARY KEY,
@@ -411,6 +419,49 @@ impl MessageStore {
                 "DELETE FROM messages WHERE device_id=? AND thread_id=?",
                 params![device_id, thread_id],
             )?;
+            Ok(())
+        });
+    }
+
+    // ── calls (the Python app doesn't know this table) ─────────────
+
+    pub fn upsert_call(&self, device_id: &str, call: &Call) {
+        self.write("upsert_call", |c| {
+            c.execute(
+                "INSERT OR REPLACE INTO calls (device_id, number, date, missed, seen) VALUES (?, ?, ?, ?, ?)",
+                params![device_id, call.number, call.date, i32::from(call.missed), i32::from(call.seen)],
+            )?;
+            Ok(())
+        });
+    }
+
+    /// Every call for a device, oldest first.
+    pub fn load_calls(&self, device_id: &str) -> Vec<Call> {
+        let Some(conn) = self.conn.as_ref() else { return Vec::new() };
+        let result = (|| -> Result<Vec<Call>, rusqlite::Error> {
+            let mut stmt =
+                conn.prepare("SELECT number, date, missed, seen FROM calls WHERE device_id=? ORDER BY date")?;
+            let rows = stmt.query_map(params![device_id], |r| {
+                Ok(Call {
+                    number: r.get::<_, String>(0)?,
+                    date: r.get(1)?,
+                    missed: r.get::<_, i64>(2)? != 0,
+                    seen: r.get::<_, i64>(3)? != 0,
+                })
+            })?;
+            rows.collect()
+        })();
+        result.unwrap_or_else(|e| {
+            log::warn!("store.load calls failed: {e}");
+            Vec::new()
+        })
+    }
+
+    pub fn delete_calls(&self, device_id: &str, numbers: &[String]) {
+        self.write_txn("delete_calls", |c| {
+            for n in numbers {
+                c.execute("DELETE FROM calls WHERE device_id=? AND number=?", params![device_id, n])?;
+            }
             Ok(())
         });
     }
