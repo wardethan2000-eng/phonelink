@@ -113,7 +113,7 @@ pub fn delete_request(id: u64, chats: &[String]) -> String {
 /// How long after the phone's newest message a laptop message may be and
 /// still count as read by "read on the phone" (the two sides stamp the
 /// same text a little differently).
-pub const READ_SLACK_MS: i64 = 30_000;
+pub const READ_SLACK_MS: i64 = 5_000;
 
 #[cfg(test)]
 mod tests {

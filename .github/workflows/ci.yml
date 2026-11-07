@@ -25,3 +25,44 @@ jobs:
 
       - name: Run test suite
         run: python3 -m pytest -q
+
+  # The Rust app on the oldest distro the release supports (GTK 4.14,
+  # libadwaita 1.5, glibc 2.39).
+  rust:
+    runs-on: ubuntu-24.04
+    steps:
+      - uses: actions/checkout@v4
+
+      - name: Install GTK 4 / libadwaita headers
+        run: |
+          sudo apt-get update
+          sudo apt-get install -y --no-install-recommends \
+            libgtk-4-dev libadwaita-1-dev libsqlite3-dev libssl-dev \
+            pkg-config libglib2.0-dev-bin dbus
+
+      - uses: dtolnay/rust-toolchain@stable
+        with:
+          components: clippy
+
+      - uses: Swatinem/rust-cache@v2
+
+      - name: Clippy
+        run: cargo clippy --all-targets -- -D warnings
+
+      # dbus-run-session gives the mock-daemon test a session bus. The
+      # Google Contacts import test hangs without a network login; skip it.
+      - name: Tests
+        run: dbus-run-session -- cargo test -- --skip import_names_and_chat_photos
+
+  helper:
+    runs-on: ubuntu-24.04
+    defaults:
+      run:
+        working-directory: phonelink-gm
+    steps:
+      - uses: actions/checkout@v4
+      - uses: actions/setup-go@v5
+        with:
+          go-version-file: phonelink-gm/go.mod
+          cache-dependency-path: phonelink-gm/go.sum
+      - run: go vet ./... && go test ./...

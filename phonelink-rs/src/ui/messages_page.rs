@@ -119,9 +119,12 @@ pub struct MessagesPage {
     search: RefCell<crate::core::search::SearchIndex>,
     /// The lasting Google Messages link (read state, deletes), when paired.
     gm: RefCell<Option<Rc<super::gm_link::GmLink>>>,
-    /// Chats the phone reported read (key → its newest message, ms), applied
-    /// together on idle (one burst of ~250 when the link connects).
+    /// Chats Google Messages says are read on the phone (key → the phone's
+    /// newest message, ms). Kept, not consumed: it is applied again whenever
+    /// the chat list loads, since the link can connect before the phone does.
     phone_read: RefCell<std::collections::HashMap<String, i64>>,
+    /// An apply of `phone_read` is queued on idle.
+    phone_read_queued: std::cell::Cell<bool>,
     inner: RefCell<Inner>,
 }
 
@@ -181,6 +184,7 @@ impl MessagesPage {
             search: RefCell::default(),
             gm: RefCell::default(),
             phone_read: RefCell::default(),
+            phone_read_queued: Default::default(),
             inner: RefCell::new(Inner {
                 m: Messages::new(),
                 store,
@@ -313,6 +317,7 @@ impl MessagesPage {
         self.stack.set_visible_child_name("content");
         self.run(effects);
         self.reschedule();
+        self.apply_phone_read();
 
         self.load_active();
         if reachable {
@@ -340,6 +345,8 @@ impl MessagesPage {
             log::info!("activeConversations: {} entries, {} parsed", entries.len(), raw.len());
             this.run(effects);
             this.reschedule();
+            // The phone's own read flags just landed; Google Messages' are newer.
+            this.apply_phone_read();
         });
     }
 
@@ -695,26 +702,36 @@ impl MessagesPage {
             self.inner.borrow_mut().m.gm_me = me;
             return;
         }
-        let Incoming::Conversation { chat, unread: false, last_ts_ms } = e else { return };
-        let first = {
-            let mut read = self.phone_read.borrow_mut();
-            let first = read.is_empty();
-            read.insert(chat, last_ts_ms);
-            first
-        };
-        if first {
-            let weak = Rc::downgrade(self);
-            glib::idle_add_local_once(move || {
-                let Some(this) = weak.upgrade() else { return };
-                let read = std::mem::take(&mut *this.phone_read.borrow_mut());
-                let effects = {
-                    let mut guard = this.inner.borrow_mut();
-                    let i = &mut *guard;
-                    i.m.read_on_phone(&read, &i.store)
-                };
-                this.run(effects);
-            });
+        let Incoming::Conversation { chat, unread, last_ts_ms } = e else { return };
+        if unread {
+            self.phone_read.borrow_mut().remove(&chat);
+            return;
         }
+        self.phone_read.borrow_mut().insert(chat, last_ts_ms);
+        self.apply_phone_read();
+    }
+
+    /// Clear unread dots on chats read on the phone (once per idle, so the
+    /// ~250 events at connect are one pass).
+    fn apply_phone_read(self: &Rc<Self>) {
+        if self.phone_read_queued.replace(true) {
+            return;
+        }
+        let weak = Rc::downgrade(self);
+        glib::idle_add_local_once(move || {
+            let Some(this) = weak.upgrade() else { return };
+            this.phone_read_queued.set(false);
+            let effects = {
+                let read = this.phone_read.borrow();
+                if read.is_empty() {
+                    return;
+                }
+                let mut guard = this.inner.borrow_mut();
+                let i = &mut *guard;
+                i.m.read_on_phone(&read, &i.store)
+            };
+            this.run(effects);
+        });
     }
 
     /// Opened on the laptop: mark it read on the phone too.

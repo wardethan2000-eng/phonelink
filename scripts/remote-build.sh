@@ -6,6 +6,8 @@
 #   scripts/remote-build.sh check [ARGS...]     cargo check
 #   scripts/remote-build.sh clippy [ARGS...]    cargo clippy
 #   scripts/remote-build.sh run -- CMD...       any command in the synced checkout
+#   scripts/remote-build.sh gm                  build the Google Messages helper -> phonelink-gm/phonelink-gm
+#   scripts/remote-build.sh release             release archive -> target/dist/ (needs data/google_oauth_client.json)
 #   scripts/remote-build.sh log                 show the latest job's log (follows it if still running)
 #
 # The box is an ssh host. Set PHONELINK_BUILD_HOST (env, or in
@@ -24,7 +26,7 @@ MEMORY_MAX="${PHONELINK_BUILD_MEMORY:-3500M}"
 
 ROOT="$(cd "$(dirname "${BASH_SOURCE[0]}")/.." && pwd)"
 
-usage() { sed -n '2,14p' "${BASH_SOURCE[0]}" | sed 's/^# \{0,1\}//'; exit 2; }
+usage() { sed -n '2,16p' "${BASH_SOURCE[0]}" | sed 's/^# \{0,1\}//'; exit 2; }
 
 sync_up() {
     ssh "$HOST" "mkdir -p '$REMOTE_DIR' work/logs"
@@ -91,6 +93,9 @@ bring_back() {
     echo "binaries copied to target/$profile/" >&2
 }
 
+# Static Go build of the helper, into target/ (which the sync leaves alone).
+GM_BUILD='(export PATH=$HOME/opt/go/bin:$PATH && mkdir -p target/gm && cd phonelink-gm && CGO_ENABLED=0 go build -trimpath -ldflags="-s -w" -o ../target/gm/phonelink-gm .)'
+
 [[ $# -ge 1 ]] || usage
 action=$1; shift
 case "$action" in
@@ -114,6 +119,26 @@ case "$action" in
         [[ $# -ge 1 ]] || usage
         sync_up
         run_remote "$@"
+        ;;
+    gm)
+        sync_up
+        code=0; run_remote bash -c "$GM_BUILD" || code=$?
+        lock_back
+        [[ $code -eq 0 ]] || exit "$code"
+        scp -q "$HOST:$REMOTE_DIR/target/gm/phonelink-gm" "$ROOT/phonelink-gm/phonelink-gm"
+        echo "helper copied to phonelink-gm/phonelink-gm" >&2
+        ;;
+    release)
+        # Release builds carry PhoneRelay's own Google client (build.rs).
+        [[ -f "$ROOT/data/google_oauth_client.json" ]] || { echo "data/google_oauth_client.json is missing: a release needs the built-in Google client" >&2; exit 1; }
+        version="$(sed -n 's/^version = "\(.*\)"/\1/p' "$ROOT/phonelink-rs/Cargo.toml" | head -1)"
+        sync_up
+        code=0; run_remote bash -c "cargo build --release && $GM_BUILD && bash scripts/pack-release.sh '$version'" || code=$?
+        lock_back
+        [[ $code -eq 0 ]] || exit "$code"
+        mkdir -p "$ROOT/target/dist"
+        rsync -az "$HOST:$REMOTE_DIR/target/dist/phonerelay-$version-x86_64.tar.gz"* "$ROOT/target/dist/"
+        echo "release copied to target/dist/" >&2
         ;;
     log)
         latest="$(ssh "$HOST" 'readlink work/logs/latest.log' || true)"

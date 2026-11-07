@@ -1,58 +1,74 @@
 # PhoneRelay (formerly Phone Link for Linux)
 
-PhoneRelay is a desktop app that brings your Android phone's messages, notifications, and files to your Linux desktop — similar to Microsoft's Phone Link on Windows. Built with GTK4 and Libadwaita, it uses [KDE Connect](https://kdeconnect.kde.org/) as the communication backend.
+PhoneRelay brings your Android phone's texts, notifications and files to your Linux desktop, much like Microsoft's Phone Link on Windows. It is a GTK 4 / libadwaita app and uses [KDE Connect](https://kdeconnect.kde.org/) to talk to the phone.
 
-> **New: Phone Link is now written in Rust** (`phonelink-rs/`). It does
-> everything the Python version does, with the same look, about 40% less
-> memory, and a single binary. It reads the same messages, contacts and
-> settings as the Python version, so you can switch either way. The Python version
-> (`phonelink/`, `run.py`) stays in the repository for now. See
-> [The Rust version](#the-rust-version) below.
-
-![Python](https://img.shields.io/badge/python-3.8+-blue)
-![GTK](https://img.shields.io/badge/GTK-4-green)
+![GTK](https://img.shields.io/badge/GTK-4.10+-green)
 ![Libadwaita](https://img.shields.io/badge/Libadwaita-1.4+-purple)
 ![License](https://img.shields.io/badge/license-MIT-brightgreen)
 
 ## Features
 
-- **SMS Conversations** — View all your text message conversations and send/receive SMS from your desktop
-- **Contact Names** — Automatically learns names from notifications and calls, with full import from Google Contacts, VCF, or CSV
-- **Notifications** — Live phone notifications in a collapsible sidebar tray; click any row to expand and see the full body; dismiss or reply right from the desktop
-- **File Browser** — Browse your phone's entire file system over SFTP; navigate folders and open files
-- **Photo Grid** — View your most recent camera roll photos as square thumbnails; click to select, right-click to copy or save, double-click to open; supports Ctrl+C
-- **Send Files** — Send any file from your PC to the phone with one click
-- **Battery & Status** — Phone battery level and connection status always visible in the header bar
-- **Ring Phone** — Make your phone ring from the desktop (useful for finding it)
-- **Modern UI** — Native GTK4/Libadwaita look with dark mode support and responsive layout
+- **Texts** — every conversation from the phone; send texts and pictures from the desktop
+- **Search** — finds a word in any message, however old; opening a result jumps to that message. **Ctrl+F** searches inside one chat
+- **Contact names** — learned from notifications and calls, or imported from Google Contacts (one click: **Settings** (gear button) **→ Google Contacts → Connect**), a VCF or a CSV
+- **Notifications** — live phone notifications in a side tray; expand, dismiss or reply from the desktop
+- **Files** — browse the phone's storage, see recent photos as a grid, copy, save, or send files to the phone
+- **Battery and status** in the header bar; **ring the phone** to find it
+- **Tray icon** and **Open on Login**
+- **Optional Google Messages link** — delete chats on the phone, and keep read/unread in step both ways (see [Google Messages link](#optional-google-messages-link))
 
 ---
 
 ## Requirements
 
-- **Linux** with a GTK4-capable desktop (GNOME, Cinnamon, MATE, KDE Plasma, etc.)
-- **Python 3.8+**
-- **KDE Connect** on your Linux PC (`kdeconnect` package)
-- **KDE Connect** app on your Android phone
-- GTK4 and Libadwaita GObject introspection bindings
+- **GTK 4.10+** and **libadwaita 1.4+**. The app checks at startup and says plainly if yours are older.
+- **glibc 2.39+** for the ready-made download (build from source on older systems).
+- **KDE Connect** on the PC (`kdeconnect` package) and the **KDE Connect** app on your Android phone.
 
-### Tested On
+| Works | Too old (GTK or libadwaita) |
+|---|---|
+| Fedora 40 and newer | Ubuntu 22.04 |
+| Ubuntu 24.04 and newer | Linux Mint 21 |
+| Linux Mint 22 and newer | Debian 12 |
+| Debian 13, Arch, openSUSE Tumbleweed | |
 
-| Component | Version |
-|-----------|---------|
-| OS | Linux Mint 22 Cinnamon |
-| Phone | Samsung Galaxy S25 (Android) |
-| KDE Connect (PC) | v23.08.5 |
-| GTK4 | 4.14.5 |
-| Libadwaita | 1.5.0 |
-| Python | 3.12 |
+Tested on Fedora 44 (KDE Plasma) with a Samsung Galaxy S25.
 
 ---
 
-## The Rust version
+## Install
 
-Needs GTK 4.10+ and libadwaita 1.4+ (the app checks at startup and says so
-if they are older), KDE Connect, and a Rust toolchain (1.98+) to build.
+### Step 1 — Install KDE Connect on your PC
+
+```bash
+# Fedora
+sudo dnf install kdeconnect
+# Debian / Ubuntu / Mint
+sudo apt install kdeconnect
+# Arch / Manjaro
+sudo pacman -S kdeconnect
+# openSUSE
+sudo zypper install kdeconnect-kde
+```
+
+Check it runs: `kdeconnect-cli --list-available`. If that errors, start the daemon with `kdeconnectd &`.
+
+### Step 1b — Install PhoneRelay
+
+Download `phonerelay-<version>-x86_64.tar.gz` from the [latest release](https://github.com/wardethan2000-eng/phonelink/releases/latest), then:
+
+```bash
+tar xzf phonerelay-*-x86_64.tar.gz
+cd phonerelay-*/
+./data/install-rust.sh ./phonelink-rs
+phonelink-rs
+```
+
+This puts `phonelink-rs` (and the optional Google Messages helper, `phonelink-gm`) in `~/.local/bin`, and adds a menu entry and icons. Nothing needs root. Turn on **Settings → Open on Login** to start it at login.
+
+To update, download the new release and run the same two lines again. Quit PhoneRelay first (tray icon → Quit), or the copy into `~/.local/bin` can fail with "Text file busy".
+
+**Build from source instead** (needs Rust 1.98+):
 
 ```bash
 # Fedora
@@ -63,67 +79,10 @@ sudo apt install kdeconnect libgtk-4-dev libadwaita-1-dev build-essential
 git clone https://github.com/wardethan2000-eng/phonelink.git
 cd phonelink
 cargo build --release
-data/install-rust.sh target/release/phonelink-rs   # ~/.local/bin + menu entry
-phonelink-rs
+data/install-rust.sh target/release/phonelink-rs
 ```
 
-Turn on **Settings → Open on Login** to start it at login; this replaces
-the Python version's login entry. Quit the Python version before starting
-the Rust one: both use the same message store, so only one may run at a
-time, and the Rust app refuses to start while the Python one is open.
-
-Google Contacts import needs a Google OAuth client, set up the same way as for
-the Python version (see below). Everything else works without one.
-
-The rest of this README describes the Python version.
-
-## Installation
-
-The core app runs with system packages only. Google Contacts import is optional and needs a few extra Python packages plus a Google OAuth desktop client configuration.
-
----
-
-### Step 1 — Install system packages on your Linux PC
-
-These packages provide Python, GTK4, Libadwaita, and the KDE Connect daemon. Install the group for your distro:
-
-**Debian / Ubuntu / Linux Mint:**
-```bash
-sudo apt update
-sudo apt install kdeconnect python3-gi python3-gi-cairo gir1.2-gtk-4.0 gir1.2-adw-1
-```
-
-**Fedora:**
-```bash
-sudo dnf install kdeconnect python3-gobject gtk4 libadwaita
-```
-
-**Arch Linux / Manjaro:**
-```bash
-sudo pacman -S kdeconnect python-gobject gtk4 libadwaita
-```
-
-**openSUSE:**
-```bash
-sudo zypper install kdeconnect-kde python3-gobject typelib-1_0-Gtk-4_0 typelib-1_0-Adw-1
-```
-
-What each package does:
-
-| Package | Purpose |
-|---------|---------|
-| `kdeconnect` | The KDE Connect daemon (`kdeconnectd`) — handles all phone communication |
-| `python3-gi` | Python GObject Introspection bindings — lets Python talk to GTK |
-| `gir1.2-gtk-4.0` | GTK4 introspection data |
-| `gir1.2-adw-1` | Libadwaita introspection data (modern GNOME UI widgets) |
-
-After installing, verify KDE Connect is available:
-```bash
-kdeconnect-cli --list-available
-```
-If that command errors, start the daemon manually: `kdeconnectd &`
-
----
+A source build has no built-in Google client for Contacts import; see [Using your own Google client](#using-your-own-google-client).
 
 ### Step 2 — Install KDE Connect on your Android phone
 
@@ -155,14 +114,14 @@ This permission is **not** in the normal Permissions screen. You must find it se
 
 **Android Settings → Apps → Special app access → Notification access → KDE Connect → toggle ON**
 
-> Without Notification access, the Notifications tray in Phone Link will always be empty, even if the Notification sync plugin is enabled.
+> Without Notification access, the Notifications tray in PhoneRelay will always be empty, even if the Notification sync plugin is enabled.
 
 #### Special permission: Files (Android 11+)
 On Android 11 and newer, "Files and media" in the normal permissions screen only grants partial access. For full file system browsing you may also need:
 
 **Android Settings → Apps → Special app access → All files access → KDE Connect → toggle ON**
 
-> If the Files tab of Phone Link shows "Connecting to phone…" indefinitely, this is almost always the cause.
+> If the Files tab of PhoneRelay shows "Connecting to phone…" indefinitely, this is almost always the cause.
 
 ---
 
@@ -200,82 +159,25 @@ After pairing, open the paired device in the KDE Connect Android app, go to its 
 
 ---
 
-### Step 6 — Clone and run Phone Link
+### Step 6 — Open PhoneRelay
 
-```bash
-git clone https://github.com/wardethan2000-eng/phonelink.git
-cd phonelink
-./install.sh
-phonelink
-```
+Start **PhoneRelay** from the menu (or run `phonelink-rs`). Your phone should appear in the header bar within a few seconds, and the Messages tab fills in.
 
-The installer creates a local launcher, installs the desktop entry/icons, and refreshes desktop caches so Phone Link can appear in application search. You can still run a development checkout directly with `python3 run.py`.
+---
 
-### Optional — Enable native Google Contacts import
+## Optional: Google Messages link
 
-If you want the in-app **Import Google Contacts** button to work, install the Google API packages.
+KDE Connect can read and send texts, but it can't delete a chat on the phone, mark one read there, or tell the desktop when you read one on the phone. If your phone uses Google Messages, PhoneRelay can do these through a Google Messages "for web" connection:
 
-On Debian / Ubuntu / Linux Mint, prefer distro packages because the system Python is externally managed:
+- **Delete a chat** in PhoneRelay and it is deleted on the phone too (business chats included).
+- **Open a chat** in PhoneRelay and it is marked read on the phone.
+- **Read a chat on the phone** and its unread dot clears in PhoneRelay.
 
-```bash
-sudo apt install python3-googleapi python3-google-auth python3-google-auth-oauthlib python3-google-auth-httplib2
-```
+This runs through a small helper, `phonelink-gm`, installed next to the app. It is AGPL-3.0 because it uses [libgm](https://github.com/mautrix/gmessages) (see `phonelink-gm/LICENSE`); the app itself stays MIT and only runs the helper as a separate program.
 
-If you prefer a virtual environment, create one that can still see the system GTK bindings:
+For now, linking uses [gmcli](https://github.com/fdsouvenir/gmcli): install it (needs Go: `GOBIN="$HOME/.local/bin" go install github.com/fdsouvenir/gmcli@latest`) and run `gmcli auth` once. It opens Chrome, Chromium or Edge to sign in to Google, then shows an emoji to tap on the phone. PhoneRelay picks up gmcli's session from `~/.local/state/gmcli/session.json` the next time it starts. Pairing inside the app is planned.
 
-```bash
-python3 -m venv --system-site-packages .venv
-. .venv/bin/activate
-pip install google-auth-oauthlib google-api-python-client google-auth-httplib2
-```
-
-Then run the app from that virtualenv:
-
-```bash
-.venv/bin/python run.py
-```
-
-If you are not on Debian-based Linux, you can use pip directly in a virtualenv, or install equivalent distro packages if your distro provides them.
-
-```bash
-python3 -m pip install google-auth-oauthlib google-api-python-client google-auth-httplib2
-```
-
-The Rust app has Phone Link's own Google client built in: click **Connect** in Settings and pick your account. (Builds include it when `data/google_oauth_client.json`, the Desktop client JSON from Google Cloud, is present; it is kept out of git.) The options below are for the Python app, or to use your own Google Cloud client instead.
-
-Then configure a Google OAuth desktop client for Phone Link.
-
-Option A: environment variables
-
-```bash
-export PHONELINK_GOOGLE_CLIENT_ID="your-google-oauth-client-id"
-export PHONELINK_GOOGLE_CLIENT_SECRET="your-google-oauth-client-secret"
-```
-
-Option B: config file at `~/.config/phonelink/google_oauth.json`
-
-```json
-{
-  "installed": {
-    "client_id": "your-google-oauth-client-id",
-    "client_secret": "your-google-oauth-client-secret",
-    "auth_uri": "https://accounts.google.com/o/oauth2/auth",
-    "token_uri": "https://oauth2.googleapis.com/token",
-    "redirect_uris": [
-      "http://127.0.0.1",
-      "http://localhost"
-    ]
-  }
-}
-```
-
-Once configured, the app opens your browser for Google sign-in on the first import and reuses the saved token on later imports.
-
-If the app starts and shows a **"KDE Connect Not Found"** error, the daemon is not running. Start it:
-```bash
-kdeconnectd &
-```
-Then relaunch the app.
+Limits: it's an unofficial protocol, so Google can break it until the helper is updated. The phone must be online. Google drops a link unused for about 14 days. Google Messages allows one web session at a time, so opening messages.google.com in a browser takes the link away from PhoneRelay.
 
 ---
 
@@ -286,7 +188,7 @@ Then relaunch the app.
 The header bar is always visible and shows:
 
 - **Left**: Phone icon, device name, and a coloured dot (green = connected, orange = paired but not reachable, grey = no device)
-- **Centre**: Tab switcher (Messages / Files)
+- **Centre**: Tab switcher (Messages / Files / Clipboard)
 - **Right**: Battery icon and percentage, notification bell button, ring phone button
 
 ### Messages Tab
@@ -295,7 +197,9 @@ The header bar is always visible and shows:
 - Click a conversation to open the full message thread on the right
 - Type in the compose bar at the bottom and press **Enter** or click **Send**
 - Click **+** to start a new conversation with any phone number
-- **Right-click** a conversation → **Set contact name** to assign a display name
+- **Right-click** a conversation → **Set contact name** to assign a display name, or **Delete**
+- Type in the search box to find any message; **Ctrl+F** finds text inside the open chat
+- Paste a picture with **Ctrl+V** to send it
 
 ### Notifications Tray
 
@@ -359,20 +263,20 @@ In the Messages tab, click the **contacts icon** next to the search bar → **Im
 
 ### Option D: Import Google Contacts directly
 
-In the Messages tab, click the **contacts icon** next to the search bar → **Import Google Contacts**.
+Open **Settings → Google Contacts → Connect**.
 
 On first use:
 
-1. Phone Link opens your browser
+1. PhoneRelay opens your browser
 2. You sign in to Google
 3. You grant read-only contacts access
-4. Phone Link imports your contacts automatically
+4. PhoneRelay imports your contacts automatically
 
 After the first authorization, later imports can reuse the saved Google token and run with one click.
 
-You can also manage the connection from **Preferences → Google Contacts**. That page shows the connected account, lets you refresh or disconnect it, and controls a low-volume background refresh that runs at most once every 24 hours.
+You can also manage the connection from **Settings → Google Contacts**. That page shows the connected account, lets you refresh or disconnect it, and controls a low-volume background refresh that runs at most once every 24 hours.
 
-When Google contact photos are available, Phone Link caches them locally and shows them for contacts that already appear in your active conversations.
+When Google contact photos are available, PhoneRelay caches them locally and shows them for contacts that already appear in your active conversations.
 
 ### Option E: Set a name manually
 
@@ -380,16 +284,29 @@ Right-click any conversation → **Set contact name**.
 
 ### Where contacts are stored
 
-`~/.local/share/phonelink/contacts.json` — a simple JSON mapping phone number digits to display names:
+In `~/.local/share/phonelink/messages.db` (a SQLite file, shared with the retired Python version). For Google Contacts import, OAuth tokens are stored separately at `~/.local/share/phonelink/google_token.json`.
+
+---
+
+### Using your own Google client
+
+Release downloads have PhoneRelay's Google client built in. A source build (or anyone who prefers their own Google Cloud project) can use a Desktop OAuth client instead:
+
+Save it as `~/.config/phonelink/google_oauth.json`:
 
 ```json
 {
-  "13165551234": "John Smith",
-  "13165559999": "Jane Doe"
+  "installed": {
+    "client_id": "your-google-oauth-client-id",
+    "client_secret": "your-google-oauth-client-secret",
+    "auth_uri": "https://accounts.google.com/o/oauth2/auth",
+    "token_uri": "https://oauth2.googleapis.com/token",
+    "redirect_uris": ["http://127.0.0.1", "http://localhost"]
+  }
 }
 ```
 
-For Google Contacts import, OAuth tokens are stored separately at `~/.local/share/phonelink/google_token.json`.
+Or set `PHONELINK_GOOGLE_CLIENT_ID` and `PHONELINK_GOOGLE_CLIENT_SECRET`.
 
 ---
 
@@ -398,12 +315,19 @@ For Google Contacts import, OAuth tokens are stored separately at `~/.local/shar
 | Shortcut | Where | Action |
 |----------|-------|--------|
 | `Enter` | Messages compose bar | Send message |
+| `Ctrl+V` | Messages compose bar | Paste a picture to send |
+| `Ctrl+F` | Open chat | Find text in this chat (`Enter` / `Shift+Enter` step through matches, `Esc` closes) |
+| `Ctrl+N` | Anywhere | Show or hide the notifications tray |
+| `Ctrl+plus` / `Ctrl+minus` / `Ctrl+0` | Open chat | Text size |
 | `Ctrl+C` | Files → Recent Photos | Copy selected photos to clipboard |
-| `Ctrl+Q` | Anywhere | Quit the app |
 
 ---
 
 ## Troubleshooting
+
+### "GTK or libadwaita is too old" at startup
+
+Your distro's GTK 4 or libadwaita is older than PhoneRelay needs (see [Requirements](#requirements)). Ubuntu 22.04, Mint 21 and Debian 12 are too old; upgrading the distro is the fix.
 
 ### "No device connected" / phone not appearing
 
@@ -454,32 +378,23 @@ For Google Contacts import, OAuth tokens are stored separately at `~/.local/shar
 
 ```
 phonelink/
-├── run.py                          # Entry point
-├── pyproject.toml                  # Project metadata
-├── data/                           # Static assets (icons, desktop file, CSS)
-├── phonelink/
-│   ├── app.py                      # Adw.Application subclass, startup logic
-│   ├── contacts.py                 # Contact name resolver (JSON, VCF, CSV, notifications)
-│   ├── dbus_client.py              # KDE Connect D-Bus API wrapper
-│   ├── models.py                   # Data models: Device, SmsMessage, Conversation, Notification
-│   └── ui/
-│       ├── main_window.py          # Main window — header bar, tab stack, notification tray
-│       ├── sms_panel.py            # Messages tab (conversation list + message thread)
-│       ├── conversation_list.py    # Conversation list widget
-│       ├── message_thread.py       # Chat bubble thread view
-│       ├── notifications_panel.py  # Notification tray — compact expandable list
-│       └── files_panel.py          # Files tab — photo grid + SFTP file browser
+├── phonelink-rs/        # The app (Rust): core/ logic, dbus/ KDE Connect client, ui/ GTK
+├── phonelink-gm/        # Google Messages helper (Go, AGPL-3.0)
+├── data/                # Icons, desktop file, install-rust.sh
+├── docs/                # Design notes and plans
+├── scripts/             # Build and test helpers
+└── phonelink/, run.py   # The retired Python version
 ```
 
 ---
 
 ## How It Works
 
-Phone Link for Linux is a **thin frontend** — it does not implement any phone protocol itself. It talks to the [KDE Connect](https://kdeconnect.kde.org/) daemon over **D-Bus**:
+PhoneRelay is a **thin frontend** — it does not implement any phone protocol itself. It talks to the [KDE Connect](https://kdeconnect.kde.org/) daemon over **D-Bus**:
 
 ```
 ┌─────────────┐     D-Bus      ┌──────────────┐    TCP/TLS    ┌─────────────┐
-│  Phone Link │ ◄────────────► │ kdeconnectd  │ ◄───────────► │  KDE Connect│
+│  PhoneRelay │ ◄────────────► │ kdeconnectd  │ ◄───────────► │  KDE Connect│
 │  (this app) │  session bus   │  (daemon)    │   Wi-Fi       │  (Android)  │
 └─────────────┘                └──────────────┘               └─────────────┘
 ```
@@ -495,16 +410,138 @@ Phone Link for Linux is a **thin frontend** — it does not implement any phone 
 
 ---
 
-## Roadmap
+## Python version (retired)
 
-- [x] Phase 1: Foundation, D-Bus connection, device pairing
-- [x] Phase 2: SMS conversations — view, send, contact names, VCF/CSV import
-- [x] Phase 3: Live notifications tray with dismiss and reply
-- [x] Phase 4: File browser (SFTP), photo grid, send/receive files, copy/save
-- [ ] Phase 5: Desktop integration — autostart, system tray icon, desktop notifications
+PhoneRelay started as a Python app (`phonelink/`, `run.py`). The Rust app replaces it and reads the same messages, contacts and settings, so you can switch over without losing anything. Quit the Python app before starting the Rust one: they share the message store, and the Rust app refuses to start while the Python one is open. The Python version gets no new features and will be removed later; these steps are kept for anyone still using it.
+
+### Installing the Python version
+
+The core app runs with system packages only. Google Contacts import is optional and needs a few extra Python packages plus a Google OAuth desktop client configuration.
+
+---
+
+#### System packages
+
+These packages provide Python, GTK4, Libadwaita, and the KDE Connect daemon. Install the group for your distro:
+
+**Debian / Ubuntu / Linux Mint:**
+```bash
+sudo apt update
+sudo apt install kdeconnect python3-gi python3-gi-cairo gir1.2-gtk-4.0 gir1.2-adw-1
+```
+
+**Fedora:**
+```bash
+sudo dnf install kdeconnect python3-gobject gtk4 libadwaita
+```
+
+**Arch Linux / Manjaro:**
+```bash
+sudo pacman -S kdeconnect python-gobject gtk4 libadwaita
+```
+
+**openSUSE:**
+```bash
+sudo zypper install kdeconnect-kde python3-gobject typelib-1_0-Gtk-4_0 typelib-1_0-Adw-1
+```
+
+What each package does:
+
+| Package | Purpose |
+|---------|---------|
+| `kdeconnect` | The KDE Connect daemon (`kdeconnectd`) — handles all phone communication |
+| `python3-gi` | Python GObject Introspection bindings — lets Python talk to GTK |
+| `gir1.2-gtk-4.0` | GTK4 introspection data |
+| `gir1.2-adw-1` | Libadwaita introspection data (modern GNOME UI widgets) |
+
+After installing, verify KDE Connect is available:
+```bash
+kdeconnect-cli --list-available
+```
+If that command errors, start the daemon manually: `kdeconnectd &`
+
+---
+
+#### Clone and run
+
+```bash
+git clone https://github.com/wardethan2000-eng/phonelink.git
+cd phonelink
+./install.sh
+phonelink
+```
+
+The installer creates a local launcher, installs the desktop entry/icons, and refreshes desktop caches so PhoneRelay can appear in application search. You can still run a development checkout directly with `python3 run.py`.
+
+#### Optional — Google Contacts import (Python)
+
+If you want the in-app **Import Google Contacts** button to work, install the Google API packages.
+
+On Debian / Ubuntu / Linux Mint, prefer distro packages because the system Python is externally managed:
+
+```bash
+sudo apt install python3-googleapi python3-google-auth python3-google-auth-oauthlib python3-google-auth-httplib2
+```
+
+If you prefer a virtual environment, create one that can still see the system GTK bindings:
+
+```bash
+python3 -m venv --system-site-packages .venv
+. .venv/bin/activate
+pip install google-auth-oauthlib google-api-python-client google-auth-httplib2
+```
+
+Then run the app from that virtualenv:
+
+```bash
+.venv/bin/python run.py
+```
+
+If you are not on Debian-based Linux, you can use pip directly in a virtualenv, or install equivalent distro packages if your distro provides them.
+
+```bash
+python3 -m pip install google-auth-oauthlib google-api-python-client google-auth-httplib2
+```
+
+Then configure a Google OAuth desktop client for PhoneRelay.
+
+Option A: environment variables
+
+```bash
+export PHONELINK_GOOGLE_CLIENT_ID="your-google-oauth-client-id"
+export PHONELINK_GOOGLE_CLIENT_SECRET="your-google-oauth-client-secret"
+```
+
+Option B: config file at `~/.config/phonelink/google_oauth.json`
+
+```json
+{
+  "installed": {
+    "client_id": "your-google-oauth-client-id",
+    "client_secret": "your-google-oauth-client-secret",
+    "auth_uri": "https://accounts.google.com/o/oauth2/auth",
+    "token_uri": "https://oauth2.googleapis.com/token",
+    "redirect_uris": [
+      "http://127.0.0.1",
+      "http://localhost"
+    ]
+  }
+}
+```
+
+Once configured, the app opens your browser for Google sign-in on the first import and reuses the saved token on later imports.
+
+If the app starts and shows a **"KDE Connect Not Found"** error, the daemon is not running. Start it:
+```bash
+kdeconnectd &
+```
+Then relaunch the app.
+
+---
+
 
 ---
 
 ## License
 
-MIT — see [LICENSE](LICENSE).
+MIT — see [LICENSE](LICENSE). The Google Messages helper in `phonelink-gm/` is AGPL-3.0-or-later (see [phonelink-gm/LICENSE](phonelink-gm/LICENSE)).
