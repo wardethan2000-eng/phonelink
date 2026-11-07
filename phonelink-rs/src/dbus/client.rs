@@ -208,6 +208,12 @@ impl Client {
 
     /// True if the KDE Connect daemon owns its bus name.
     pub async fn is_daemon_available(&self) -> bool {
+        self.daemon_name_has_owner().await.unwrap_or(false)
+    }
+
+    /// `NameHasOwner` for the daemon's bus name, keeping the error so
+    /// `--dump` can say why it could not tell.
+    pub async fn daemon_name_has_owner(&self) -> Result<bool, String> {
         let reply = self
             .bus
             .call_future(
@@ -220,8 +226,30 @@ impl Client {
                 gio::DBusCallFlags::NONE,
                 CALL_TIMEOUT_MS,
             )
-            .await;
-        reply.ok().and_then(|r| r.get::<(bool,)>()).is_some_and(|(b,)| b)
+            .await
+            .map_err(|e| e.message().to_string())?;
+        reply.get::<(bool,)>().map(|(b,)| b).ok_or_else(|| "NameHasOwner: unexpected reply".to_string())
+    }
+
+    /// Bus names on this session bus that mention KDE Connect. Diagnostic
+    /// only: shows whether the daemon is on a different bus or a different name.
+    pub async fn kdeconnect_bus_names(&self) -> Result<Vec<String>, String> {
+        let reply = self
+            .bus
+            .call_future(
+                Some("org.freedesktop.DBus"),
+                "/org/freedesktop/DBus",
+                "org.freedesktop.DBus",
+                "ListNames",
+                None,
+                Some(VariantTy::new("(as)").unwrap()),
+                gio::DBusCallFlags::NONE,
+                CALL_TIMEOUT_MS,
+            )
+            .await
+            .map_err(|e| e.message().to_string())?;
+        let (names,) = reply.get::<(Vec<String>,)>().ok_or_else(|| "ListNames: unexpected reply".to_string())?;
+        Ok(names.into_iter().filter(|n| n.to_ascii_lowercase().contains("kdeconnect")).collect())
     }
 
     /// All known device ids.

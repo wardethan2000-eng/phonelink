@@ -145,9 +145,32 @@ pub async fn run(signatures: bool) -> i32 {
             return 1;
         }
     };
-    let present = client.is_daemon_available().await;
-    println!("daemon: {}", if present { "present" } else { "NOT RUNNING" });
+    let present = match client.daemon_name_has_owner().await {
+        Ok(true) => {
+            println!("daemon: present");
+            true
+        }
+        Ok(false) => {
+            println!("daemon: {BUS_NAME} has no owner on this session bus");
+            false
+        }
+        Err(e) => {
+            println!("daemon: could not ask the session bus ({e})");
+            false
+        }
+    };
     if !present {
+        // Usually a terminal on a different session bus than the desktop
+        // (tmux/screen started elsewhere, ssh, sudo), so say which bus.
+        match std::env::var("DBUS_SESSION_BUS_ADDRESS") {
+            Ok(a) => println!("  DBUS_SESSION_BUS_ADDRESS={a}"),
+            Err(_) => println!("  DBUS_SESSION_BUS_ADDRESS is not set"),
+        }
+        match client.kdeconnect_bus_names().await {
+            Ok(names) if names.is_empty() => println!("  no KDE Connect names on this bus"),
+            Ok(names) => println!("  KDE Connect names on this bus: {}", names.join(", ")),
+            Err(e) => println!("  could not list bus names ({e})"),
+        }
         return 1;
     }
 

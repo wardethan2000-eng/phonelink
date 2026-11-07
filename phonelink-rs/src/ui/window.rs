@@ -318,6 +318,25 @@ impl Window {
                 this.body.set_visible_child_name("settings");
             }
         });
+        // A tab click leaves Settings. The capture-phase gesture catches a
+        // click on the tab that is already active (the stack doesn't change,
+        // so no notify fires); the notify covers keyboard switching.
+        let leave_settings = {
+            let body = this.body.downgrade();
+            move || {
+                if let Some(b) = body.upgrade()
+                    && b.visible_child_name().as_deref() == Some("settings")
+                {
+                    b.set_visible_child_name("main");
+                }
+            }
+        };
+        let tab_click = gtk::GestureClick::new();
+        tab_click.set_propagation_phase(gtk::PropagationPhase::Capture);
+        let leave = leave_settings.clone();
+        tab_click.connect_pressed(move |_, _, _, _| leave());
+        switcher.add_controller(tab_click);
+        stack.connect_visible_child_notify(move |_| leave_settings());
         let weak = Rc::downgrade(&this);
         this.header.device_list.connect_row_activated(move |_, row| {
             if let Some(this) = weak.upgrade() {
