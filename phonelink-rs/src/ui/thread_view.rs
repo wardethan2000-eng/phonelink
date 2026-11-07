@@ -882,7 +882,7 @@ impl ThreadView {
         let preview_text = gtk::Box::new(gtk::Orientation::Vertical, 4);
         preview_text.set_valign(gtk::Align::Center);
         preview_text.set_hexpand(true);
-        let preview_label = gtk::Label::new(Some("Picture pasted"));
+        let preview_label = gtk::Label::new(Some("Picture to send"));
         preview_label.add_css_class("heading");
         preview_label.set_xalign(0.0);
         preview_text.append(&preview_label);
@@ -904,6 +904,10 @@ impl ThreadView {
         compose.set_margin_end(12);
         compose.set_margin_top(8);
         compose.set_margin_bottom(8);
+        let attach_button = gtk::Button::from_icon_name("mail-attachment-symbolic");
+        attach_button.add_css_class("flat");
+        attach_button.set_tooltip_text(Some("Add a picture"));
+        compose.append(&attach_button);
         let entry = gtk::Entry::new();
         entry.set_placeholder_text(Some("Type a message…  (Ctrl+V pastes a picture)"));
         entry.set_hexpand(true);
@@ -938,6 +942,24 @@ impl ThreadView {
             find_label,
             state: RefCell::new(State { window: THREAD_WINDOW, pinned: true, ..Default::default() }),
         });
+
+        let weak = Rc::downgrade(&this);
+        attach_button.connect_clicked(move |_| {
+            if let Some(this) = weak.upgrade() {
+                this.pick_picture();
+            }
+        });
+        // A picture dragged from the file manager onto the chat.
+        let drop = gtk::DropTarget::new(gio::File::static_type(), gdk::DragAction::COPY);
+        let weak = Rc::downgrade(&this);
+        drop.connect_drop(move |_, value, _, _| {
+            let (Some(this), Ok(file)) = (weak.upgrade(), value.get::<gio::File>()) else { return false };
+            let Some(path) = file.path().and_then(|p| image_path_from_uri_list(&p.to_string_lossy())) else { return false };
+            this.set_pending_image(path);
+            this.entry.grab_focus();
+            true
+        });
+        thread_box.add_controller(drop);
 
         let weak = Rc::downgrade(&this);
         find_entry.connect_search_changed(move |e| {
@@ -1222,6 +1244,33 @@ impl ThreadView {
             return true;
         }
         false
+    }
+
+    /// The paperclip: choose a picture to go with the next message.
+    fn pick_picture(self: &Rc<Self>) {
+        let filter = gtk::FileFilter::new();
+        filter.set_name(Some("Pictures"));
+        for ext in IMAGE_FILE_EXTS {
+            filter.add_suffix(ext);
+        }
+        let filters = gio::ListStore::new::<gtk::FileFilter>();
+        filters.append(&filter);
+        let dialog = gtk::FileDialog::new();
+        dialog.set_title("Add a picture");
+        dialog.set_filters(Some(&filters));
+        dialog.set_default_filter(Some(&filter));
+        if let Some(pictures) = glib::user_special_dir(glib::UserDirectory::Pictures) {
+            dialog.set_initial_folder(Some(&gio::File::for_path(pictures)));
+        }
+        let window = self.entry.root().and_downcast::<gtk::Window>();
+        let weak = Rc::downgrade(self);
+        dialog.open(window.as_ref(), gio::Cancellable::NONE, move |res| {
+            let (Some(this), Ok(file)) = (weak.upgrade(), res) else { return };
+            if let Some(path) = file.path().filter(|p| p.is_file()) {
+                this.set_pending_image(path);
+                this.entry.grab_focus();
+            }
+        });
     }
 
     fn set_pending_image(&self, path: PathBuf) {
