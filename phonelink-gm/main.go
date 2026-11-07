@@ -7,9 +7,11 @@
 //
 //	phonelink-gm status
 //	phonelink-gm delete [--dry-run] CHAT...
+//	phonelink-gm members          (debugging: every chat's members, JSON lines)
 //
 // Each CHAT is the chat's other members' numbers, comma-separated
-// ("+13165551234" or "+13165551234,+13165555678"). It must match exactly one
+// ("+13165551234" or "+13165551234,+13165555678"), or a business chat's
+// address ("name_agent@rbm.goog"). It must match exactly one
 // Google Messages conversation, or it is left alone.
 //
 // Prints one JSON object; "results" has one entry per CHAT, in order. Exit 0
@@ -124,7 +126,12 @@ func saveAuth(path string, auth *libgm.AuthData) error {
 var nonDigit = regexp.MustCompile(`\D`)
 
 // phoneKey: last 10 digits (or all when shorter), like PhoneRelay's.
+// Business chats (RCS agents such as "name_agent@rbm.goog") and email
+// addresses have no phone number: they are matched by the whole address.
 func phoneKey(s string) string {
+	if strings.Contains(s, "@") {
+		return strings.ToLower(strings.TrimSpace(s))
+	}
 	d := nonDigit.ReplaceAllString(s, "")
 	if len(d) > 10 {
 		d = d[len(d)-10:]
@@ -232,7 +239,7 @@ func main() {
 	if cmd == "status" {
 		finish(result{OK: true, Paired: err == nil})
 	}
-	if cmd != "delete" {
+	if cmd != "delete" && cmd != "members" {
 		fail("usage", "unknown command %q", cmd)
 	}
 	if err != nil {
@@ -242,11 +249,11 @@ func main() {
 	for _, arg := range fs.Args() {
 		k := keySet(strings.Split(arg, ","))
 		if k == "" {
-			fail("usage", "chat %q has no phone number", arg)
+			fail("usage", "chat %q has no phone number or address", arg)
 		}
 		chats = append(chats, k)
 	}
-	if len(chats) == 0 {
+	if len(chats) == 0 && cmd != "members" {
 		fail("usage", "no chats given")
 	}
 
@@ -323,6 +330,18 @@ func main() {
 			}
 			convs = append(convs, resp.GetConversations()...)
 		}
+	}
+	if cmd == "members" {
+		fetchAll()
+		enc := json.NewEncoder(os.Stdout)
+		for _, c := range convs {
+			var ps []map[string]any
+			for _, p := range c.GetParticipants() {
+				ps = append(ps, map[string]any{"number": p.GetID().GetNumber(), "formatted": p.GetFormattedNumber(), "me": p.GetIsMe(), "pid": p.GetID().GetParticipantID()})
+			}
+			_ = enc.Encode(map[string]any{"id": c.GetConversationID(), "name": c.GetName(), "unread": c.GetUnread(), "status": c.GetStatus().String(), "others": others(c), "participants": ps})
+		}
+		os.Exit(0)
 	}
 	out := result{OK: true, DryRun: *dryRun}
 	for _, want := range chats {

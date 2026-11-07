@@ -43,3 +43,19 @@ func TestPickNeedsExactlyOneChatWithExactlyThoseMembers(t *testing.T) {
 		t.Fatal("picked a deleted chat")
 	}
 }
+
+func TestBusinessChatsMatchByAddress(t *testing.T) {
+	me := part("+13165550000", true)
+	convs := []*gmproto.Conversation{
+		conv("1", me, part("shop_ab3cd_agent@rbm.goog", false)),
+		conv("2", me, part("other_xy3z_agent@rbm.goog", false)),
+		conv("3", me, part("3", false)),
+	}
+	if c, why := pick(convs, keySet([]string{" Shop_AB3CD_agent@rbm.goog"})); c == nil || c.GetConversationID() != "1" {
+		t.Fatalf("business pick = %v %s", c, why)
+	}
+	// The digits inside an agent address are not a phone number.
+	if got := keySet([]string{"other_xy3z_agent@rbm.goog"}); got == "3" {
+		t.Fatal("agent address keyed by its digits")
+	}
+}
