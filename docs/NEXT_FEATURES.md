@@ -208,6 +208,12 @@ phone. Incoming RCS shows up within a few seconds without KDE Connect.
 laptop can install from it by following the README alone, and both comments
 are posted.
 
+**Status 2026-11-06: done.** v0.2.0 released (main = rust-port at the tag),
+archive built by `scripts/remote-build.sh release`, CI runs Rust and Go jobs
+on ubuntu-24.04, #8 and #6 commented; #1 skipped (Ethan). The install was
+checked into a throwaway `$HOME`, not a real second user account. Also done
+ahead of B: deletes and read sync through `phonelink-gm serve`.
+
 ---
 
 ## D. Calls in the chat (reduced)

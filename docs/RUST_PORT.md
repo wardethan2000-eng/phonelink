@@ -341,8 +341,8 @@ Things said in public that the project owes people. Close each one out when
 it is done.
 | Where | Said (date) | Owed |
 |---|---|---|
-| Issue #8 | 2026-11-05: rewriting in Rust; single binary, Flatpak planned; "I'll post here when it's ready" | A comment on #8 when the Rust app has a release, with install steps, inviting the reporter to package it for Fedora. The 2026-11-05 comment said a Flatpak was planned. While it is on hold, don't repeat that, and correct it in the follow-up if it's still undecided |
-| Issue #6 | 2026-11-05: likely too-old GTK/Adw on Mint 21; the Rust version will check at startup and say so plainly; asked for `python3 run.py` output | Ship the startup version check, then comment on #6. Read any terminal output the reporter posts |
+| Issue #8 | 2026-11-05: rewriting in Rust; single binary, Flatpak planned; "I'll post here when it's ready" | A comment on #8 when the Rust app has a release, with install steps, inviting the reporter to package it for Fedora. The 2026-11-05 comment said a Flatpak was planned. While it is on hold, don't repeat that, and correct it in the follow-up if it's still undecided **Done 2026-11-06:** commented with the v0.2.0 release link. |
+| Issue #6 | 2026-11-05: likely too-old GTK/Adw on Mint 21; the Rust version will check at startup and say so plainly; asked for `python3 run.py` output | Ship the startup version check, then comment on #6. Read any terminal output the reporter posts **Done 2026-11-06:** commented with the v0.2.0 release link. |
 | Issue #1 | 2026-11-05: hard (KDE Connect can't stream the camera), not in the plans, Rust version in progress | Nothing owed; mention the Rust release there as a courtesy |
 
 ## Phase 8: Flatpak (ON HOLD)
