@@ -769,9 +769,9 @@ pub struct ThreadView {
     messages_box: gtk::Box,
     pub entry: gtk::Entry,
     pub send_button: gtk::Button,
-    preview_bar: gtk::Box,
-    preview_picture: gtk::Image,
-    preview_label: gtk::Label,
+    preview_bar: gtk::Overlay,
+    preview_picture: gtk::Picture,
+    preview_clamps: (adw::Clamp, adw::Clamp),
     pending_image: RefCell<Option<PathBuf>>,
     /// `(thread_id, text, picture)` → whether it was taken (then the compose
     /// bar clears).
@@ -866,39 +866,33 @@ impl ThreadView {
 
         thread_box.append(&gtk::Separator::new(gtk::Orientation::Horizontal));
 
-        // A picture waiting to go with the next send: a small square
-        // thumbnail, its name, and a remove button.
-        let preview_bar = gtk::Box::new(gtk::Orientation::Horizontal, 10);
+        // A picture waiting to go with the next send: just the picture, in
+        // its own shape, with a remove button on its corner.
+        let preview_bar = gtk::Overlay::new();
         preview_bar.set_margin_start(12);
         preview_bar.set_margin_end(12);
         preview_bar.set_margin_top(8);
         preview_bar.set_halign(gtk::Align::Start);
-        preview_bar.add_css_class("compose-image-preview-card");
         preview_bar.set_visible(false);
-        let preview_picture = gtk::Image::new();
-        preview_picture.set_pixel_size(PREVIEW_THUMB);
+        let preview_picture = gtk::Picture::new();
+        preview_picture.set_can_shrink(true);
+        preview_picture.set_content_fit(gtk::ContentFit::Cover);
         preview_picture.set_overflow(gtk::Overflow::Hidden);
         preview_picture.add_css_class("compose-thumb");
-        preview_bar.append(&preview_picture);
-        let preview_text = gtk::Box::new(gtk::Orientation::Vertical, 2);
-        preview_text.set_valign(gtk::Align::Center);
-        let preview_label = gtk::Label::new(None);
-        preview_label.set_xalign(0.0);
-        preview_label.set_ellipsize(pango::EllipsizeMode::Middle);
-        preview_label.set_max_width_chars(28);
-        preview_text.append(&preview_label);
-        let preview_hint = gtk::Label::new(Some("Sends with your next message"));
-        preview_hint.add_css_class("dim-label");
-        preview_hint.add_css_class("caption");
-        preview_hint.set_xalign(0.0);
-        preview_text.append(&preview_hint);
-        preview_bar.append(&preview_text);
+        // A picture asks for its full pixel size; the clamps hold it to the
+        // size picked in `set_pending_image`.
+        let preview_clamp_w = adw::Clamp::builder().orientation(gtk::Orientation::Horizontal).child(&preview_picture).build();
+        let preview_clamp_h = adw::Clamp::builder().orientation(gtk::Orientation::Vertical).child(&preview_clamp_w).build();
+        preview_bar.set_child(Some(&preview_clamp_h));
         let preview_remove = gtk::Button::from_icon_name("window-close-symbolic");
-        preview_remove.add_css_class("flat");
+        preview_remove.add_css_class("osd");
         preview_remove.add_css_class("circular");
-        preview_remove.set_valign(gtk::Align::Center);
+        preview_remove.set_halign(gtk::Align::End);
+        preview_remove.set_valign(gtk::Align::Start);
+        preview_remove.set_margin_top(6);
+        preview_remove.set_margin_end(6);
         preview_remove.set_tooltip_text(Some("Remove picture"));
-        preview_bar.append(&preview_remove);
+        preview_bar.add_overlay(&preview_remove);
         thread_box.append(&preview_bar);
 
         let compose = gtk::Box::new(gtk::Orientation::Horizontal, 8);
@@ -931,7 +925,7 @@ impl ThreadView {
             send_button: send_button.clone(),
             preview_bar,
             preview_picture,
-            preview_label,
+            preview_clamps: (preview_clamp_w, preview_clamp_h),
             pending_image: RefCell::default(),
             on_send: RefCell::default(),
             font_scale: Cell::new(1.0),
@@ -1278,11 +1272,14 @@ impl ThreadView {
 
     fn set_pending_image(&self, path: PathBuf) {
         self.clear_pending_image(true);
-        let scale = self.preview_picture.scale_factor().max(1);
-        self.preview_picture.set_paintable(square_thumbnail(&path, PREVIEW_THUMB * scale).as_ref());
-        let pasted = private_tmp::contains(&path);
-        let name = path.file_name().map(|n| n.to_string_lossy().into_owned()).filter(|_| !pasted);
-        self.preview_label.set_text(name.as_deref().unwrap_or("Pasted picture"));
+        let (w, h) = gtk::gdk_pixbuf::Pixbuf::file_info(&path).map_or((4, 3), |(_, w, h)| (w.max(1), h.max(1)));
+        let (w, h) = preview_size(w, h);
+        self.preview_picture.set_size_request(w, h);
+        for (clamp, max) in [(&self.preview_clamps.0, w), (&self.preview_clamps.1, h)] {
+            clamp.set_maximum_size(max);
+            clamp.set_tightening_threshold(max);
+        }
+        self.preview_picture.set_filename(Some(&path));
         self.preview_bar.set_visible(true);
         *self.pending_image.borrow_mut() = Some(path);
     }
@@ -1295,7 +1292,7 @@ impl ThreadView {
         {
             let _ = std::fs::remove_file(path);
         }
-        self.preview_picture.set_paintable(None::<&gdk::Paintable>);
+        self.preview_picture.set_filename(None::<&Path>);
         self.preview_bar.set_visible(false);
     }
 
@@ -1918,17 +1915,15 @@ pub fn image_path_from_uri_list(text: &str) -> Option<PathBuf> {
     })
 }
 
-/// Side of the compose bar's picture thumbnail, in px.
-const PREVIEW_THUMB: i32 = 56;
+/// The compose bar's picture fits in this box (px), keeping its shape.
+const PREVIEW_MAX: (f64, f64) = (280.0, 200.0);
 
-/// The middle square of a picture, `size` px on a side, for the compose
-/// bar (the whole picture squeezed in looked odd next to its name).
-fn square_thumbnail(path: &Path, size: i32) -> Option<gdk::Texture> {
-    let pb = gtk::gdk_pixbuf::Pixbuf::from_file(path).ok()?.apply_embedded_orientation()?;
-    let side = pb.width().min(pb.height());
-    let square = pb.new_subpixbuf((pb.width() - side) / 2, (pb.height() - side) / 2, side, side);
-    let small = square.scale_simple(size, size, gtk::gdk_pixbuf::InterpType::Bilinear)?;
-    Some(gdk::Texture::for_pixbuf(&small))
+/// Size of the compose bar's picture for a `w`×`h` image: as large as fits
+/// in [`PREVIEW_MAX`], never blown up past its own size.
+fn preview_size(w: i32, h: i32) -> (i32, i32) {
+    let (fw, fh) = (f64::from(w), f64::from(h));
+    let fit = (PREVIEW_MAX.0 / fw).min(PREVIEW_MAX.1 / fh).min(1.0);
+    (((fw * fit).round() as i32).max(24), ((fh * fit).round() as i32).max(24))
 }
 
 fn earlier_label(hidden: usize) -> String {
@@ -1991,6 +1986,11 @@ mod tests {
     fn names_are_sanitized_as_python() {
         assert_eq!(sanitize_name("a b/c.jpg"), "a_b_c.jpg");
         assert_eq!(sanitize_name("..__"), "attachment");
+        // The picture about to go keeps its shape.
+        assert_eq!(preview_size(1600, 1200), (267, 200));
+        assert_eq!(preview_size(1080, 1920), (113, 200));
+        assert_eq!(preview_size(4000, 1000), (280, 70));
+        assert_eq!(preview_size(100, 80), (100, 80));
         let att = Attachment { file_name: "IMG 1".into(), mime_type: "image/png".into(), ..Default::default() };
         assert_eq!(attachment_name(&att), "IMG_1.png");
     }
