@@ -7,6 +7,7 @@ import html
 import os
 import re
 import shutil
+import stat
 import tempfile
 import webbrowser
 from collections import OrderedDict
@@ -29,7 +30,55 @@ from phonelink.settings import (
 from phonelink.ui.icons import resolve_icon
 
 
-ATTACHMENT_CACHE_DIR = Path(tempfile.gettempdir()) / "phonelink" / "message_attachments"
+def _private_tmp_dir(sub=None):
+    """Per-user scratch folder, mode 0700: $XDG_RUNTIME_DIR/phonelink, else
+    ~/.cache/phonelink/tmp. Never the shared /tmp, where another user could
+    read pictures or create the folder first. Refuses a symlink or a folder
+    owned by someone else."""
+    runtime = os.environ.get("XDG_RUNTIME_DIR", "")
+    if runtime and os.path.isabs(runtime) and os.path.isdir(runtime):
+        base = Path(runtime) / "phonelink"
+    else:
+        base = Path(GLib.get_user_cache_dir()) / "phonelink" / "tmp"
+    base.parent.mkdir(parents=True, exist_ok=True)
+    for d in [base] + ([base / sub] if sub else []):
+        try:
+            d.mkdir(mode=0o700)
+        except FileExistsError:
+            pass
+        st = os.lstat(d)
+        if not stat.S_ISDIR(st.st_mode) or st.st_uid != os.getuid():
+            raise OSError(f"{d} is not a private folder")
+        if st.st_mode & 0o077:
+            os.chmod(d, 0o700)
+    return base / sub if sub else base
+
+
+def _is_scratch_file(path):
+    """Only pictures the app saved itself may be deleted; a file pasted from
+    the user's own folders is never touched (issue #9)."""
+    try:
+        base = _private_tmp_dir().resolve()
+        real = Path(path).resolve()
+    except OSError:
+        return False
+    return real != base and real.is_relative_to(base)
+
+
+def _is_app_file(path):
+    """Only files the app wrote itself may be shown from a path payload: the
+    payload comes from the phone."""
+    try:
+        real = Path(path).resolve(strict=True)
+    except OSError:
+        return False
+    for d in (_private_tmp_dir(), FULL_ATTACHMENT_CACHE_DIR):
+        try:
+            if real != d.resolve() and real.is_relative_to(d.resolve()):
+                return True
+        except OSError:
+            continue
+    return False
 
 # Persistent cache for full-resolution attachment files the phone sends on
 # request. Kept out of /tmp so upgraded images survive a restart.
@@ -201,15 +250,18 @@ def _attachment_local_path(att: dict) -> str | None:
 
     if payload.startswith("file://"):
         file_path = unquote(urlparse(payload).path)
-        return file_path if os.path.isfile(file_path) else None
+        return file_path if os.path.isfile(file_path) and _is_app_file(file_path) else None
 
-    if os.path.isfile(payload):
-        return payload
+    if os.path.isabs(payload) and os.path.isfile(payload):
+        return payload if _is_app_file(payload) else None
 
-    ATTACHMENT_CACHE_DIR.mkdir(parents=True, exist_ok=True)
+    try:
+        cache_dir = _private_tmp_dir("message_attachments")
+    except OSError:
+        return None
     unique_identifier = str(att.get("uniqueIdentifier") or att.get("partId") or "attachment")
     digest = hashlib.sha1(payload.encode("utf-8", errors="ignore")).hexdigest()[:12]
-    target = ATTACHMENT_CACHE_DIR / f"{_sanitize_name(unique_identifier)}-{digest}{_attachment_ext(str(att.get('mimeType') or ''))}"
+    target = cache_dir / f"{_sanitize_name(unique_identifier)}-{digest}{_attachment_ext(str(att.get('mimeType') or ''))}"
     if target.is_file():
         return str(target)
 
@@ -220,7 +272,9 @@ def _attachment_local_path(att: dict) -> str | None:
     if not data:
         return None
     try:
-        target.write_bytes(data)
+        fd = os.open(target, os.O_WRONLY | os.O_CREAT | os.O_TRUNC | os.O_NOFOLLOW, 0o600)
+        with os.fdopen(fd, "wb") as f:
+            f.write(data)
     except OSError:
         return None
     return str(target)
@@ -1121,8 +1175,7 @@ class MessageThread(Gtk.Box):
             if texture is None:
                 return
             self._clear_pending_image()
-            tmp_dir = os.path.join(tempfile.gettempdir(), "phonelink")
-            os.makedirs(tmp_dir, exist_ok=True)
+            tmp_dir = str(_private_tmp_dir())
             fd, tmp_path = tempfile.mkstemp(
                 prefix="paste_",
                 suffix=".png",
@@ -1139,7 +1192,12 @@ class MessageThread(Gtk.Box):
         self._clear_pending_image()
 
     def _clear_pending_image(self, delete_file: bool = True):
-        if delete_file and self._pending_image_path and os.path.exists(self._pending_image_path):
+        if (
+            delete_file
+            and self._pending_image_path
+            and os.path.exists(self._pending_image_path)
+            and _is_scratch_file(self._pending_image_path)
+        ):
             try:
                 os.unlink(self._pending_image_path)
             except OSError:
@@ -1154,7 +1212,7 @@ class MessageThread(Gtk.Box):
         self._image_preview_bar.set_visible(True)
 
     def _retain_temp_path(self, path: str):
-        if not path:
+        if not path or not _is_scratch_file(path):
             return
         self._retained_temp_paths.add(path)
 

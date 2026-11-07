@@ -144,11 +144,18 @@ impl MessageStore {
             && let Some(parent) = Path::new(path).parent()
             && !parent.as_os_str().is_empty()
         {
-            std::fs::create_dir_all(parent)?;
+            // Every text the phone ever synced: private to the user.
+            super::private_tmp::private_data_dir(parent)?;
         }
         let conn = Connection::open(path)?;
         // journal_mode returns a row, so read it rather than execute().
         let _mode: String = conn.query_row("PRAGMA journal_mode=WAL", [], |r| r.get(0))?;
+        if path != ":memory:" {
+            // SQLite gives -wal/-shm the database's own mode, so set that first.
+            for suffix in ["", "-wal", "-shm"] {
+                super::private_tmp::tighten(Path::new(&format!("{path}{suffix}")), 0o600)?;
+            }
+        }
         conn.execute_batch("PRAGMA synchronous=NORMAL")?;
         conn.execute_batch(SCHEMA)?;
         Ok(conn)
@@ -811,6 +818,21 @@ mod tests {
         let dir = tempfile::tempdir().unwrap();
         let store = MessageStore::open(dir.path().join("messages.db"));
         Fixture { _dir: dir, store }
+    }
+
+    #[test]
+    fn database_files_are_private() {
+        use std::os::unix::fs::PermissionsExt;
+        let f = fixture();
+        f.store.upsert_conversation("dev", &Conversation { thread_id: 1, ..Default::default() });
+        let mode = |p: &Path| std::fs::metadata(p).unwrap().permissions().mode() & 0o777;
+        assert_eq!(mode(f._dir.path()), 0o700);
+        let db = f._dir.path().join("messages.db");
+        assert_eq!(mode(&db), 0o600);
+        let wal = f._dir.path().join("messages.db-wal");
+        if wal.exists() {
+            assert_eq!(mode(&wal), 0o600);
+        }
     }
 
     #[test]

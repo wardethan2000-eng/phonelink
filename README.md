@@ -55,9 +55,10 @@ Check it runs: `kdeconnect-cli --list-available`. If that errors, start the daem
 
 ### Step 1b — Install PhoneRelay
 
-Download `phonerelay-<version>-x86_64.tar.gz` from the [latest release](https://github.com/wardethan2000-eng/phonelink/releases/latest), then:
+Download `phonerelay-<version>-x86_64.tar.gz` and its `.sha256` file from the [latest release](https://github.com/wardethan2000-eng/phonelink/releases/latest), then:
 
 ```bash
+sha256sum -c phonerelay-*-x86_64.tar.gz.sha256   # must say OK
 tar xzf phonerelay-*-x86_64.tar.gz
 cd phonerelay-*/
 ./data/install-rust.sh ./phonelink-rs
@@ -175,7 +176,7 @@ KDE Connect can read and send texts, but it can't delete a chat on the phone, ma
 
 This runs through a small helper, `phonelink-gm`, installed next to the app. It is AGPL-3.0 because it uses [libgm](https://github.com/mautrix/gmessages) (see `phonelink-gm/LICENSE`); the app itself stays MIT and only runs the helper as a separate program.
 
-For now, linking uses [gmcli](https://github.com/fdsouvenir/gmcli): install it (needs Go: `GOBIN="$HOME/.local/bin" go install github.com/fdsouvenir/gmcli@latest`) and run `gmcli auth` once. It opens Chrome, Chromium or Edge to sign in to Google, then shows an emoji to tap on the phone. PhoneRelay picks up gmcli's session from `~/.local/state/gmcli/session.json` the next time it starts. Pairing inside the app is planned.
+For now, linking uses [gmcli](https://github.com/fdsouvenir/gmcli): install it (needs Go: `GOBIN="$HOME/.local/bin" go install github.com/fdsouvenir/gmcli@v1.2.0`) and run `gmcli auth` once. It opens Chrome, Chromium or Edge to sign in to Google, then shows an emoji to tap on the phone. PhoneRelay picks up gmcli's session from `~/.local/state/gmcli/session.json` the next time it starts. Pairing inside the app is planned.
 
 Limits: it's an unofficial protocol, so Google can break it until the helper is updated. The phone must be online. Google drops a link unused for about 14 days. Google Messages allows one web session at a time, so opening messages.google.com in a browser takes the link away from PhoneRelay.
 

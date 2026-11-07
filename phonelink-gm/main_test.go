@@ -1,6 +1,7 @@
 package main
 
 import (
+	"strings"
 	"testing"
 
 	"go.mau.fi/mautrix-gmessages/pkg/libgm/gmproto"
@@ -78,5 +79,25 @@ func TestPickIgnoresMyNumberInTheRequest(t *testing.T) {
 	convs := []*gmproto.Conversation{conv("1", me, part("+13165551111", false), part("+13165552222", false))}
 	if c, why := pick(convs, keySet([]string{"3165550000", "3165551111", "3165552222"})); c == nil {
 		t.Fatalf("pick with me included = %s", why)
+	}
+}
+
+func TestLogsNeverCarryPayload(t *testing.T) {
+	line := []byte(`{"level":"warn","decrypted_data":"SGVsbG8gZnJvbSBNb20=","resp_body":"x","error":"unknown event","message":"Got unknown event type"}` + "\n")
+	out := string(redact(line))
+	for _, secret := range []string{"SGVsbG8", `"resp_body":"x"`} {
+		if strings.Contains(out, secret) {
+			t.Fatalf("payload leaked: %s", out)
+		}
+	}
+	if !strings.Contains(out, "Got unknown event type") || !strings.Contains(out, "unknown event") {
+		t.Fatalf("diagnostics lost: %s", out)
+	}
+	long := []byte(`{"level":"warn","note":"` + strings.Repeat("a", 900) + `"}`)
+	if strings.Contains(string(redact(long)), strings.Repeat("a", 400)) {
+		t.Fatal("long field not hidden")
+	}
+	if strings.Contains(string(redact([]byte("not json Mom says hi"))), "Mom") {
+		t.Fatal("non-JSON line leaked")
 	}
 }

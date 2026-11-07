@@ -645,10 +645,17 @@ impl Window {
                 if !(url.starts_with("http://") || url.starts_with("https://")) {
                     return;
                 }
-                match gio::AppInfo::launch_default_for_uri(&url, gio::AppLaunchContext::NONE) {
-                    Ok(()) => this.toast("Opened link from phone"),
-                    Err(e) => log::warn!("open link from phone: {e}"),
-                }
+                // Ask first: a paired phone (or anything able to share to it)
+                // shouldn't open pages on this computer by itself.
+                let toast = adw::Toast::new("Link from phone");
+                toast.set_button_label(Some("Open"));
+                toast.set_timeout(10);
+                toast.connect_button_clicked(move |_| {
+                    if let Err(e) = gio::AppInfo::launch_default_for_uri(&url, gio::AppLaunchContext::NONE) {
+                        log::warn!("open link from phone: {e}");
+                    }
+                });
+                this.toasts.add_toast(toast);
             }));
         }
         *self.device_subs.borrow_mut() = subs;

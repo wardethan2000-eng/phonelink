@@ -5,11 +5,17 @@ on:
     branches: ["**"]
   pull_request:
 
+# Read-only token: CI only builds and tests.
+permissions:
+  contents: read
+
+# Third-party actions are pinned to full commits (tag in the comment), so a
+# moved tag can't change what runs here.
 jobs:
   test:
     runs-on: ubuntu-latest
     steps:
-      - uses: actions/checkout@v4
+      - uses: actions/checkout@11d5960a326750d5838078e36cf38b85af677262 # v4.4.0
 
       # Use the distro's python3 (not actions/setup-python) so the apt-installed
       # GObject-Introspection typelibs are importable.  No display is needed —
@@ -31,7 +37,7 @@ jobs:
   rust:
     runs-on: ubuntu-24.04
     steps:
-      - uses: actions/checkout@v4
+      - uses: actions/checkout@11d5960a326750d5838078e36cf38b85af677262 # v4.4.0
 
       - name: Install GTK 4 / libadwaita headers
         run: |
@@ -40,11 +46,12 @@ jobs:
             libgtk-4-dev libadwaita-1-dev libsqlite3-dev libssl-dev \
             pkg-config libglib2.0-dev-bin dbus
 
-      - uses: dtolnay/rust-toolchain@stable
+      - uses: dtolnay/rust-toolchain@b725eda525362e7cf34af9a7243cac1e3f01a7ec # stable branch, 2026-11-07
         with:
+          toolchain: stable
           components: clippy
 
-      - uses: Swatinem/rust-cache@v2
+      - uses: Swatinem/rust-cache@d1527c8f67ef9af357290475d4af4b0fab8f12e0 # v2.9.3
 
       - name: Clippy
         run: cargo clippy --all-targets -- -D warnings
@@ -60,8 +67,8 @@ jobs:
       run:
         working-directory: phonelink-gm
     steps:
-      - uses: actions/checkout@v4
-      - uses: actions/setup-go@v5
+      - uses: actions/checkout@11d5960a326750d5838078e36cf38b85af677262 # v4.4.0
+      - uses: actions/setup-go@40f1582b2485089dde7abd97c1529aa768e1baff # v5.6.0
         with:
           go-version-file: phonelink-gm/go.mod
           cache-dependency-path: phonelink-gm/go.sum

@@ -10,8 +10,9 @@
 use std::collections::{HashMap, HashSet};
 
 use super::attachments;
-use super::contacts::{is_messaging_app, looks_like_phone_number, normalize_phone, resolve_name};
-use super::hidden_texts::{HiddenTextDetector, body_matches, normalize_text};
+use super::private_tmp;
+use super::contacts::{is_messaging_app, is_texting_notification, looks_like_phone_number, normalize_phone, resolve_name};
+use super::hidden_texts::{HiddenTextDetector, body_matches, normalize_text, reply_preview_matches};
 use super::message::{RawMessage, parse_message};
 use super::models::{Conversation, SmsMessage};
 use super::reconcile::{self, ConversationIndex};
@@ -108,6 +109,8 @@ pub struct ReplyableNotification {
     /// The message preview (`contacts::notification_message_text`).
     pub text: String,
     pub reply_id: String,
+    /// KDE Connect's `internalId`: Android's notification key.
+    pub internal_id: String,
 }
 
 /// Sends whose phone echo has not arrived yet: (conversation, text, route).
@@ -769,7 +772,13 @@ impl Messages {
                     continue;
                 };
                 let dest = attachments::full_cache_path_in(cache_dir, att)?;
-                let copied = std::fs::create_dir_all(cache_dir).and_then(|_| std::fs::copy(file_path, &dest));
+                // Pictures people sent: the cache folder and its copies are private.
+                let copied = cache_dir
+                    .parent()
+                    .map_or(Ok(()), private_tmp::private_data_dir)
+                    .and_then(|()| private_tmp::private_data_dir(cache_dir))
+                    .and_then(|()| std::fs::copy(file_path, &dest))
+                    .and_then(|_| private_tmp::tighten(&dest, 0o600));
                 if let Err(e) = copied {
                     log::warn!("caching a full attachment failed: {e}");
                     return None;
@@ -788,7 +797,7 @@ impl Messages {
     /// texting app and can be answered.
     pub fn note_notification(&mut self, n: ReplyableNotification) {
         self.notifications.retain(|o| o.public_id != n.public_id);
-        if is_messaging_app(&n.app_name) && !n.reply_id.is_empty() && !n.text.is_empty() {
+        if is_texting_notification(&n.app_name, &n.internal_id) && !n.reply_id.is_empty() && !n.text.is_empty() {
             self.notifications.push(n);
         }
     }
@@ -834,7 +843,7 @@ impl Messages {
         }
         let newest = Self::newest_received(conv)?;
         let mut candidates = self.notifications.iter().filter(|n| {
-            if !body_matches(&n.text, &newest.body) {
+            if !reply_preview_matches(&n.text, &newest.body) {
                 return false;
             }
             if !conv.is_group() && !Self::title_fits(&n.title, conv) {
@@ -844,7 +853,7 @@ impl Messages {
             !self.index.conversations.values().any(|other| {
                 other.thread_id != conv.thread_id
                     && other.thread_id >= 0
-                    && Self::newest_received(other).is_some_and(|m| body_matches(&n.text, &m.body))
+                    && Self::newest_received(other).is_some_and(|m| reply_preview_matches(&n.text, &m.body))
             })
         });
         let found = candidates.next()?;
@@ -1169,6 +1178,7 @@ mod tests {
             title: title.into(),
             text: text.into(),
             reply_id: format!("reply-{id}"),
+            internal_id: format!("0|com.google.android.apps.messaging|{id}|null|10123"),
         }
     }
 
@@ -1227,6 +1237,13 @@ mod tests {
         // Not a texting app, or no reply action.
         p.m.note_notification(ReplyableNotification { app_name: "Gmail".into(), ..notif("n3", "Alex", "Running ten minutes late") });
         p.m.note_notification(ReplyableNotification { reply_id: String::new(), ..notif("n4", "Alex", "Running ten minutes late") });
+        // Any app can call itself "Messages": the package decides.
+        p.m.note_notification(ReplyableNotification {
+            internal_id: "0|com.evil.app|7|null|10999".into(),
+            ..notif("n7", "Alex", "Running ten minutes late")
+        });
+        // A short preview fits too many texts to trust.
+        p.m.note_notification(notif("n8", "Alex", "Run"));
         assert!(matches!(p.m.send(10, "ok")[0], Effect::Reply { .. }));
         // The right one, then removed from the phone: back to SMS.
         p.m.note_notification(notif("n5", "Alex", "Running ten minutes late"));

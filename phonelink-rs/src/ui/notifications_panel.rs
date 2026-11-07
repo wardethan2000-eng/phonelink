@@ -356,6 +356,7 @@ impl NotificationsPanel {
 fn load_icon(image: &gtk::Image, n: &Notification) {
     if n.has_icon
         && !n.icon_path.is_empty()
+        && super::decodable_image(std::path::Path::new(&n.icon_path)).is_some()
         && let Ok(pb) = gtk::gdk_pixbuf::Pixbuf::from_file_at_scale(&n.icon_path, 32, 32, true)
     {
         #[allow(deprecated)] // Texture::for_pixbuf: the replacement needs GTK 4.20.

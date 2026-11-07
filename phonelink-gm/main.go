@@ -269,7 +269,7 @@ func newLink(auth *libgm.AuthData, session string) *link {
 	l := &link{
 		auth:    auth,
 		session: session,
-		logger:  zerolog.New(os.Stderr).With().Timestamp().Logger().Level(zerolog.WarnLevel),
+		logger:  zerolog.New(redactWriter{os.Stderr}).With().Timestamp().Logger().Level(zerolog.WarnLevel),
 		ready:   make(chan []*gmproto.Conversation, 1),
 		fatal:   make(chan error, 1),
 	}

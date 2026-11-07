@@ -9,7 +9,7 @@
 //! network.
 
 use std::collections::{HashMap, HashSet};
-use std::io::{BufRead, BufReader, Read, Write};
+use std::io::{Read, Write};
 use std::net::TcpListener;
 use std::path::{Path, PathBuf};
 use std::time::Duration;
@@ -277,6 +277,10 @@ impl Http for UreqHttp {
         Self::json(self.agent.request(method, url).set("Authorization", &format!("Bearer {bearer}")).send_json(body.clone()))
     }
     fn get_bytes(&self, url: &str, bearer: &str) -> Option<(Vec<u8>, String)> {
+        if !is_google_photo_url(url) {
+            log::warn!("google: skipped a contact photo that isn't on Google's photo host");
+            return None;
+        }
         let resp = self
             .agent
             .get(url)
@@ -296,9 +300,11 @@ impl Http for UreqHttp {
 
 // ── credentials ────────────────────────────────────────────────────
 
-/// A usable access token from the saved file, refreshed if needed. A failed
-/// refresh (or a token without the contacts scope) removes the file, as
-/// Python did for background syncs: the user must reconnect.
+/// A usable access token from the saved file, refreshed if needed. When
+/// Google says the sign-in is no longer valid (or the token lacks the
+/// contacts scope) the file is removed and the user must reconnect. A refresh
+/// that fails for any other reason (offline, DNS, a captive portal) keeps it:
+/// the next sync tries again.
 pub fn saved_credentials(http: &dyn Http, cfg: Option<&ClientConfig>, path: &Path, now: DateTime<Utc>) -> Result<Token> {
     let reconnect = || GoogleError::AuthRequired("Google Contacts needs you to reconnect from Settings.".into());
     let Some(mut token) = Token::load(path) else {
@@ -328,12 +334,24 @@ pub fn saved_credentials(http: &dyn Http, cfg: Option<&ClientConfig>, path: &Pat
             token.save(path).map_err(other)?;
             Ok(token)
         }
-        Err(e) => {
-            log::warn!("google: token refresh failed: {e}");
+        Err(e) if sign_in_revoked(&e) => {
+            log::warn!("google: token refresh refused: {e}");
             let _ = std::fs::remove_file(path);
             Err(reconnect())
         }
+        Err(e) => {
+            log::warn!("google: token refresh failed, keeping the sign-in: {e}");
+            Err(GoogleError::Other(format!("Couldn't reach Google to refresh the sign-in: {e}")))
+        }
     }
+}
+
+/// Google's token endpoint answers 400/401 with `invalid_grant` (revoked or
+/// expired refresh token) or `invalid_client` (the client is gone); only then
+/// is the saved sign-in useless.
+fn sign_in_revoked(error: &str) -> bool {
+    (error.starts_with("HTTP 400") || error.starts_with("HTTP 401"))
+        && (error.contains("invalid_grant") || error.contains("invalid_client"))
 }
 
 pub fn disconnect(path: &Path) -> bool {
@@ -465,9 +483,7 @@ impl SignIn {
                 Err(e) => return Err(other(e)),
             };
             let _ = stream.set_nonblocking(false);
-            let _ = stream.set_read_timeout(Some(Duration::from_secs(10)));
-            let mut line = String::new();
-            let _ = BufReader::new(&stream).read_line(&mut line);
+            let line = read_request_line(&stream, std::time::Instant::now() + Duration::from_secs(10));
             let params = query_params(&line);
             let ours = params.get("state").is_some_and(|s| *s == self.state);
             let body = if ours { SUCCESS_PAGE } else { "" };
@@ -498,6 +514,52 @@ impl SignIn {
         token.save(token_path).map_err(other)?;
         Ok(token)
     }
+}
+
+/// The request line of one loopback connection, at most 8 KiB and within
+/// `deadline` in all: another local user can't stall the sign-in with a
+/// slow or endless request.
+fn read_request_line(mut stream: impl Read + ReadTimeout, deadline: std::time::Instant) -> String {
+    const MAX: usize = 8 * 1024;
+    let mut buf = Vec::new();
+    let mut chunk = [0u8; 512];
+    while buf.len() < MAX && !buf.contains(&b'\n') {
+        let left = deadline.saturating_duration_since(std::time::Instant::now());
+        if left.is_zero() || stream.set_timeout(left).is_err() {
+            break;
+        }
+        match stream.read(&mut chunk) {
+            Ok(0) | Err(_) => break,
+            Ok(n) => buf.extend_from_slice(&chunk[..n.min(MAX - buf.len())]),
+        }
+    }
+    let end = buf.iter().position(|&b| b == b'\n').unwrap_or(buf.len());
+    String::from_utf8_lossy(&buf[..end]).into_owned()
+}
+
+/// A stream whose reads can be given a timeout (a `TcpStream`; tests use a
+/// slice).
+trait ReadTimeout {
+    fn set_timeout(&self, t: Duration) -> std::io::Result<()>;
+}
+
+impl ReadTimeout for &std::net::TcpStream {
+    fn set_timeout(&self, t: Duration) -> std::io::Result<()> {
+        self.set_read_timeout(Some(t))
+    }
+}
+
+/// Only Google's own photo hosts get the access token.
+fn is_google_photo_url(url: &str) -> bool {
+    let Some(rest) = url.strip_prefix("https://") else {
+        return false;
+    };
+    let host = rest.split(['/', '?', '#']).next().unwrap_or("");
+    if host.contains('@') || host.contains(':') {
+        return false;
+    }
+    let host = host.to_ascii_lowercase();
+    host == "googleusercontent.com" || host.ends_with(".googleusercontent.com")
 }
 
 // ── People API ─────────────────────────────────────────────────────
@@ -699,13 +761,16 @@ mod tests {
         form_reply: Option<Value>,
         calls: RefCell<Vec<String>>,
         photo: Option<(Vec<u8>, String)>,
+        form_error: Option<String>,
     }
 
     impl Http for Fake {
         fn post_form(&self, url: &str, form: &[(&str, &str)]) -> std::result::Result<Value, String> {
             let grant = form.iter().find(|(k, _)| *k == "grant_type").map(|(_, v)| *v).unwrap_or_default();
             self.calls.borrow_mut().push(format!("POST {url} {grant}"));
-            self.form_reply.clone().ok_or_else(|| "HTTP 400: invalid_grant".to_string())
+            self.form_reply
+                .clone()
+                .ok_or_else(|| self.form_error.clone().unwrap_or_else(|| r#"HTTP 400: {"error": "invalid_grant"}"#.to_string()))
         }
         fn get_json(&self, url: &str, _: &str) -> std::result::Result<Value, String> {
             self.calls.borrow_mut().push(format!("GET {url}"));
@@ -802,6 +867,52 @@ mod tests {
         assert!(matches!(err, GoogleError::AuthRequired(_)));
         assert!(!p.exists());
         assert!(matches!(saved_credentials(&Fake::default(), None, &p, now()), Err(GoogleError::AuthRequired(_))));
+    }
+
+    struct Slow<'a>(&'a [u8]);
+    impl Read for Slow<'_> {
+        fn read(&mut self, out: &mut [u8]) -> std::io::Result<usize> {
+            let n = self.0.len().min(out.len()).min(3);
+            out[..n].copy_from_slice(&self.0[..n]);
+            self.0 = &self.0[n..];
+            Ok(n)
+        }
+    }
+    impl ReadTimeout for Slow<'_> {
+        fn set_timeout(&self, _: Duration) -> std::io::Result<()> {
+            Ok(())
+        }
+    }
+
+    #[test]
+    fn loopback_request_line_is_capped() {
+        let later = std::time::Instant::now() + Duration::from_secs(5);
+        assert_eq!(read_request_line(Slow(b"GET /?state=s&code=c HTTP/1.1\r\nHost: x\r\n"), later), "GET /?state=s&code=c HTTP/1.1\r");
+        let endless = vec![b'a'; 100_000];
+        assert_eq!(read_request_line(Slow(&endless), later).len(), 8 * 1024);
+        assert_eq!(read_request_line(Slow(b"GET /"), std::time::Instant::now()), "");
+    }
+
+    #[test]
+    fn only_google_photo_hosts_get_the_token() {
+        assert!(is_google_photo_url("https://lh3.googleusercontent.com/a/abc=s100"));
+        assert!(!is_google_photo_url("http://lh3.googleusercontent.com/a"));
+        assert!(!is_google_photo_url("https://evil.com/lh3.googleusercontent.com"));
+        assert!(!is_google_photo_url("https://lh3.googleusercontent.com.evil.com/a"));
+        assert!(!is_google_photo_url("https://x@lh3.googleusercontent.com/a"));
+        assert!(!is_google_photo_url("https://evilgoogleusercontent.com/a"));
+    }
+
+    #[test]
+    fn offline_refresh_keeps_the_sign_in() {
+        let t = tempfile::tempdir().unwrap();
+        let p = t.path().join("tok.json");
+        std::fs::write(&p, token_json("2026-11-01T00:00:00Z")).unwrap();
+        for e in ["Dns Failed: resolve dns name 'oauth2.googleapis.com:443'", "HTTP 503: unavailable", "HTTP 400: <html>portal</html>"] {
+            let fake = Fake { form_error: Some(e.into()), ..Default::default() };
+            assert!(matches!(saved_credentials(&fake, None, &p, now()), Err(GoogleError::Other(_))), "{e}");
+            assert!(p.exists(), "{e} removed the sign-in");
+        }
     }
 
     #[test]

@@ -20,6 +20,30 @@ pub fn full_cache_dir() -> PathBuf {
     base.join("phonelink").join("attachments_full")
 }
 
+/// Largest picture the app will decode: 80 megapixels (about 320 MB of
+/// pixels), more than a 50 MP phone photo. Anyone can text a tiny PNG that
+/// claims 30000 × 30000; some loaders decode the whole thing before scaling.
+pub const MAX_IMAGE_PIXELS: i64 = 80_000_000;
+/// Widest aspect ratio decoded, so scaling to fit can't blow up one side.
+pub const MAX_IMAGE_ASPECT: i64 = 50;
+
+/// Whether a picture with this header size is safe to decode.
+pub fn safe_image_size(w: i32, h: i32) -> bool {
+    let (w, h) = (i64::from(w), i64::from(h));
+    w > 0 && h > 0 && w * h <= MAX_IMAGE_PIXELS && w.max(h) <= w.min(h) * MAX_IMAGE_ASPECT
+}
+
+/// Whether `path` is a file the app made itself: inside the private scratch
+/// folder or the full-size picture cache, after resolving symlinks.
+pub fn is_app_file(path: &Path) -> bool {
+    is_app_file_in(&[super::private_tmp::base_dir(), full_cache_dir()], path)
+}
+
+fn is_app_file_in(dirs: &[PathBuf], path: &Path) -> bool {
+    let Ok(real) = path.canonicalize() else { return false };
+    dirs.iter().filter_map(|d| d.canonicalize().ok()).any(|d| real.starts_with(&d) && real != d)
+}
+
 /// Extension for the image types MMS carries (Python `_attachment_ext`).
 pub fn image_ext(mime_type: &str) -> &'static str {
     match mime_type.split(';').next().unwrap_or("").trim().to_ascii_lowercase().as_str() {
@@ -102,4 +126,35 @@ mod tests {
         assert!(full_cache_path_in(dir, &Attachment::default()).is_none());
         assert_eq!(sanitize_name("..__"), "attachment");
     }
+
+    #[test]
+    fn huge_or_extreme_pictures_are_not_decoded() {
+        assert!(safe_image_size(4000, 3000));
+        assert!(safe_image_size(8160, 6120));
+        assert!(!safe_image_size(30000, 30000));
+        assert!(!safe_image_size(1_000_000, 1));
+        assert!(!safe_image_size(0, 10));
+        assert!(!safe_image_size(-5, 10));
+        assert!(!safe_image_size(i32::MAX, i32::MAX));
+    }
+
+
+    #[test]
+    fn only_the_apps_own_files_count() {
+        let t = tempfile::tempdir().unwrap();
+        let ours = t.path().join("cache");
+        std::fs::create_dir(&ours).unwrap();
+        let inside = ours.join("a.jpg");
+        std::fs::write(&inside, b"x").unwrap();
+        let secret = t.path().join("id_ed25519");
+        std::fs::write(&secret, b"key").unwrap();
+        let dirs = [ours.clone()];
+        assert!(is_app_file_in(&dirs, &inside));
+        assert!(!is_app_file_in(&dirs, &secret));
+        assert!(!is_app_file_in(&dirs, &ours.join("..").join("id_ed25519")));
+        let link = ours.join("link.jpg");
+        std::os::unix::fs::symlink(&secret, &link).unwrap();
+        assert!(!is_app_file_in(&dirs, &link));
+    }
+
 }

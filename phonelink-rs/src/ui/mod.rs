@@ -128,6 +128,18 @@ fn load_css() {
 /// with its own renderer: forcing cairo there gave a blank window.
 const DEFAULT_RENDERER: &str = "cairo";
 
+/// A picture's header size, only when it is safe to decode
+/// (`attachments::safe_image_size`). Reads the header, not the pixels.
+pub(crate) fn decodable_image(path: &std::path::Path) -> Option<(i32, i32)> {
+    let (_, w, h) = gtk::gdk_pixbuf::Pixbuf::file_info(path)?;
+    if crate::core::attachments::safe_image_size(w, h) {
+        Some((w, h))
+    } else {
+        log::warn!("not decoding a {w}×{h} picture: too large");
+        None
+    }
+}
+
 pub fn run() -> glib::ExitCode {
     let broadway = std::env::var("GDK_BACKEND").is_ok_and(|b| b.contains("broadway"));
     if std::env::var_os("GSK_RENDERER").is_none() && !broadway {
@@ -146,6 +158,10 @@ pub fn run() -> glib::ExitCode {
         );
         return glib::ExitCode::FAILURE;
     }
+    crate::core::private_tmp::tighten_existing_data(
+        &crate::core::settings::home_dir(),
+        std::env::var_os("XDG_CACHE_HOME").map(std::path::PathBuf::from),
+    );
     let app = adw::Application::builder().application_id(APPLICATION_ID).build();
     app.connect_startup(|_| load_css());
     app.connect_activate(|app| {

@@ -63,6 +63,7 @@ fn replyable(id: &str, props: &Props) -> ReplyableNotification {
         title: text_of("title"),
         text: notification_message_text(&json),
         reply_id: text_of("replyId"),
+        internal_id: text_of("internalId"),
     }
 }
 
@@ -967,7 +968,7 @@ impl MessagesPage {
         let weak = Rc::downgrade(self);
         dialog.open(self.parent_window().as_ref(), gio::Cancellable::NONE, move |res| {
             let (Some(this), Some(path)) = (weak.upgrade(), res.ok().and_then(|f| f.path())) else { return };
-            let count = this.import_contacts_file(&path);
+            let count = this.import_contacts_file(&path, true);
             this.toast(&format!("Imported {count} contacts"));
         });
     }
@@ -1012,7 +1013,7 @@ impl MessagesPage {
                 Some(std::path::PathBuf::from(&url))
             };
             if let Some(path) = path.filter(|p| p.extension().is_some_and(|e| e.eq_ignore_ascii_case("vcf"))) {
-                this.import_contacts_file(&path);
+                this.import_contacts_file(&path, false);
             }
         }));
         subs
@@ -1069,12 +1070,14 @@ impl MessagesPage {
             .filter(|p| p.extension().is_some_and(|e| e.eq_ignore_ascii_case("vcf")))
             .max_by_key(|p| std::fs::metadata(p).and_then(|m| m.modified()).ok());
         if let Some(path) = newest {
-            self.import_contacts_file(&path);
+            self.import_contacts_file(&path, false);
         }
     }
 
     /// Import a VCF or Google CSV file; returns how many contacts it had.
-    fn import_contacts_file(self: &Rc<Self>, path: &std::path::Path) -> usize {
+    /// `rename`: the user picked the file, so its names win. A file that
+    /// came from the phone only names unknown numbers.
+    fn import_contacts_file(self: &Rc<Self>, path: &std::path::Path, rename: bool) -> usize {
         let mut found = std::collections::HashMap::new();
         let is_csv = path.extension().is_some_and(|e| e.eq_ignore_ascii_case("csv"));
         let count = if is_csv {
@@ -1085,6 +1088,7 @@ impl MessagesPage {
         let effects = {
             let mut guard = self.inner.borrow_mut();
             let i = &mut *guard;
+            let found = if rename { found } else { crate::core::contacts::only_unnamed(found, &i.m.contact_map) };
             i.m.learn_contacts(found, &i.store)
         };
         self.list.set_contacts(self.inner.borrow().m.contact_map.clone());

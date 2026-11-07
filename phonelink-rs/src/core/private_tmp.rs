@@ -71,6 +71,40 @@ fn ensure_private_dir(dir: &Path) -> io::Result<()> {
     Ok(())
 }
 
+/// A folder holding the user's own data (messages, cached pictures, contact
+/// photos): created 0700 with any missing parents, and an existing one
+/// tightened to 0700. Unlike the scratch folder a symlink is accepted, since
+/// people move their data folders; the target is what gets tightened.
+pub fn private_data_dir(dir: &Path) -> io::Result<()> {
+    DirBuilder::new().recursive(true).mode(0o700).create(dir)?;
+    tighten(dir, 0o700)
+}
+
+/// Set `path` to `mode` when group or others have any access to it. A
+/// missing path is fine (SQLite's -wal/-shm come and go).
+pub fn tighten(path: &Path, mode: u32) -> io::Result<()> {
+    match fs::metadata(path) {
+        Ok(m) if m.mode() & 0o077 != 0 => fs::set_permissions(path, fs::Permissions::from_mode(mode)),
+        Ok(_) => Ok(()),
+        Err(e) if e.kind() == io::ErrorKind::NotFound => Ok(()),
+        Err(e) => Err(e),
+    }
+}
+
+/// Earlier versions created the data and cache folders readable by everyone
+/// (0755, files 0644). Close them at startup; a 0700 folder keeps the old
+/// files inside private too.
+pub fn tighten_existing_data(home: &Path, cache_home: Option<PathBuf>) {
+    let cache = cache_home.filter(|p| p.is_absolute()).unwrap_or_else(|| home.join(".cache"));
+    for dir in [super::settings::data_dir(home), cache.join("phonelink")] {
+        if dir.is_dir()
+            && let Err(e) = tighten(&dir, 0o700)
+        {
+            log::warn!("couldn't make {} private: {e}", dir.display());
+        }
+    }
+}
+
 /// Our effective uid: the owner of `/proc/self` (std has no getuid).
 fn my_uid() -> Option<u32> {
     fs::metadata("/proc/self").ok().map(|m| m.uid())
@@ -180,6 +214,37 @@ mod tests {
         assert!(!contains_in(base, Path::new("/tmp/phonelink/paste_1.png")));
         assert!(!contains_in(base, Path::new("/run/user/1000/phonelink/../../../home/u/photo.jpg")));
         assert!(!contains_in(base, Path::new("/run/user/1000/phonelinkX/a.png")));
+    }
+
+    #[test]
+    fn data_dirs_are_created_and_tightened_private() {
+        let t = tempfile::tempdir().unwrap();
+        let d = t.path().join("share").join("phonelink");
+        private_data_dir(&d).unwrap();
+        assert_eq!(mode(&d), 0o700);
+        fs::set_permissions(&d, fs::Permissions::from_mode(0o755)).unwrap();
+        private_data_dir(&d).unwrap();
+        assert_eq!(mode(&d), 0o700);
+        let f = d.join("messages.db");
+        fs::write(&f, b"x").unwrap();
+        fs::set_permissions(&f, fs::Permissions::from_mode(0o644)).unwrap();
+        tighten(&f, 0o600).unwrap();
+        assert_eq!(mode(&f), 0o600);
+        tighten(&d.join("missing-wal"), 0o600).unwrap();
+    }
+
+    #[test]
+    fn startup_closes_old_open_folders() {
+        let home = tempfile::tempdir().unwrap();
+        let data = super::super::settings::data_dir(home.path());
+        let cache = home.path().join(".cache").join("phonelink");
+        for d in [&data, &cache] {
+            fs::create_dir_all(d).unwrap();
+            fs::set_permissions(d, fs::Permissions::from_mode(0o755)).unwrap();
+        }
+        tighten_existing_data(home.path(), None);
+        assert_eq!(mode(&data), 0o700);
+        assert_eq!(mode(&cache), 0o700);
     }
 
     #[test]

@@ -79,14 +79,21 @@ pub fn chat_arg(addresses: &[String]) -> String {
     addresses.iter().map(|a| a.trim()).filter(|a| !a.is_empty()).collect::<Vec<_>>().join(",")
 }
 
+/// The helper's arguments. `--` ends the options: a chat key is the
+/// sender's address, and an e-mail sender like "-session=…@x.com" must not
+/// be read as an option.
+fn delete_args(chats: &[Vec<String>]) -> Vec<String> {
+    let mut args = vec!["delete".to_string(), "--timeout=90s".to_string(), "--".to_string()];
+    args.extend(chats.iter().map(|c| chat_arg(c)));
+    args
+}
+
 /// Delete chats on the phone (blocking; run it off the main thread). Each
 /// chat is its members' addresses.
 pub fn delete_chats(chats: &[Vec<String>]) -> Result<Vec<Outcome>, String> {
     let helper = helper_path().ok_or("the Google Messages helper (phonelink-gm) isn't installed")?;
     let out = Command::new(helper)
-        .arg("delete")
-        .arg("--timeout=90s")
-        .args(chats.iter().map(|c| chat_arg(c)))
+        .args(delete_args(chats))
         .output()
         .map_err(|e| format!("couldn't run the Google Messages helper: {e}"))?;
     let stderr = String::from_utf8_lossy(&out.stderr);
@@ -155,6 +162,12 @@ mod tests {
             "1 deleted on your phone, 1 not found in Google Messages, 1 failed (x); the rest removed from PhoneRelay only"
         );
         assert_eq!(summary(&Err("boom".into())), "Removed from PhoneRelay only: boom");
+    }
+
+    #[test]
+    fn chat_keys_can_never_be_options() {
+        let args = delete_args(&[vec!["-session=/tmp/x@evil.com".into()], vec!["+1316".into()]]);
+        assert_eq!(args, ["delete", "--timeout=90s", "--", "-session=/tmp/x@evil.com", "+1316"]);
     }
 
     #[test]

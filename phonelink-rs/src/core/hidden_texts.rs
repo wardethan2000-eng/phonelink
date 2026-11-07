@@ -65,6 +65,19 @@ pub fn body_matches(preview: &str, body: &str) -> bool {
         || b.starts_with(&p)
 }
 
+/// Stricter `body_matches` for choosing where a reply goes: a truncated
+/// preview must still be long enough that it can't fit a text by chance.
+pub fn reply_preview_matches(preview: &str, body: &str) -> bool {
+    let p = normalize_text(preview);
+    let b = normalize_text(body);
+    if p.is_empty() || b.is_empty() {
+        return false;
+    }
+    p == b
+        || (b.chars().count() >= MIN_TEXT_LENGTH && p.contains(&b))
+        || (p.chars().count() >= MIN_TEXT_LENGTH && b.starts_with(&p))
+}
+
 #[derive(Debug, Clone)]
 pub struct HiddenTextDetector {
     pub settle_seconds: f64,

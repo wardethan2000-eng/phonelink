@@ -28,14 +28,16 @@ ROOT="$(cd "$(dirname "${BASH_SOURCE[0]}")/.." && pwd)"
 
 usage() { sed -n '2,16p' "${BASH_SOURCE[0]}" | sed 's/^# \{0,1\}//'; exit 2; }
 
+# sync_up [SRC]: copy SRC (default: this checkout) to the box.
 sync_up() {
+    local src="${1:-$ROOT}"
     ssh "$HOST" "mkdir -p '$REMOTE_DIR' work/logs"
     # --checksum without --times: only files whose content changed are
     # rewritten, and they get a fresh mtime, so cargo never builds stale.
     rsync -rlpz --checksum --delete \
         --exclude '/target/' --exclude '.git/' --exclude '__pycache__/' \
         --exclude '*.pyc' --exclude '.venv/' \
-        "$ROOT/" "$HOST:$REMOTE_DIR/"
+        "$src/" "$HOST:$REMOTE_DIR/"
 }
 
 # Start CMD detached on the box, then stream its log until it ends.
@@ -94,7 +96,7 @@ bring_back() {
 }
 
 # Static Go build of the helper, into target/ (which the sync leaves alone).
-GM_BUILD='(export PATH=$HOME/opt/go/bin:$PATH && mkdir -p target/gm && cd phonelink-gm && CGO_ENABLED=0 go build -trimpath -ldflags="-s -w" -o ../target/gm/phonelink-gm .)'
+GM_BUILD='(export PATH=$HOME/opt/go/bin:$PATH && mkdir -p target/gm && cd phonelink-gm && CGO_ENABLED=0 go build -mod=readonly -trimpath -ldflags="-s -w" -o ../target/gm/phonelink-gm .)'
 
 [[ $# -ge 1 ]] || usage
 action=$1; shift
@@ -132,9 +134,20 @@ case "$action" in
         # Release builds carry PhoneRelay's own Google client (build.rs).
         [[ -f "$ROOT/data/google_oauth_client.json" ]] || { echo "data/google_oauth_client.json is missing: a release needs the built-in Google client" >&2; exit 1; }
         version="$(sed -n 's/^version = "\(.*\)"/\1/p' "$ROOT/phonelink-rs/Cargo.toml" | head -1)"
-        sync_up
-        code=0; run_remote bash -c "cargo build --release && $GM_BUILD && bash scripts/pack-release.sh '$version'" || code=$?
-        lock_back
+        # Build exactly what tag vVERSION holds, so anyone can rebuild it from
+        # the tag (the AGPL helper's source must be there): an export of the
+        # tag, never this working tree, and the committed Cargo.lock as is.
+        tag="v$version"
+        git -C "$ROOT" rev-parse -q --verify "refs/tags/$tag^{commit}" >/dev/null \
+            || { echo "tag $tag doesn't exist: commit, then tag the release first" >&2; exit 1; }
+        [[ "$(git -C "$ROOT" rev-parse HEAD)" == "$(git -C "$ROOT" rev-parse "$tag^{commit}")" ]] \
+            || echo "note: HEAD is not $tag; building $tag" >&2
+        export_dir="$(mktemp -d)"
+        trap 'rm -rf "$export_dir"' EXIT
+        git -C "$ROOT" archive "$tag" | tar -x -C "$export_dir"
+        install -m 600 "$ROOT/data/google_oauth_client.json" "$export_dir/data/google_oauth_client.json"
+        sync_up "$export_dir"
+        code=0; run_remote bash -c "cargo build --release --locked && $GM_BUILD && bash scripts/pack-release.sh '$version'" || code=$?
         [[ $code -eq 0 ]] || exit "$code"
         mkdir -p "$ROOT/target/dist"
         rsync -az "$HOST:$REMOTE_DIR/target/dist/phonerelay-$version-x86_64.tar.gz"* "$ROOT/target/dist/"

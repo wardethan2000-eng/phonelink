@@ -47,7 +47,9 @@ pub fn contact_photos_dir(home: &Path) -> PathBuf {
 
 fn non_digit_re() -> &'static Regex {
     static RE: OnceLock<Regex> = OnceLock::new();
-    RE.get_or_init(|| Regex::new(r"\D").expect("valid regex"))
+    // ASCII digits only, as the Google Messages helper does: a Unicode `\D`
+    // keeps "１" and other multi-byte digits, which then broke byte slicing.
+    RE.get_or_init(|| Regex::new(r"[^0-9]").expect("valid regex"))
 }
 
 /// Strip a phone number to digits only for comparison.
@@ -110,9 +112,48 @@ pub fn photo_suffix(content_type: Option<&str>) -> &'static str {
 /// Python's `isdigit` also accepts exotic digit characters.)
 pub fn looks_like_phone_number(text: &str) -> bool {
     let cleaned = clean_text(text);
-    // "(775) 566-0568" and "775.566.0568" are numbers too, not names.
+    // "(316) 555-0168" and "316.555.0168" are numbers too, not names.
     let candidate: String = cleaned.chars().filter(|c| !matches!(c, '+' | '-' | ' ' | '(' | ')' | '.')).collect();
     !candidate.is_empty() && candidate.chars().all(|c| c.is_ascii_digit())
+}
+
+/// Android texting apps whose notifications may carry a desktop reply.
+const TEXTING_PACKAGES: &[&str] = &[
+    "com.google.android.apps.messaging",
+    "com.samsung.android.messaging",
+    "com.android.mms",
+    "com.android.messaging",
+    "com.motorola.messaging",
+    "com.oneplus.mms",
+    "com.verizon.messaging.vzmsgs",
+    "com.textra",
+    "xyz.klinker.messenger",
+    "com.p1.chompsms",
+    "com.handcent.nextsms",
+    "org.fossify.messages",
+    "com.simplemobiletools.smsmessenger",
+    "com.moez.QKSMS",
+    "dev.octoshrimpy.quik",
+];
+
+/// The posting app's package from a KDE Connect notification's `internalId`,
+/// which is Android's notification key "user|package|id|tag|uid". Android
+/// fills it in, so unlike `appName` another app can't fake it.
+pub fn notification_package(internal_id: &str) -> Option<&str> {
+    let mut parts = internal_id.split('|');
+    let _user = parts.next()?;
+    let package = parts.next()?;
+    (!package.is_empty() && parts.next().is_some()).then_some(package)
+}
+
+/// Whether a desktop reply may go through this notification: it must come
+/// from a known texting app. Any app can call itself "Messages", so the
+/// name only counts when the phone sent no notification key.
+pub fn is_texting_notification(app_name: &str, internal_id: &str) -> bool {
+    match notification_package(internal_id) {
+        Some(package) => TEXTING_PACKAGES.contains(&package),
+        None => is_messaging_app(app_name),
+    }
 }
 
 /// Best-effort detection for SMS / messaging notification sources.
@@ -162,7 +203,7 @@ pub fn notification_message_text(props: &Props) -> String {
 
 /// Same number, allowing for a country code (last 10 digits).
 fn same_phone(a: &str, b: &str) -> bool {
-    a == b || (a.len() >= 10 && b.len() >= 10 && a[a.len() - 10..] == b[b.len() - 10..])
+    a == b || (a.chars().count() >= 10 && b.chars().count() >= 10 && last_chars(a, 10) == last_chars(b, 10))
 }
 
 /// Contacts to offer while searching the conversation list, to start a new
@@ -193,7 +234,7 @@ pub fn contact_suggestions(
                 // so the result is stable.
                 let mut keys: Vec<&String> = contact_map.keys().collect();
                 keys.sort();
-                if let Some(k) = keys.into_iter().find(|k| k.len() >= 10 && k[k.len() - 10..] == norm[norm.len() - 10..]) {
+                if let Some(k) = keys.into_iter().find(|k| k.chars().count() >= 10 && last_chars(k, 10) == last_chars(&norm, 10)) {
                     display = contact_map[k].clone();
                 }
             }
@@ -244,7 +285,7 @@ pub fn store_contact_photo_in(
     if norm.is_empty() || image_bytes.is_empty() {
         return false;
     }
-    if fs::create_dir_all(dir).is_err() {
+    if super::private_tmp::private_data_dir(dir).is_err() {
         return false;
     }
     let target = dir.join(format!("{norm}{}", photo_suffix(content_type)));
@@ -259,7 +300,7 @@ pub fn store_contact_photo_in(
             let _ = fs::remove_file(existing);
         }
     }
-    fs::write(&target, image_bytes).is_ok()
+    super::private_tmp::write_private(&target, image_bytes).is_ok()
 }
 
 pub fn store_contact_photo(address: &str, image_bytes: &[u8], content_type: Option<&str>) -> bool {
@@ -769,6 +810,13 @@ pub fn resolve_name(contact_map: &HashMap<String, String>, address: &str) -> Str
     address.to_string()
 }
 
+/// Keep only numbers that have no name yet. A contacts file that arrives
+/// from the phone (anyone can text one) may add names but never rename a
+/// known contact.
+pub fn only_unnamed(found: HashMap<String, String>, contact_map: &HashMap<String, String>) -> HashMap<String, String> {
+    found.into_iter().filter(|(phone, _)| resolve_name(contact_map, phone) == *phone).collect()
+}
+
 // ── Notification-based contact harvesting ──────────────────────────
 
 /// Insertion-ordered map of message body -> conversation address (Python dict
@@ -1013,8 +1061,8 @@ mod tests {
         fs::write(dir.join("a.vcf"), "BEGIN:VCARD\nFN:Dad\nTEL:3165550001\nEND:VCARD\n").unwrap();
         fs::write(dir.join("b.vcf"), "BEGIN:VCARD\nFN:Mom\nTEL:3165550002\nEND:VCARD\n").unwrap();
         let guessed = names(&[
-            ("13165550001", "Trent Fair"),     // wrong guess, other form of Dad's number
-            ("13165550003", "(775) 566-0568"), // a number, not a name
+            ("13165550001", "Pat Example"),    // wrong guess, other form of Dad's number
+            ("13165550003", "(316) 555-0168"), // a number, not a name
             ("13165550004", "Alex"),           // fills a gap
         ]);
         let manual = names(&[("13165550002", "Mother")]);
@@ -1029,8 +1077,8 @@ mod tests {
 
     #[test]
     fn numbers_with_brackets_or_dots_are_not_names() {
-        assert!(looks_like_phone_number("(775) 566-0568"));
-        assert!(looks_like_phone_number("775.566.0568"));
+        assert!(looks_like_phone_number("(316) 555-0168"));
+        assert!(looks_like_phone_number("316.555.0168"));
         assert!(looks_like_phone_number("+1 316-555-0000"));
         assert!(!looks_like_phone_number("Dad"));
         assert!(!looks_like_phone_number("(Work)"));
@@ -1075,7 +1123,7 @@ mod tests {
         );
         // A title that is only a number teaches nothing.
         assert_eq!(
-            match_contact_from_notification_props(&notification("(775) 566-0568", "See you at the game tonight"), &one, &none),
+            match_contact_from_notification_props(&notification("(316) 555-0168", "See you at the game tonight"), &one, &none),
             None
         );
     }
@@ -1102,4 +1150,46 @@ mod tests {
             ("First Contact".to_string(), vec!["15551112222".to_string()])
         );
     }
+
+    #[test]
+    fn reply_notifications_need_a_texting_package() {
+        let gm = "0|com.google.android.apps.messaging|42|null|10123";
+        assert_eq!(notification_package(gm), Some("com.google.android.apps.messaging"));
+        assert!(is_texting_notification("Messages", gm));
+        // Another app calling itself "Messages" is not a texting app.
+        assert!(!is_texting_notification("Messages", "0|com.evil.app|1|null|10999"));
+        // No key from the phone: the name is all there is.
+        assert_eq!(notification_package("17"), None);
+        assert!(is_texting_notification("Messages", ""));
+        assert!(!is_texting_notification("Gmail", ""));
+    }
+
+
+    #[test]
+    fn unicode_digits_never_split_a_character() {
+        // "1" + four fullwidth digits: 13 bytes, and byte 3 is mid-character.
+        let odd = "1\u{ff11}\u{ff12}\u{ff13}\u{ff14}";
+        assert_eq!(normalize_phone(odd), "1");
+        assert_eq!(normalize_phone("+1 (316) 555-0101"), "13165550101");
+        let mut map = HashMap::new();
+        map.insert(odd.to_string(), "Odd".to_string());
+        map.insert("3165550101".to_string(), "Sam".to_string());
+        let _ = contact_suggestions("1", &map, &[odd.to_string(), "13165550101".into()]);
+        assert!(same_phone("\u{ff11}\u{ff12}\u{ff13}\u{ff14}\u{ff15}\u{ff16}\u{ff17}\u{ff18}\u{ff19}\u{ff10}", "\u{ff11}\u{ff12}\u{ff13}\u{ff14}\u{ff15}\u{ff16}\u{ff17}\u{ff18}\u{ff19}\u{ff10}"));
+        assert!(!same_phone("x\u{ff11}\u{ff12}\u{ff13}\u{ff14}\u{ff15}\u{ff16}\u{ff17}\u{ff18}\u{ff19}", "y\u{ff11}\u{ff12}\u{ff13}\u{ff14}\u{ff15}\u{ff16}\u{ff17}\u{ff18}\u{ff19}"));
+    }
+
+
+    #[test]
+    fn received_contact_files_never_rename_known_contacts() {
+        let mut known = HashMap::new();
+        known.insert("3165550001".to_string(), "Dad".to_string());
+        let mut found = HashMap::new();
+        found.insert("13165550001".to_string(), "Bank Fraud Dept".to_string());
+        found.insert("3165550009".to_string(), "New Friend".to_string());
+        let kept = only_unnamed(found, &known);
+        assert_eq!(kept.len(), 1);
+        assert_eq!(kept["3165550009"], "New Friend");
+    }
+
 }

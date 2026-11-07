@@ -13,6 +13,9 @@ use crate::core::clipboard::{self, Change, Entry, History, Source};
 use crate::core::models::Device;
 use crate::dbus::Client;
 
+/// The MIME type KDE's and other password managers add to a copied secret.
+const PASSWORD_HINT: &str = "x-kde-passwordManagerHint";
+
 pub struct ClipboardPage {
     pub widget: gtk::Stack,
     list_box: gtk::ListBox,
@@ -157,7 +160,11 @@ impl ClipboardPage {
         };
         let weak = Rc::downgrade(self);
         glib::spawn_future_local(async move {
-            let text = display.clipboard().read_text_future().await.ok().flatten();
+            let clipboard = display.clipboard();
+            // Password managers (KeePassXC, Bitwarden, …) mark what they copy;
+            // it is never listed, so it can't stay on screen after they clear it.
+            let secret = clipboard.formats().contain_mime_type(PASSWORD_HINT);
+            let text = if secret { None } else { clipboard.read_text_future().await.ok().flatten() };
             let Some(this) = weak.upgrade() else { return };
             let change = this.history.borrow_mut().read_done(text.as_deref(), source, Local::now());
             this.show(change);

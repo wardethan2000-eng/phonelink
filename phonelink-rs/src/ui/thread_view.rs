@@ -100,18 +100,26 @@ fn attachment_name(att: &Attachment) -> String {
     if ext.is_empty() || name.to_lowercase().ends_with(ext) { name } else { format!("{name}{ext}") }
 }
 
-/// The inline file: a `file://` URI, a path, or base64 data written to
-/// the private scratch folder's `message_attachments` (`core::private_tmp`).
+/// The inline file: base64 data from the phone, written to the private
+/// scratch folder's `message_attachments` (`core::private_tmp`). A path or
+/// `file://` payload (rows the Python app saved) is used only when it lies in
+/// the app's own folders: the payload comes from the phone, and a rogue
+/// device must not make a chat open `~/.ssh/id_ed25519`.
 fn attachment_local_path(att: &Attachment) -> Option<PathBuf> {
     let payload = att.payload.as_str();
     if payload.is_empty() {
         return None;
     }
-    if payload.starts_with("file://") {
-        return gio::File::for_uri(payload).path().filter(|p| p.is_file());
+    let as_path = if payload.starts_with("file://") {
+        gio::File::for_uri(payload).path()
+    } else {
+        Some(PathBuf::from(payload)).filter(|p| p.is_absolute())
+    };
+    if let Some(p) = as_path.filter(|p| p.is_file()) {
+        return crate::core::attachments::is_app_file(&p).then_some(p);
     }
-    if Path::new(payload).is_file() {
-        return Some(PathBuf::from(payload));
+    if payload.starts_with("file://") {
+        return None;
     }
     let dir = private_tmp::dir(Some("message_attachments"))
         .inspect_err(|e| log::warn!("attachment folder: {e}"))
@@ -214,10 +222,7 @@ struct Decoded {
 }
 
 fn decode(path: &Path, can_fetch_full: bool) -> Decoded {
-    let Some((_, w, h)) = Pixbuf::file_info(path) else { return Decoded { measured: None, pixels: None } };
-    if w <= 0 || h <= 0 {
-        return Decoded { measured: None, pixels: None };
-    }
+    let Some((w, h)) = super::decodable_image(path) else { return Decoded { measured: None, pixels: None } };
     let (dw, dh, _) = image_display(w, h, can_fetch_full);
     let pixels = Pixbuf::from_file_at_scale(path, dw * IMAGE_DECODE_SCALE, dh * IMAGE_DECODE_SCALE, true)
         .ok()
@@ -435,9 +440,10 @@ fn run_action(action: FileAction, widget: &gtk::Widget, path: Option<&Path>, att
     let name = attachment_name(att);
     match (action, path) {
         (FileAction::Open, Some(p)) => open_file(p),
-        (FileAction::CopyImage, Some(p)) => match gdk::Texture::from_filename(p) {
-            Ok(tex) => widget.clipboard().set_texture(&tex),
-            Err(e) => log::warn!("copy image: {e}"),
+        (FileAction::CopyImage, Some(p)) => match super::decodable_image(p).map(|_| gdk::Texture::from_filename(p)) {
+            Some(Ok(tex)) => widget.clipboard().set_texture(&tex),
+            Some(Err(e)) => log::warn!("copy image: {e}"),
+            None => {}
         },
         (FileAction::Save, Some(p)) => save_as(widget, p, &name),
         (FileAction::Download, _) | (_, None) => (actions.download)(att.part_id, att.unique_identifier.clone(), name),

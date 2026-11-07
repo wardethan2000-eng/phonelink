@@ -1162,10 +1162,7 @@ fn open_file(path: &Path, status: &gtk::Label) {
 /// thread turns into a texture (the tile "covers", as Python's did).
 fn decode_thumbnail(path: &Path) -> Option<(glib::Bytes, i32, i32, usize, bool)> {
     let s = THUMB_SIZE * 2;
-    let (_, w, h) = gtk::gdk_pixbuf::Pixbuf::file_info(path)?;
-    if w <= 0 || h <= 0 {
-        return None;
-    }
+    let (w, h) = super::decodable_image(path)?;
     // Scale so the short side is `s`, then cut the middle square.
     let k = s as f64 / w.min(h) as f64;
     let (sw, sh) = (((w as f64 * k).round() as i32).max(s), ((h as f64 * k).round() as i32).max(s));

@@ -23,10 +23,10 @@ use super::models::{Conversation, SmsMessage};
 /// Turns (addresses, primary address) into a display name.
 pub type NameResolver<'a> = &'a dyn Fn(&[String], &str) -> String;
 
-/// Python `re.sub(r"[^\d]", "", number)` (Unicode `\d`).
+/// Digits only (ASCII, like `contacts::normalize_phone` and the helper).
 fn normalize_phone(number: &str) -> String {
     static NON_DIGIT: OnceLock<Regex> = OnceLock::new();
-    let re = NON_DIGIT.get_or_init(|| Regex::new(r"[^\d]").expect("static regex"));
+    let re = NON_DIGIT.get_or_init(|| Regex::new(r"[^0-9]").expect("static regex"));
     re.replace_all(number, "").into_owned()
 }
 
