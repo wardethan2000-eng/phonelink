@@ -1235,7 +1235,11 @@ mod tests {
         assert!(matches!(p.m.send(10, "ok")[0], Effect::Reply { .. }));
         p.m.remove_notification("n6");
         // Not a texting app, or no reply action.
-        p.m.note_notification(ReplyableNotification { app_name: "Gmail".into(), ..notif("n3", "Alex", "Running ten minutes late") });
+        p.m.note_notification(ReplyableNotification {
+            app_name: "Gmail".into(),
+            internal_id: "0|com.google.android.gm|3|null|10100".into(),
+            ..notif("n3", "Alex", "Running ten minutes late")
+        });
         p.m.note_notification(ReplyableNotification { reply_id: String::new(), ..notif("n4", "Alex", "Running ten minutes late") });
         // Any app can call itself "Messages": the package decides.
         p.m.note_notification(ReplyableNotification {
