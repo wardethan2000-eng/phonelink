@@ -834,7 +834,7 @@ impl MessagesPage {
                 }
                 let Some(this) = weak.upgrade() else { return };
                 let now_ms = chrono::Utc::now().timestamp_millis();
-                let effects = {
+                let (effects, to_phone) = {
                     let mut guard = this.inner.borrow_mut();
                     let i = &mut *guard;
                     let mut effects = Vec::new();
@@ -853,15 +853,16 @@ impl MessagesPage {
                         }
                         _ => true,
                     });
-                    if !to_phone.is_empty() {
-                        this.delete_on_google(to_phone);
-                    }
                     // One "only from PhoneRelay" note, not one per chat.
                     let mut toasted = false;
                     effects.retain(|e| !matches!(e, Effect::Toast(_)) || !std::mem::replace(&mut toasted, true));
                     effects.push(Effect::ShowEmpty);
-                    effects
+                    (effects, to_phone)
                 };
+                // After the borrow ends: this reads `inner` (chat keys).
+                if !to_phone.is_empty() {
+                    this.delete_on_google(to_phone);
+                }
                 this.run(effects);
             });
             dialog.present();
