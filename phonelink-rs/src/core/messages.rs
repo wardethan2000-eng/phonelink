@@ -150,8 +150,9 @@ pub struct GmMode {
     chats: HashMap<i64, GmChat>,
     /// My messages' route and delivery, by uid.
     delivery: HashMap<i64, SendRoute>,
-    /// Texts sent from here whose echo hasn't come: tmp id → thread.
-    sent_here: HashMap<String, i64>,
+    /// Texts sent from here whose echo hasn't come: tmp id → (thread,
+    /// text). Real phones echo without the tmp id, so the text matches too.
+    sent_here: HashMap<String, (i64, String)>,
     /// Messages sent from here (their delivery is always shown).
     uids_sent_here: HashSet<i64>,
     /// Chats whose newest page was fetched this session.
@@ -1277,16 +1278,25 @@ impl Messages {
             None => return Vec::new(),
         };
         let mut changed = false;
-        if m.from_me {
-            if let Some(delivery) = Delivery::parse(&m.status) {
-                let route = SendRoute::Google { rcs: m.rcs, delivery };
-                changed = gm.delivery.insert(uid, route).is_some_and(|old| old != route);
-            }
-            if !m.tmp_id.is_empty() && gm.sent_here.remove(&m.tmp_id).is_some() {
+        if m.from_me
+            && let Some(delivery) = Delivery::parse(&m.status)
+        {
+            let route = SendRoute::Google { rcs: m.rcs, delivery };
+            changed = gm.delivery.insert(uid, route).is_some_and(|old| old != route);
+        }
+        let primary = self.index.primary_for(thread_id);
+        if m.from_me && !gm.uids_sent_here.contains(&uid) {
+            let key = normalize_text(&m.text);
+            let mine = if gm.sent_here.contains_key(&m.tmp_id) {
+                Some(m.tmp_id.clone())
+            } else {
+                gm.sent_here.iter().find(|(_, (t, text))| *t == primary && *text == key).map(|(k, _)| k.clone())
+            };
+            if let Some(k) = mine {
+                gm.sent_here.remove(&k);
                 gm.uids_sent_here.insert(uid);
             }
         }
-        let primary = self.index.primary_for(thread_id);
         let shown = self.index.get(primary).is_some_and(|c| c.messages.iter().any(|x| x.uid == uid));
         if m.deleted {
             let Some(conv) = self.index.get_mut(primary).filter(|_| shown) else { return Vec::new() };
@@ -1335,7 +1345,7 @@ impl Messages {
         gm.sends += 1;
         let now_ms = chrono::Utc::now().timestamp_millis();
         let tmp_id = super::gm::new_tmp_id(now_ms, gm.sends % 1000);
-        gm.sent_here.insert(tmp_id.clone(), primary);
+        gm.sent_here.insert(tmp_id.clone(), (primary, normalize_text(text)));
         Effect::GmSend { thread_id: primary, conv, text: text.to_string(), tmp_id }
     }
 
@@ -1347,7 +1357,7 @@ impl Messages {
         gm.fetched.insert(primary);
         gm.sends += 1;
         let tmp_id = super::gm::new_tmp_id(chrono::Utc::now().timestamp_millis(), gm.sends % 1000);
-        gm.sent_here.insert(tmp_id.clone(), primary);
+        gm.sent_here.insert(tmp_id.clone(), (primary, normalize_text(text)));
         self.active = Some(primary);
         self.read_thread_ids.insert(primary);
         vec![
@@ -2229,6 +2239,7 @@ mod tests {
             // The echo carries the tmp id; then its delivery updates.
             let mut echo = gmsg("a", "9", true, 3000);
             echo.tmp_id = tmp_id.clone();
+            echo.text = "hello".into();
             echo.status = "sending".into();
             p.msg(&echo);
             let uid = p.store.gm_local_id("msg", "9");
@@ -2236,6 +2247,12 @@ mod tests {
             echo.status = "read".into();
             assert_eq!(p.msg(&echo), vec![Effect::Redraw(tid)]);
             assert_eq!(p.m.route_of(uid).map(SendRoute::label), Some("RCS · Read"));
+            // A real phone echoes without the tmp id: the text matches it.
+            let [Effect::GmSend { .. }] = p.m.send(tid, "second one").as_slice() else { panic!() };
+            let mut echo2 = gmsg("a", "12", true, 3050);
+            echo2.text = "second one".into();
+            p.msg(&echo2);
+            assert_eq!(p.m.route_of(p.store.gm_local_id("msg", "12")).map(SendRoute::label), Some("RCS · Delivered"));
             // Texts sent from the phone show no route, unless they failed.
             p.msg(&gmsg("a", "10", true, 3100));
             assert_eq!(p.m.route_of(p.store.gm_local_id("msg", "10")), None);
