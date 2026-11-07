@@ -31,6 +31,7 @@ use regex::Regex;
 use crate::core::attachments::{existing_full_in, full_cache_dir, image_ext, is_image, sanitize_name};
 use crate::core::messages::SendRoute;
 use crate::core::models::{Attachment, Conversation, SmsMessage};
+use crate::core::private_tmp;
 use crate::core::search;
 
 pub const THREAD_WINDOW: usize = 60;
@@ -100,7 +101,7 @@ fn attachment_name(att: &Attachment) -> String {
 }
 
 /// The inline file: a `file://` URI, a path, or base64 data written to
-/// `$TMPDIR/phonelink/message_attachments` (same names as Python).
+/// the private scratch folder's `message_attachments` (`core::private_tmp`).
 fn attachment_local_path(att: &Attachment) -> Option<PathBuf> {
     let payload = att.payload.as_str();
     if payload.is_empty() {
@@ -112,8 +113,9 @@ fn attachment_local_path(att: &Attachment) -> Option<PathBuf> {
     if Path::new(payload).is_file() {
         return Some(PathBuf::from(payload));
     }
-    let dir = std::env::temp_dir().join("phonelink").join("message_attachments");
-    std::fs::create_dir_all(&dir).ok()?;
+    let dir = private_tmp::dir(Some("message_attachments"))
+        .inspect_err(|e| log::warn!("attachment folder: {e}"))
+        .ok()?;
     let uid = if att.unique_identifier.is_empty() {
         if att.part_id == 0 { "attachment".to_string() } else { att.part_id.to_string() }
     } else {
@@ -128,7 +130,7 @@ fn attachment_local_path(att: &Attachment) -> Option<PathBuf> {
     if data.is_empty() {
         return None;
     }
-    std::fs::write(&target, &data).ok()?;
+    private_tmp::write_private(&target, &data).ok()?;
     Some(target)
 }
 
@@ -1123,11 +1125,15 @@ impl ThreadView {
         if taken {
             self.entry.set_text("");
             if let Some(path) = image {
-                // Keep the file until KDE Connect has read it, as Python did.
                 self.clear_pending_image(false);
-                glib::timeout_add_seconds_local_once(120, move || {
-                    let _ = std::fs::remove_file(path);
-                });
+                // A pasted picture we saved ourselves is removed once KDE
+                // Connect has had time to read it, as Python did. A file
+                // pasted from the user's own folders is theirs: never touched.
+                if private_tmp::contains(&path) {
+                    glib::timeout_add_seconds_local_once(120, move || {
+                        let _ = std::fs::remove_file(path);
+                    });
+                }
             }
         }
     }
@@ -1143,15 +1149,18 @@ impl ThreadView {
         if has_texture {
             clipboard.read_texture_async(gio::Cancellable::NONE, move |res| {
                 let (Some(this), Ok(Some(tex))) = (weak.upgrade(), res) else { return };
-                let dir = std::env::temp_dir().join("phonelink");
-                if std::fs::create_dir_all(&dir).is_err() {
-                    return;
-                }
+                let dir = match private_tmp::dir(None) {
+                    Ok(d) => d,
+                    Err(e) => {
+                        log::warn!("paste folder: {e}");
+                        return;
+                    }
+                };
                 let stamp = std::time::SystemTime::now()
                     .duration_since(std::time::UNIX_EPOCH)
                     .map_or(0, |d| d.as_millis());
                 let path = dir.join(format!("paste_{stamp}.png"));
-                if tex.save_to_png(&path).is_ok() {
+                if private_tmp::write_private(&path, &tex.save_to_png_bytes()).is_ok() {
                     this.set_pending_image(path);
                 }
             });
@@ -1180,7 +1189,7 @@ impl ThreadView {
     fn clear_pending_image(&self, delete: bool) {
         if let Some(path) = self.pending_image.borrow_mut().take()
             && delete
-            && path.starts_with(std::env::temp_dir().join("phonelink"))
+            && private_tmp::contains(&path)
         {
             let _ = std::fs::remove_file(path);
         }

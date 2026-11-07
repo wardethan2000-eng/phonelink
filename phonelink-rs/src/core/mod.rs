@@ -13,6 +13,7 @@ pub mod messages;
 pub mod models;
 pub mod notifications;
 pub mod phone_delete;
+pub mod private_tmp;
 pub mod reconcile;
 pub mod search;
 pub mod settings;
