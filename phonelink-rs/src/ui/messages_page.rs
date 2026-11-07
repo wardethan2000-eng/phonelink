@@ -117,6 +117,11 @@ pub struct MessagesPage {
     /// Folded message text for searching (kept outside `inner`: the list
     /// asks for hits while `inner` is borrowed).
     search: RefCell<crate::core::search::SearchIndex>,
+    /// The lasting Google Messages link (read state, deletes), when paired.
+    gm: RefCell<Option<Rc<super::gm_link::GmLink>>>,
+    /// Chats the phone reported read (key → its newest message, ms), applied
+    /// together on idle (one burst of ~250 when the link connects).
+    phone_read: RefCell<std::collections::HashMap<String, i64>>,
     inner: RefCell<Inner>,
 }
 
@@ -174,6 +179,8 @@ impl MessagesPage {
             toasts: RefCell::default(),
             google: RefCell::default(),
             search: RefCell::default(),
+            gm: RefCell::default(),
+            phone_read: RefCell::default(),
             inner: RefCell::new(Inner {
                 m: Messages::new(),
                 store,
@@ -194,6 +201,12 @@ impl MessagesPage {
             }),
         });
         *download_target.borrow_mut() = Rc::downgrade(&this);
+        let weak = Rc::downgrade(&this);
+        *this.gm.borrow_mut() = super::gm_link::GmLink::start(move |e| {
+            if let Some(this) = weak.upgrade() {
+                this.gm_event(e);
+            }
+        });
         let saved_scale = this.inner.borrow().settings.borrow().message_font_scale();
         let weak = Rc::downgrade(&this);
         this.thread.set_zoom(saved_scale, move |scale| {
@@ -480,9 +493,12 @@ impl MessagesPage {
             match e {
                 Effect::RefreshList => refresh = true,
                 Effect::Sync(action) => self.sync(action),
-                Effect::MarkRead { thread_id } => self.with_device(move |c, d| async move {
-                    c.mark_conversation_as_read(&d, thread_id).await;
-                }),
+                Effect::MarkRead { thread_id } => {
+                    self.mark_read_on_google(thread_id);
+                    self.with_device(move |c, d| async move {
+                        c.mark_conversation_as_read(&d, thread_id).await;
+                    })
+                }
                 Effect::ShowThread(tid) => self.show_thread(tid),
                 Effect::ShowEmpty => self.thread.show_empty(),
                 Effect::Toast(text) => self.toast(text),
@@ -671,14 +687,87 @@ impl MessagesPage {
         });
     }
 
-    /// Run the Google Messages helper off the main thread, then say how it went.
+    // ── Google Messages link ───────────────────────────────────────
+
+    fn gm_event(self: &Rc<Self>, e: crate::core::gm::Incoming) {
+        use crate::core::gm::Incoming;
+        if let Incoming::Ready { me } = e {
+            self.inner.borrow_mut().m.gm_me = me;
+            return;
+        }
+        let Incoming::Conversation { chat, unread: false, last_ts_ms } = e else { return };
+        let first = {
+            let mut read = self.phone_read.borrow_mut();
+            let first = read.is_empty();
+            read.insert(chat, last_ts_ms);
+            first
+        };
+        if first {
+            let weak = Rc::downgrade(self);
+            glib::idle_add_local_once(move || {
+                let Some(this) = weak.upgrade() else { return };
+                let read = std::mem::take(&mut *this.phone_read.borrow_mut());
+                let effects = {
+                    let mut guard = this.inner.borrow_mut();
+                    let i = &mut *guard;
+                    i.m.read_on_phone(&read, &i.store)
+                };
+                this.run(effects);
+            });
+        }
+    }
+
+    /// Opened on the laptop: mark it read on the phone too.
+    fn mark_read_on_google(&self, thread_id: i64) {
+        let Some(gm) = self.gm.borrow().clone() else { return };
+        let Some(key) = self.inner.borrow().m.gm_chat_key(thread_id) else { return };
+        gm.request(
+            |id| crate::core::gm::mark_read_request(id, &key),
+            |r| {
+                if !r.ok {
+                    log::info!("mark read on the phone: {} {}", r.error, r.message);
+                }
+            },
+        );
+    }
+
+    /// Delete on the phone through Google Messages (the lasting link when
+    /// it runs, else a one-shot helper off the main thread), then say how
+    /// it went.
     fn delete_on_google(self: &Rc<Self>, chats: Vec<(i64, Vec<String>)>) {
         if !crate::core::phone_delete::available() {
             self.toast("Removed from PhoneRelay only: Google Messages isn't paired on this computer");
             return;
         }
         let weak = Rc::downgrade(self);
-        let members: Vec<Vec<String>> = chats.into_iter().map(|(_, a)| a).collect();
+        let keys: Vec<String> = {
+            let i = self.inner.borrow();
+            chats.iter().map(|(_, a)| i.m.gm_key_for(a)).filter(|k| !k.is_empty()).collect()
+        };
+        if keys.is_empty() {
+            self.toast("Removed from PhoneRelay only: the chat has no number or address to find it by");
+            return;
+        }
+        let gm = self.gm.borrow().clone();
+        if let Some(gm) = gm.filter(|g| g.is_running()) {
+            let n = keys.len();
+            let sent = gm.request(
+                |id| crate::core::gm::delete_request(id, &keys),
+                move |reply| {
+                    let Some(this) = weak.upgrade() else { return };
+                    let result = reply.delete_outcomes(n);
+                    if let Err(e) = &result {
+                        log::warn!("delete on phone: {e}");
+                    }
+                    this.toast(&crate::core::phone_delete::summary(&result));
+                },
+            );
+            if sent {
+                return;
+            }
+        }
+        let weak = Rc::downgrade(self);
+        let members: Vec<Vec<String>> = keys.into_iter().map(|k| vec![k]).collect();
         glib::spawn_future_local(async move {
             let done = gio::spawn_blocking(move || crate::core::phone_delete::delete_chats(&members)).await;
             let Some(this) = weak.upgrade() else { return };

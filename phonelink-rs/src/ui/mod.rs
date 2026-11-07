@@ -4,6 +4,7 @@
 pub mod clipboard_page;
 pub mod conversation_list;
 pub mod files_page;
+pub mod gm_link;
 pub mod google_sync;
 pub mod icons;
 pub mod messages_page;

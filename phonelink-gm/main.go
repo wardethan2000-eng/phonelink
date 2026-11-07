@@ -183,8 +183,39 @@ func others(conv *gmproto.Conversation) []string {
 	return out
 }
 
+// myKeys: the keys of my own numbers, as Google Messages marks them.
+func myKeys(convs []*gmproto.Conversation) map[string]bool {
+	mine := map[string]bool{}
+	for _, c := range convs {
+		for _, p := range c.GetParticipants() {
+			if p.GetIsMe() {
+				if k := phoneKey(p.GetID().GetNumber()); k != "" {
+					mine[k] = true
+				}
+			}
+		}
+	}
+	return mine
+}
+
+// withoutMe drops my own numbers from a chat key (callers may not know
+// them), unless nothing else is left.
+func withoutMe(key string, mine map[string]bool) string {
+	var keep []string
+	for _, k := range strings.Split(key, ",") {
+		if !mine[k] {
+			keep = append(keep, k)
+		}
+	}
+	if len(keep) == 0 {
+		return key
+	}
+	return strings.Join(keep, ",")
+}
+
 // pick finds the one conversation whose members are exactly `want`.
 func pick(convs []*gmproto.Conversation, want string) (*gmproto.Conversation, string) {
+	want = withoutMe(want, myKeys(convs))
 	var found *gmproto.Conversation
 	for _, c := range convs {
 		if c.GetStatus() == gmproto.ConversationStatus_DELETED {
@@ -222,15 +253,147 @@ func lock(sessionPath string) (*os.File, error) {
 	}
 }
 
+// link is one libgm connection with the session kept up to date. Extra
+// events (serve mode) go to onEvent.
+type link struct {
+	cli     *libgm.Client
+	auth    *libgm.AuthData
+	session string
+	logger  zerolog.Logger
+	ready   chan []*gmproto.Conversation
+	fatal   chan error
+	onEvent func(evt any)
+}
+
+func newLink(auth *libgm.AuthData, session string) *link {
+	l := &link{
+		auth:    auth,
+		session: session,
+		logger:  zerolog.New(os.Stderr).With().Timestamp().Logger().Level(zerolog.WarnLevel),
+		ready:   make(chan []*gmproto.Conversation, 1),
+		fatal:   make(chan error, 1),
+	}
+	l.cli = libgm.NewClient(auth, nil, l.logger)
+	var once sync.Once
+	l.cli.SetEventHandler(func(evt any) {
+		switch e := evt.(type) {
+		case *events.AuthTokenRefreshed:
+			if err := saveAuth(l.session, l.auth); err != nil {
+				l.logger.Error().Err(err).Msg("save refreshed session")
+			}
+		case *events.ClientReady:
+			once.Do(func() { l.ready <- e.Conversations })
+		case *events.ListenFatalError:
+			l.die(e.Error)
+		case *events.GaiaLoggedOut:
+			l.die(errLoggedOut)
+		}
+		if l.onEvent != nil {
+			l.onEvent(evt)
+		}
+	})
+	return l
+}
+
+var errLoggedOut = errors.New("Google account signed out of Google Messages")
+
+func (l *link) die(err error) {
+	select {
+	case l.fatal <- err:
+	default:
+	}
+}
+
+// connect opens the long poll the way gmcli does, then makes this the
+// active session so the phone answers requests.
+func (l *link) connect(ctx context.Context) error {
+	if err := l.cli.Connect(); err != nil {
+		return fmt.Errorf("connect: %w", err)
+	}
+	for !l.cli.IsConnected() {
+		select {
+		case err := <-l.fatal:
+			return err
+		case <-ctx.Done():
+			return errors.New("the phone did not answer in time")
+		case <-time.After(100 * time.Millisecond):
+		}
+	}
+	if err := l.cli.SetActiveSession(ctx); err != nil {
+		return fmt.Errorf("set active session: %w", err)
+	}
+	return nil
+}
+
+// listAll: every chat in the inbox and the archive.
+func (l *link) listAll(ctx context.Context) ([]*gmproto.Conversation, error) {
+	var convs []*gmproto.Conversation
+	for _, folder := range []gmproto.ListConversationsRequest_Folder{
+		gmproto.ListConversationsRequest_INBOX, gmproto.ListConversationsRequest_ARCHIVE,
+	} {
+		resp, err := l.cli.ListConversations(ctx, 1000, folder)
+		if err != nil {
+			return nil, fmt.Errorf("list conversations: %w", err)
+		}
+		convs = append(convs, resp.GetConversations()...)
+	}
+	return convs, nil
+}
+
+// deleteChats deletes (or, dry, finds) each chat key's conversation. find
+// is asked first; refetch is called once if a chat isn't found.
+func deleteChats(ctx context.Context, cli *libgm.Client, keys []string, dry bool, find func() []*gmproto.Conversation, refetch func()) result {
+	out := result{OK: true, DryRun: dry}
+	refetched := false
+	for _, want := range keys {
+		conv, why := pick(find(), want)
+		if conv == nil && !refetched {
+			refetched = true
+			refetch()
+			conv, why = pick(find(), want)
+		}
+		r := chatResult{Chat: want}
+		switch {
+		case conv == nil:
+			r.Error, r.Message = why, fmt.Sprintf("%s: no single Google Messages chat with exactly %s", why, want)
+		case dry:
+			r.OK, r.ConversationID = true, conv.GetConversationID()
+		default:
+			r.ConversationID = conv.GetConversationID()
+			if err := cli.DeleteConversation(ctx, conv.GetConversationID(), others(conv)[0]); err != nil {
+				r.Error, r.Message = "delete_failed", err.Error()
+			} else {
+				r.OK = true
+			}
+		}
+		out.OK = out.OK && r.OK
+		out.Results = append(out.Results, r)
+	}
+	return out
+}
+
+// chatKeys turns CHAT arguments into match keys.
+func chatKeys(args []string) ([]string, error) {
+	var keys []string
+	for _, arg := range args {
+		k := keySet(strings.Split(arg, ","))
+		if k == "" {
+			return nil, fmt.Errorf("chat %q has no phone number or address", arg)
+		}
+		keys = append(keys, k)
+	}
+	return keys, nil
+}
+
 func main() {
 	if len(os.Args) < 2 {
-		fail("usage", "usage: phonelink-gm status | delete [--dry-run] NUMBER...")
+		fail("usage", "usage: phonelink-gm status | serve | members | delete [--dry-run] CHAT...")
 	}
 	cmd := os.Args[1]
 	fs := flag.NewFlagSet(cmd, flag.ContinueOnError)
 	session := fs.String("session", defaultSession(), "gmcli session.json")
 	dryRun := fs.Bool("dry-run", false, "find the conversation but do not delete it")
-	timeout := fs.Duration("timeout", 60*time.Second, "give up after this long")
+	timeout := fs.Duration("timeout", 60*time.Second, "give up after this long (serve: connecting only)")
 	if err := fs.Parse(os.Args[2:]); err != nil {
 		fail("usage", "%v", err)
 	}
@@ -239,22 +402,20 @@ func main() {
 	if cmd == "status" {
 		finish(result{OK: true, Paired: err == nil})
 	}
-	if cmd != "delete" && cmd != "members" {
+	if cmd != "delete" && cmd != "members" && cmd != "serve" {
 		fail("usage", "unknown command %q", cmd)
 	}
 	if err != nil {
 		fail("not_paired", "Google Messages is not paired: %v", err)
 	}
 	var chats []string
-	for _, arg := range fs.Args() {
-		k := keySet(strings.Split(arg, ","))
-		if k == "" {
-			fail("usage", "chat %q has no phone number or address", arg)
+	if cmd == "delete" {
+		if chats, err = chatKeys(fs.Args()); err != nil {
+			fail("usage", "%v", err)
 		}
-		chats = append(chats, k)
-	}
-	if len(chats) == 0 && cmd != "members" {
-		fail("usage", "no chats given")
+		if len(chats) == 0 {
+			fail("usage", "no chats given")
+		}
 	}
 
 	lk, err := lock(*session)
@@ -263,73 +424,28 @@ func main() {
 	}
 	defer lk.Close()
 
-	logger := zerolog.New(os.Stderr).Level(zerolog.WarnLevel)
-	cli := libgm.NewClient(auth, nil, logger)
-	ready := make(chan []*gmproto.Conversation, 1)
-	fatal := make(chan error, 1)
-	var once sync.Once
-	cli.SetEventHandler(func(evt any) {
-		switch e := evt.(type) {
-		case *events.AuthTokenRefreshed:
-			if err := saveAuth(*session, auth); err != nil {
-				logger.Error().Err(err).Msg("save refreshed session")
-			}
-		case *events.ClientReady:
-			once.Do(func() { ready <- e.Conversations })
-		case *events.ListenFatalError:
-			select {
-			case fatal <- e.Error:
-			default:
-			}
-		case *events.GaiaLoggedOut:
-			select {
-			case fatal <- errors.New("Google account signed out of Google Messages"):
-			default:
-			}
-		}
-	})
+	l := newLink(auth, *session)
+	if cmd == "serve" {
+		os.Exit(serve(l, *timeout))
+	}
 	ctx, cancel := context.WithTimeout(context.Background(), *timeout)
 	defer cancel()
-	if err := cli.Connect(); err != nil {
-		fail("connect_failed", "connect: %v", err)
-	}
-	defer cli.Disconnect()
-
-	// Wait for the long-poll the way gmcli does, then make this the
-	// active session so the phone answers requests.
-	for !cli.IsConnected() {
-		select {
-		case err := <-fatal:
-			fail("connect_failed", "%v", err)
-		case <-ctx.Done():
-			fail("connect_failed", "the phone did not answer in %s", *timeout)
-		case <-time.After(100 * time.Millisecond):
-		}
-	}
-	if err := cli.SetActiveSession(ctx); err != nil {
-		fail("connect_failed", "set active session: %v", err)
+	defer l.cli.Disconnect()
+	if err := l.connect(ctx); err != nil {
+		fail("connect_failed", "%v", err)
 	}
 	var convs []*gmproto.Conversation
 	select {
-	case convs = <-ready: // the newest chats, if the phone sends them quickly
+	case convs = <-l.ready: // the newest chats, if the phone sends them quickly
 	case <-time.After(3 * time.Second):
 	}
 	// ClientReady carries only the newest chats; ask for more if needed.
-	fetched := false
 	fetchAll := func() {
-		if fetched {
-			return
+		all, err := l.listAll(ctx)
+		if err != nil {
+			fail("connect_failed", "%v", err)
 		}
-		fetched = true
-		for _, folder := range []gmproto.ListConversationsRequest_Folder{
-			gmproto.ListConversationsRequest_INBOX, gmproto.ListConversationsRequest_ARCHIVE,
-		} {
-			resp, err := cli.ListConversations(ctx, 1000, folder)
-			if err != nil {
-				fail("connect_failed", "list conversations: %v", err)
-			}
-			convs = append(convs, resp.GetConversations()...)
-		}
+		convs = append(convs, all...)
 	}
 	if cmd == "members" {
 		fetchAll()
@@ -343,29 +459,5 @@ func main() {
 		}
 		os.Exit(0)
 	}
-	out := result{OK: true, DryRun: *dryRun}
-	for _, want := range chats {
-		conv, why := pick(convs, want)
-		if conv == nil {
-			fetchAll()
-			conv, why = pick(convs, want)
-		}
-		r := chatResult{Chat: want}
-		switch {
-		case conv == nil:
-			r.Error, r.Message = why, fmt.Sprintf("%s: no single Google Messages chat with exactly %s", why, want)
-		case *dryRun:
-			r.OK, r.ConversationID = true, conv.GetConversationID()
-		default:
-			r.ConversationID = conv.GetConversationID()
-			if err := cli.DeleteConversation(ctx, conv.GetConversationID(), others(conv)[0]); err != nil {
-				r.Error, r.Message = "delete_failed", err.Error()
-			} else {
-				r.OK = true
-			}
-		}
-		out.OK = out.OK && r.OK
-		out.Results = append(out.Results, r)
-	}
-	finish(out)
+	finish(deleteChats(ctx, l.cli, chats, *dryRun, func() []*gmproto.Conversation { return convs }, fetchAll))
 }

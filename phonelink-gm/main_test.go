@@ -59,3 +59,24 @@ func TestBusinessChatsMatchByAddress(t *testing.T) {
 		t.Fatal("agent address keyed by its digits")
 	}
 }
+
+func TestConversationEventsUseMillisecondsAndSkipDeleted(t *testing.T) {
+	c := conv("9", part("+13165550000", true), part("+13165551111", false))
+	c.LastMessageTimestamp = 1_790_000_000_123_456
+	ev, ok := conversationEvent(c)
+	if !ok || ev.Chat != "3165551111" || ev.LastTSms != 1_790_000_000_123 || ev.Unread {
+		t.Fatalf("event = %+v %v", ev, ok)
+	}
+	c.Status = gmproto.ConversationStatus_DELETED
+	if _, ok := conversationEvent(c); ok {
+		t.Fatal("event for a deleted chat")
+	}
+}
+
+func TestPickIgnoresMyNumberInTheRequest(t *testing.T) {
+	me := part("+13165550000", true)
+	convs := []*gmproto.Conversation{conv("1", me, part("+13165551111", false), part("+13165552222", false))}
+	if c, why := pick(convs, keySet([]string{"3165550000", "3165551111", "3165552222"})); c == nil {
+		t.Fatalf("pick with me included = %s", why)
+	}
+}

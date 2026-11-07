@@ -1,6 +1,9 @@
 # phonelink-gm: Google Messages helper (Phase 9, Route B1)
 
-Design, 2026-11-05. Not built yet. Goal: full RCS in the Messages tab by
+Design, 2026-11-05. **Built so far (2026-11-06):** a `serve` mode with
+`mark_read`, `delete` and per-chat unread events, used for read-state sync
+and deletes (see `phonelink-gm/serve.go`; requests use an `op` field and
+chats are matched by member keys, not ids). The rest is not built yet. Goal: full RCS in the Messages tab by
 pairing the app as a Google Messages "for web" device.
 
 ## Why a separate helper

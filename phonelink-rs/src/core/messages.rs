@@ -130,6 +130,8 @@ pub struct Messages {
     full_requested: HashSet<String>,
     /// Android 17 hiding texts from KDE Connect (port brief, rule 1).
     pub hidden_texts: HiddenTextDetector,
+    /// My own number keys, as Google Messages reports them.
+    pub gm_me: Vec<String>,
 }
 
 /// Display name for a conversation from the contact map.
@@ -421,6 +423,50 @@ impl Messages {
         let threads = self.conversation_threads(thread_id);
         self.catch_up.queue_conversation_gap_fill(&threads, now);
         out
+    }
+
+    /// My own number keys: Google Messages' and the guessed one.
+    fn gm_me_keys(&self) -> Vec<String> {
+        let mut me = self.gm_me.clone();
+        if !self.index.self_key.is_empty() && !me.contains(&self.index.self_key) {
+            me.push(self.index.self_key.clone());
+        }
+        me
+    }
+
+    /// The Google Messages helper's key for a conversation (`core::gm`).
+    pub fn gm_chat_key(&self, thread_id: i64) -> Option<String> {
+        let c = self.index.get(thread_id)?;
+        let key = super::gm::chat_key(&c.addresses, &c.address, &self.gm_me_keys());
+        (!key.is_empty()).then_some(key)
+    }
+
+    /// The helper's key for chat members (as `DeleteOnPhone` carries them).
+    pub fn gm_key_for(&self, addresses: &[String]) -> String {
+        super::gm::chat_key(addresses, "", &self.gm_me_keys())
+    }
+
+    /// Google Messages says these chats (key → the phone's newest message,
+    /// ms) are read on the phone: clear their unread dot here, unless this
+    /// side has a newer text the phone's state doesn't cover yet.
+    pub fn read_on_phone(&mut self, read: &HashMap<String, i64>, store: &MessageStore) -> Vec<Effect> {
+        let Some(dev) = self.device_id.clone() else { return Vec::new() };
+        let me = self.gm_me_keys();
+        let mut changed = false;
+        for conv in self.index.conversations.values_mut() {
+            if conv.is_read || conv.thread_id < 0 {
+                continue;
+            }
+            let key = super::gm::chat_key(&conv.addresses, &conv.address, &me);
+            let Some(&phone_ts) = read.get(&key) else { continue };
+            if conv.last_date > phone_ts + super::gm::READ_SLACK_MS {
+                continue;
+            }
+            conv.is_read = true;
+            store.upsert_conversation(&dev, conv);
+            changed = true;
+        }
+        if changed { vec![Effect::RefreshList] } else { Vec::new() }
     }
 
     /// The conversation's primary phone thread followed by merged ones.
@@ -956,6 +1002,37 @@ mod tests {
 
     fn uids(c: &Conversation) -> HashSet<i64> {
         c.messages.iter().map(|m| m.uid).collect()
+    }
+
+    // ── read on the phone (Google Messages) ─────────────────────────
+
+    #[test]
+    fn read_on_the_phone_clears_the_dot_unless_this_side_has_newer() {
+        let mut p = Panel::new();
+        let unread = |uid, tid, a: &str, date| RawMessage { read: 0, ..tup(uid, tid, &[a], date) };
+        p.apply(&[unread(1, 10, "+13165551111", 1_000_000), unread(2, 20, "shop_agent@rbm.goog", 2_000_000), unread(3, 30, "+13165553333", 9_000_000)]);
+        assert_eq!(p.m.gm_chat_key(20).as_deref(), Some("shop_agent@rbm.goog"));
+        let read = HashMap::from([
+            ("3165551111".to_string(), 1_000_500),
+            ("shop_agent@rbm.goog".to_string(), 2_000_000),
+            // The phone's state predates this side's newest text.
+            ("3165553333".to_string(), 1_000_000),
+        ]);
+        let effects = p.m.read_on_phone(&read, &p.store);
+        assert!(effects.contains(&Effect::RefreshList));
+        // A group listing my own number matches once Google Messages says it's mine.
+        p.apply(&[RawMessage { read: 0, ..tup(4, 40, &["+13165550000", "+13165551111", "+13165552222"], 3_000_000) }]);
+        let group = HashMap::from([("3165551111,3165552222".to_string(), 3_000_000)]);
+        p.m.read_on_phone(&group, &p.store);
+        assert!(!p.m.index.get(40).unwrap().is_read);
+        p.m.gm_me = vec!["3165550000".into()];
+        p.m.read_on_phone(&group, &p.store);
+        assert!(p.m.index.get(40).unwrap().is_read);
+        let is_read = |p: &Panel, t| p.m.index.get(t).unwrap().is_read;
+        assert!(is_read(&p, 10) && is_read(&p, 20));
+        assert!(!is_read(&p, 30));
+        // Nothing left to change: no refresh.
+        assert!(p.m.read_on_phone(&read, &p.store).is_empty());
     }
 
     // ── PanelReconcileTests ─────────────────────────────────────────
