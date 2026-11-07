@@ -5,7 +5,8 @@
 //! file at gmcli's session path).
 //!
 //! Sends echo back as `sending`, then `delivered`, then `read`. A text
-//! containing "fail" fails.
+//! containing "fail" fails. Weekend crew's last message has a picture;
+//! `download` writes a made-up one.
 
 use std::io::{BufRead, Write};
 use std::sync::{Arc, Mutex};
@@ -84,8 +85,62 @@ const CHATS: &[Chat] = &[
     },
 ];
 
+/// A width×height PNG of a soft gradient (stored, not compressed).
+fn png(width: u32, height: u32) -> Vec<u8> {
+    fn crc(data: &[u8]) -> u32 {
+        let mut c = !0u32;
+        for &b in data {
+            c ^= u32::from(b);
+            for _ in 0..8 {
+                c = if c & 1 != 0 { 0xEDB8_8320 ^ (c >> 1) } else { c >> 1 };
+            }
+        }
+        !c
+    }
+    fn chunk(out: &mut Vec<u8>, kind: &[u8], data: &[u8]) {
+        out.extend((data.len() as u32).to_be_bytes());
+        let mut body = kind.to_vec();
+        body.extend(data);
+        out.extend(&body);
+        out.extend(crc(&body).to_be_bytes());
+    }
+    let mut raw = Vec::new();
+    for y in 0..height {
+        raw.push(0);
+        for x in 0..width {
+            raw.extend([(60 + 150 * x / width) as u8, (110 + 100 * y / height) as u8, 200]);
+        }
+    }
+    // zlib: stored blocks of at most 65535 bytes, then adler32.
+    let mut z = vec![0x78, 0x01];
+    let blocks: Vec<&[u8]> = raw.chunks(65535).collect();
+    for (i, b) in blocks.iter().enumerate() {
+        z.push(u8::from(i + 1 == blocks.len()));
+        z.extend((b.len() as u16).to_le_bytes());
+        z.extend((!(b.len() as u16)).to_le_bytes());
+        z.extend(*b);
+    }
+    let (mut a, mut b) = (1u32, 0u32);
+    for &x in &raw {
+        a = (a + u32::from(x)) % 65521;
+        b = (b + a) % 65521;
+    }
+    z.extend(((b << 16) | a).to_be_bytes());
+    let mut out = b"\x89PNG\r\n\x1a\n".to_vec();
+    let mut ihdr = Vec::new();
+    ihdr.extend(width.to_be_bytes());
+    ihdr.extend(height.to_be_bytes());
+    ihdr.extend([8, 2, 0, 0, 0]);
+    chunk(&mut out, b"IHDR", &ihdr);
+    chunk(&mut out, b"IDAT", &z);
+    chunk(&mut out, b"IEND", &[]);
+    out
+}
+
 fn message(c: &Chat, i: usize, ts: i64, from: Option<usize>, text: &str, status: &str) -> Value {
+    let pic = c.conv == "2" && i + 1 == c.texts.len();
     json!({
+        "attachments": if pic { json!([{"id": "pic-1", "mime": "image/png", "name": "album.png", "size": 1, "key": "a2V5"}]) } else { json!([]) },
         "conv": c.conv,
         "msg": format!("{}-{i}", c.conv),
         "ts_ms": ts,
@@ -149,12 +204,22 @@ fn main() {
                 let msgs = CHATS.iter().find(|c| c.conv == conv).map(|c| messages(c, start)).unwrap_or_default();
                 put(&out, &json!({"id": id, "ok": true, "messages": msgs}));
             }
-            "send_text" => {
+            "download" => {
+                let path = req["path"].as_str().unwrap_or_default();
+                let ok = std::fs::write(path, png(480, 320)).is_ok();
+                std::thread::sleep(Duration::from_millis(700));
+                put(&out, &json!({"id": id, "ok": ok}));
+            }
+            "send_text" | "send_media" => {
                 let Some(c) = CHATS.iter().find(|c| c.conv == conv) else {
                     put(&out, &json!({"id": id, "ok": false, "error": "not_found"}));
                     continue;
                 };
                 let text = req["text"].as_str().unwrap_or_default().to_string();
+                let atts = match req["path"].as_str() {
+                    Some(_) => json!([{"id": format!("up-{}", sent + 1), "mime": req["mime"], "key": "a2V5"}]),
+                    None => json!([]),
+                };
                 let tmp = req["tmp_id"].as_str().unwrap_or_default().to_string();
                 put(&out, &json!({"id": id, "ok": true, "tmp_id": tmp}));
                 sent += 1;
@@ -164,7 +229,7 @@ fn main() {
                     let steps: &[&str] = if text.contains("fail") { &["sending", "failed"] } else { &["sending", "delivered", "read"] };
                     for status in steps {
                         put(&out, &json!({"event": "message", "conv": conv, "msg": format!("sent-{n}"), "tmp_id": tmp,
-                            "ts_ms": ts, "from_me": true, "text": text, "status": status, "rcs": rcs}));
+                            "ts_ms": ts, "from_me": true, "text": text, "status": status, "rcs": rcs, "attachments": atts.clone()}));
                         std::thread::sleep(Duration::from_millis(1500));
                     }
                 });

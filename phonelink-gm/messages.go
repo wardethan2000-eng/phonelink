@@ -37,6 +37,8 @@ type attachment struct {
 	Mime string `json:"mime,omitempty"`
 	Name string `json:"name,omitempty"`
 	Size int64  `json:"size,omitempty"`
+	// Key decrypts the file (base64 in JSON); the download op takes it back.
+	Key []byte `json:"key,omitempty"`
 }
 
 // msgEvent is one message. Status is one of sending, sent, delivered,
@@ -224,7 +226,7 @@ func messageEvent(m *gmproto.Message, conv *gmproto.Conversation) (msgEvent, boo
 			text = append(text, c.GetContent())
 		}
 		if mc := info.GetMediaContent(); mc != nil {
-			ev.Attachments = append(ev.Attachments, attachment{ID: mc.GetMediaID(), Mime: mc.GetMimeType(), Name: mc.GetMediaName(), Size: mc.GetSize()})
+			ev.Attachments = append(ev.Attachments, attachment{ID: mc.GetMediaID(), Mime: mc.GetMimeType(), Name: mc.GetMediaName(), Size: mc.GetSize(), Key: mc.GetDecryptionKey()})
 		}
 	}
 	if s := m.GetSubject(); s != "" {
@@ -237,7 +239,15 @@ func messageEvent(m *gmproto.Message, conv *gmproto.Conversation) (msgEvent, boo
 // sendRequest builds a text send the way gmcli and the mautrix bridge do:
 // from the chat's own SIM when the phone told us its SIMs, else the
 // legacy form (no SIM, the phone picks).
-func sendRequest(conv *gmproto.Conversation, sims []*gmproto.SIMCard, text, tmpID string) *gmproto.SendMessageRequest {
+// media, if set, is an uploaded file sent with (or without) the text.
+func sendRequest(conv *gmproto.Conversation, sims []*gmproto.SIMCard, text string, media *gmproto.MediaContent, tmpID string) *gmproto.SendMessageRequest {
+	var infos []*gmproto.MessageInfo
+	if media != nil {
+		infos = append(infos, &gmproto.MessageInfo{Data: &gmproto.MessageInfo_MediaContent{MediaContent: media}})
+	}
+	if text != "" {
+		infos = append(infos, &gmproto.MessageInfo{Data: &gmproto.MessageInfo_MessageContent{MessageContent: &gmproto.MessageContent{Content: text}}})
+	}
 	id := conv.GetConversationID()
 	var sim *gmproto.SIMCard
 	outgoing := conv.GetDefaultOutgoingID()
@@ -249,7 +259,7 @@ func sendRequest(conv *gmproto.Conversation, sims []*gmproto.SIMCard, text, tmpI
 	if outgoing == "" && len(sims) == 1 {
 		sim, outgoing = sims[0], sims[0].GetSIMParticipant().GetID()
 	}
-	if sim == nil {
+	if sim == nil && media == nil {
 		return &gmproto.SendMessageRequest{
 			ConversationID: id,
 			TmpID:          tmpID,
@@ -274,9 +284,7 @@ func sendRequest(conv *gmproto.Conversation, sims []*gmproto.SIMCard, text, tmpI
 			ParticipantID:  outgoing,
 			TmpID:          tmpID,
 			TmpID2:         tmpID,
-			MessageInfo: []*gmproto.MessageInfo{{
-				Data: &gmproto.MessageInfo_MessageContent{MessageContent: &gmproto.MessageContent{Content: text}},
-			}},
+			MessageInfo:    infos,
 		},
 	}
 }

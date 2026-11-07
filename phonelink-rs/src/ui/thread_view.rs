@@ -647,7 +647,9 @@ fn image_widget(att: &Attachment, sent: bool, actions: &BubbleActions) -> Option
 /// Any other file (or a picture we have no data for): a chip in the bubble.
 /// Click opens it (or asks the phone for it); right-click has Open / Save.
 fn file_chip(att: &Attachment, actions: &BubbleActions) -> gtk::Widget {
-    let path = if is_image(att) { existing_full_in(&full_cache_dir(), att) } else { None }
+    // Google Messages files of any kind land in the cache once fetched.
+    let from_google = crate::core::gm::gm_media(att).is_some();
+    let path = if is_image(att) || from_google { existing_full_in(&full_cache_dir(), att) } else { None }
         .or_else(|| attachment_local_path(att));
     let row = gtk::Box::new(gtk::Orientation::Horizontal, 8);
     row.add_css_class("message-file-chip");
@@ -660,7 +662,7 @@ fn file_chip(att: &Attachment, actions: &BubbleActions) -> gtk::Widget {
     label.set_max_width_chars(32);
     label.set_halign(gtk::Align::Start);
     row.append(&label);
-    if path.is_none() && att.part_id != 0 {
+    if path.is_none() && (att.part_id != 0 || from_google) {
         let hint = gtk::Label::new(Some("Click to download"));
         hint.add_css_class("caption");
         hint.add_css_class("dim-label");

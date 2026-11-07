@@ -14,6 +14,10 @@ package main
 //	{"id":5, "op":"send_text", "conv":ID, "text":"hi", "tmp_id":"tmp_123"}
 //	                                                       -> ok when the phone took it; the message then
 //	                                                          arrives as a message event with this tmp_id
+//	{"id":8, "op":"send_media", "conv":ID, "path":"/tmp/a.jpg", "mime", "name", "text", "tmp_id"}
+//	                                                       -> as send_text, with the file (text optional)
+//	{"id":9, "op":"download", "media":ID, "key":KEY, "path":"/x/a.jpg"}
+//	                                                       -> ok once the decrypted file is at path (0600)
 //	{"id":6, "op":"set_active"}                            take the web session back from another browser
 //	{"id":7, "op":"open_conversation", "numbers":["+13165551234"]}
 //	                                                       -> "conv":ID of the chat with exactly them (made if new);
@@ -26,7 +30,7 @@ package main
 //	{"event":"conversation", "chat":KEY, "conv":ID, "name", "members":[{"number","name"}],
 //	 "group", "rcs", "read_only", "archived", "unread", "last_ts_ms", "preview"}
 //	{"event":"message", "conv":ID, "msg":ID, "tmp_id", "ts_ms", "from_me", "from", "name",
-//	 "text", "status", "rcs", "deleted", "old", "attachments":[{"id","mime","name","size"}]}
+//	 "text", "status", "rcs", "deleted", "old", "attachments":[{"id","mime","name","size","key"}]}
 //	{"event":"session", "state":"inactive"}  another browser took the web session
 //	{"event":"phone", "responding":false}
 //
@@ -47,7 +51,9 @@ import (
 	"errors"
 	"fmt"
 	"math/big"
+	"net/http"
 	"os"
+	"path/filepath"
 	"sort"
 	"sync"
 	"time"
@@ -71,6 +77,11 @@ type request struct {
 	BeforeID   string   `json:"before_id,omitempty"`
 	BeforeTSms int64    `json:"before_ts_ms,omitempty"`
 	Numbers    []string `json:"numbers,omitempty"`
+	Media      string   `json:"media,omitempty"`
+	Key        []byte   `json:"key,omitempty"`
+	Path       string   `json:"path,omitempty"`
+	Mime       string   `json:"mime,omitempty"`
+	Name       string   `json:"name,omitempty"`
 }
 
 type cursor struct {
@@ -88,6 +99,20 @@ type reply struct {
 	Cursor   *cursor      `json:"cursor,omitempty"`
 	TmpID    string       `json:"tmp_id,omitempty"`
 	Conv     string       `json:"conv,omitempty"`
+}
+
+// maxMedia is the largest file send_media takes (Google Messages' own limit
+// for RCS files is about 100 MB).
+const maxMedia = 100 << 20
+
+// writePrivate writes data to path (mode 0600) through a temporary file, so
+// a reader never sees half a picture.
+func writePrivate(path string, data []byte) error {
+	tmp := path + ".part"
+	if err := os.WriteFile(tmp, data, 0o600); err != nil {
+		return err
+	}
+	return os.Rename(tmp, path)
 }
 
 func failed(id int64, kind string, format string, a ...any) reply {
@@ -365,9 +390,21 @@ func serve(l *link, timeout time.Duration) int {
 				r.Cursor = &cursor{ID: c.GetLastItemID(), TSms: c.GetLastItemTimestamp()}
 			}
 			return r
-		case "send_text":
-			if req.Conv == "" || req.Text == "" {
-				return failed(req.ID, "usage", "send_text needs conv and text")
+		case "download":
+			if req.Media == "" || len(req.Key) == 0 || req.Path == "" {
+				return failed(req.ID, "usage", "download needs media, key and path")
+			}
+			data, err := l.cli.DownloadMedia(req.Media, req.Key)
+			if err != nil {
+				return failed(req.ID, "failed", "%v", err)
+			}
+			if err := writePrivate(req.Path, data); err != nil {
+				return failed(req.ID, "failed", "%v", err)
+			}
+			return reply{ID: req.ID, OK: true}
+		case "send_text", "send_media":
+			if req.Conv == "" || (req.Text == "" && req.Op == "send_text") || (req.Path == "" && req.Op == "send_media") {
+				return failed(req.ID, "usage", "send_text needs conv and text; send_media conv and path")
 			}
 			conv := conversation(ctx, req.Conv)
 			if conv == nil {
@@ -393,7 +430,27 @@ func serve(l *link, timeout time.Duration) int {
 			if tmp == "" {
 				tmp = newTmpID()
 			}
-			resp, err := l.cli.SendMessage(ctx, sendRequest(conv, state.getSIMs(), req.Text, tmp))
+			var media *gmproto.MediaContent
+			if req.Op == "send_media" {
+				data, err := os.ReadFile(req.Path)
+				if err != nil {
+					return failed(req.ID, "usage", "%v", err)
+				}
+				if len(data) > maxMedia {
+					return failed(req.ID, "too_big", "%d MB is more than the phone takes", len(data)>>20)
+				}
+				name, mime := req.Name, req.Mime
+				if name == "" {
+					name = filepath.Base(req.Path)
+				}
+				if mime == "" {
+					mime = http.DetectContentType(data)
+				}
+				if media, err = l.cli.UploadMedia(data, name, mime); err != nil {
+					return failed(req.ID, "failed", "upload: %v", err)
+				}
+			}
+			resp, err := l.cli.SendMessage(ctx, sendRequest(conv, state.getSIMs(), req.Text, media, tmp))
 			if err != nil {
 				return failed(req.ID, "failed", "%v", err)
 			}

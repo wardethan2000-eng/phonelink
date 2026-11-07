@@ -16,7 +16,7 @@ use super::hidden_texts::{HiddenTextDetector, body_matches, normalize_text, repl
 use super::message::{RawMessage, parse_message};
 use super::calls::{self as call_log, CallEvent};
 use super::gm::{Delivery, GmConversation, GmMessage};
-use super::models::{Call, Conversation, SmsMessage};
+use super::models::{Attachment, Call, Conversation, SmsMessage};
 use super::reconcile::{self, ConversationIndex};
 use super::settings::Settings;
 use super::store::MessageStore;
@@ -71,8 +71,9 @@ pub enum Effect {
     /// Delete on the phone: KDE Connect's `deleteConversation(thread)` when
     /// the daemon has it, else Google Messages by the chat's members.
     DeleteOnPhone { thread_id: i64, addresses: Vec<String> },
-    /// Send through Google Messages (`send_text`): RCS where the chat is.
-    GmSend { thread_id: i64, conv: String, text: String, tmp_id: String },
+    /// Send through Google Messages (`send_text`, or `send_media` with a
+    /// file): RCS where the chat is.
+    GmSend { thread_id: i64, conv: String, text: String, file: Option<String>, tmp_id: String },
     /// A text to a chat that isn't in the list yet: find or make it on the
     /// phone (`open_conversation`), then [`Messages::gm_opened`].
     GmSendNew { addresses: Vec<String>, text: String },
@@ -88,7 +89,7 @@ pub enum Effect {
 }
 
 pub const TOAST_NOT_CONNECTED: &str = "Can't send — your phone isn't connected right now";
-pub const TOAST_GM_NO_PICTURES: &str = "Pictures can't be sent through Google Messages yet";
+pub const TOAST_GM_NO_PICTURES: &str = "Send a text first to start the chat, then the pictures";
 pub const TOAST_GM_READ_ONLY: &str = "This chat can't be replied to";
 pub const TOAST_GM_NOT_SENT: &str = "Couldn't send through Google Messages. Check the phone is online and try again.";
 pub const TOAST_LOCAL_DELETE_ONLY: &str =
@@ -129,6 +130,33 @@ impl SendRoute {
             },
         }
     }
+}
+
+/// One attachment to fetch through the Google Messages helper.
+#[derive(Debug, Clone, PartialEq)]
+pub struct GmDownload {
+    pub media: String,
+    pub key: String,
+    /// The attachment's unique identifier ("gm:<media>").
+    pub unique: String,
+}
+
+/// Copy a full attachment into the (private) cache and note it on `att`.
+fn cache_full(att: &mut Attachment, file_path: &std::path::Path, cache_dir: &std::path::Path) -> Option<std::path::PathBuf> {
+    let dest = attachments::full_cache_path_in(cache_dir, att)?;
+    // Pictures people sent: the cache folder and its copies are private.
+    let copied = cache_dir
+        .parent()
+        .map_or(Ok(()), private_tmp::private_data_dir)
+        .and_then(|()| private_tmp::private_data_dir(cache_dir))
+        .and_then(|()| std::fs::copy(file_path, &dest))
+        .and_then(|_| private_tmp::tighten(&dest, 0o600));
+    if let Err(e) = copied {
+        log::warn!("caching a full attachment failed: {e}");
+        return None;
+    }
+    att.extra.insert("fullPath".into(), dest.to_string_lossy().into_owned().into());
+    Some(dest)
 }
 
 /// One Google Messages chat behind a local thread.
@@ -745,7 +773,7 @@ impl Messages {
             return Vec::new();
         }
         if thread_id >= 0 {
-            return vec![self.send_existing(thread_id, text, attachments)];
+            return self.send_existing(thread_id, text, attachments);
         }
         // A draft: a real thread may have loaded since it was created.
         let Some(draft) = self.index.conversations.get(&thread_id) else { return Vec::new() };
@@ -755,7 +783,9 @@ impl Messages {
             Some(existing) => {
                 self.active = Some(existing);
                 self.read_thread_ids.insert(existing);
-                vec![self.send_existing(existing, text, attachments), Effect::RefreshList, Effect::ShowThread(existing)]
+                let mut out = self.send_existing(existing, text, attachments);
+                out.extend([Effect::RefreshList, Effect::ShowThread(existing)]);
+                out
             }
             None if self.gm.is_some() => {
                 self.active = None;
@@ -777,7 +807,7 @@ impl Messages {
 
     /// A text for an existing thread: through the texting app's notification
     /// when one clearly belongs to this conversation, else `replyToConversation`.
-    fn send_existing(&mut self, thread_id: i64, text: &str, attachments: Vec<String>) -> Effect {
+    fn send_existing(&mut self, thread_id: i64, text: &str, attachments: Vec<String>) -> Vec<Effect> {
         let primary = self.index.primary_for(thread_id);
         if self.gm.is_some() {
             return self.gm_send(primary, text, attachments);
@@ -791,7 +821,7 @@ impl Messages {
             None => (SendRoute::Sms, self.reply(primary, text, attachments)),
         };
         self.note_pending_route(primary, text, route);
-        effect
+        vec![effect]
     }
 
     fn note_pending_route(&mut self, primary: i64, text: &str, route: SendRoute) {
@@ -964,6 +994,58 @@ impl Messages {
         out
     }
 
+    /// Google Messages pictures in `uids` (those on screen) not yet here,
+    /// to download through the helper. Each is returned once per session.
+    pub fn take_gm_downloads(&mut self, thread_id: i64, uids: &HashSet<i64>, cache_dir: &std::path::Path) -> Vec<GmDownload> {
+        if self.gm.is_none() {
+            return Vec::new();
+        }
+        let mut out = Vec::new();
+        for tid in self.conversation_threads(thread_id) {
+            let Some(conv) = self.index.get(tid) else { continue };
+            for att in conv.messages.iter().filter(|m| uids.contains(&m.uid)).flat_map(|m| &m.attachments) {
+                if !attachments::is_image(att) || attachments::existing_full_in(cache_dir, att).is_some() {
+                    continue;
+                }
+                let Some((media, key)) = super::gm::gm_media(att) else { continue };
+                if self.full_requested.insert(att.unique_identifier.clone()) {
+                    out.push(GmDownload { media, key, unique: att.unique_identifier.clone() });
+                }
+            }
+        }
+        out
+    }
+
+    /// The Google Messages attachment `unique` (a click on its chip), even
+    /// if it was asked for before.
+    pub fn gm_download_for(&self, unique: &str) -> Option<GmDownload> {
+        self.gm.as_ref()?;
+        let att = self.index.conversations.values().flat_map(|c| &c.messages).flat_map(|m| &m.attachments).find(|a| a.unique_identifier == unique)?;
+        let (media, key) = super::gm::gm_media(att)?;
+        Some(GmDownload { media, key, unique: unique.to_string() })
+    }
+
+    /// The helper saved attachment `unique` at `file_path`: keep it in the
+    /// cache, record it on its message, and return (thread, cached path).
+    pub fn gm_downloaded(
+        &mut self,
+        unique: &str,
+        file_path: &std::path::Path,
+        store: &MessageStore,
+        cache_dir: &std::path::Path,
+    ) -> Option<(i64, std::path::PathBuf)> {
+        let dev = self.device_id.clone()?;
+        for conv in self.index.conversations.values_mut() {
+            for msg in conv.messages.iter_mut() {
+                let Some(att) = msg.attachments.iter_mut().find(|a| a.unique_identifier == unique) else { continue };
+                let dest = cache_full(att, file_path, cache_dir)?;
+                store.upsert_message(&dev, conv.thread_id, msg);
+                return Some((conv.thread_id, dest));
+            }
+        }
+        None
+    }
+
     /// The phone sent a file we asked for. If it is an inline image's full
     /// version, copy it into the cache, record it on the message, persist,
     /// and return the conversation to redraw. `None` for anything else (a
@@ -988,19 +1070,7 @@ impl Messages {
                 else {
                     continue;
                 };
-                let dest = attachments::full_cache_path_in(cache_dir, att)?;
-                // Pictures people sent: the cache folder and its copies are private.
-                let copied = cache_dir
-                    .parent()
-                    .map_or(Ok(()), private_tmp::private_data_dir)
-                    .and_then(|()| private_tmp::private_data_dir(cache_dir))
-                    .and_then(|()| std::fs::copy(file_path, &dest))
-                    .and_then(|_| private_tmp::tighten(&dest, 0o600));
-                if let Err(e) = copied {
-                    log::warn!("caching a full attachment failed: {e}");
-                    return None;
-                }
-                att.extra.insert("fullPath".into(), dest.to_string_lossy().into_owned().into());
+                cache_full(att, file_path, cache_dir)?;
                 store.upsert_message(&dev, conv.thread_id, msg);
                 return Some(conv.thread_id);
             }
@@ -1311,6 +1381,28 @@ impl Messages {
             return if self.active == Some(primary) { vec![Effect::ShowThread(primary)] } else { Vec::new() };
         }
         if shown {
+            // Rows saved before keys were kept: take the phone's keys now.
+            let keys: Vec<(String, String)> = m
+                .attachments
+                .iter()
+                .filter(|a| !a.key.is_empty())
+                .map(|a| (format!("{}{}", super::gm::GM_MEDIA_PREFIX, a.id), a.key.clone()))
+                .collect();
+            if !keys.is_empty()
+                && let Some(row) = self.index.get_mut(primary).and_then(|c| c.messages.iter_mut().find(|x| x.uid == uid))
+            {
+                let mut keyed = false;
+                for att in row.attachments.iter_mut().filter(|a| !a.extra.contains_key(super::gm::GM_KEY)) {
+                    if let Some((_, key)) = keys.iter().find(|(u, _)| *u == att.unique_identifier) {
+                        att.extra.insert(super::gm::GM_KEY.into(), key.clone().into());
+                        keyed = true;
+                    }
+                }
+                if keyed {
+                    store.upsert_message(&dev, primary, row);
+                    changed = true;
+                }
+            }
             return if changed && self.active == Some(primary) { vec![Effect::Redraw(primary)] } else { Vec::new() };
         }
         // A new text arriving live is unread until seen.
@@ -1335,24 +1427,29 @@ impl Messages {
 
     /// A text into an existing chat through Google Messages: into its
     /// newest Google chat that takes replies.
-    fn gm_send(&mut self, primary: i64, text: &str, attachments: Vec<String>) -> Effect {
-        if !attachments.is_empty() {
-            return Effect::Toast(TOAST_GM_NO_PICTURES);
-        }
+    /// Each file goes as its own message (Google Messages takes one per
+    /// message), the text with the first.
+    fn gm_send(&mut self, primary: i64, text: &str, attachments: Vec<String>) -> Vec<Effect> {
         let threads = self.conversation_threads(primary);
-        let Some(gm) = self.gm.as_mut() else { return Effect::Toast(TOAST_GM_NOT_SENT) };
+        let Some(gm) = self.gm.as_mut() else { return vec![Effect::Toast(TOAST_GM_NOT_SENT)] };
         let chat = threads
             .iter()
             .filter_map(|t| gm.chats.get(t))
             .filter(|c| !c.read_only)
             .max_by_key(|c| c.last_ts)
             .map(|c| c.conv.clone());
-        let Some(conv) = chat else { return Effect::Toast(TOAST_GM_READ_ONLY) };
-        gm.sends += 1;
+        let Some(conv) = chat else { return vec![Effect::Toast(TOAST_GM_READ_ONLY)] };
         let now_ms = chrono::Utc::now().timestamp_millis();
-        let tmp_id = super::gm::new_tmp_id(now_ms, gm.sends % 1000);
-        gm.sent_here.insert(tmp_id.clone(), (primary, normalize_text(text), 0));
-        Effect::GmSend { thread_id: primary, conv, text: text.to_string(), tmp_id }
+        let files: Vec<Option<String>> = if attachments.is_empty() { vec![None] } else { attachments.into_iter().map(Some).collect() };
+        let mut out = Vec::new();
+        for (i, file) in files.into_iter().enumerate() {
+            let text = if i == 0 { text.trim().to_string() } else { String::new() };
+            gm.sends += 1;
+            let tmp_id = super::gm::new_tmp_id(now_ms, gm.sends % 1000);
+            gm.sent_here.insert(tmp_id.clone(), (primary, normalize_text(&text), 0));
+            out.push(Effect::GmSend { thread_id: primary, conv: conv.clone(), text, file, tmp_id });
+        }
+        out
     }
 
     /// The phone found or made the chat for a [`Effect::GmSendNew`]
@@ -1367,7 +1464,7 @@ impl Messages {
         self.active = Some(primary);
         self.read_thread_ids.insert(primary);
         vec![
-            Effect::GmSend { thread_id: primary, conv: conv.to_string(), text: text.to_string(), tmp_id },
+            Effect::GmSend { thread_id: primary, conv: conv.to_string(), text: text.to_string(), file: None, tmp_id },
             Effect::RefreshList,
             Effect::ShowThread(primary),
         ]
@@ -1379,8 +1476,7 @@ impl Messages {
     /// stays put and only its label changes.
     pub fn gm_add_pending(
         &mut self,
-        tmp_id: &str,
-        text: &str,
+        (tmp_id, text, file): (&str, &str, Option<&str>),
         uid: i64,
         store: &MessageStore,
         hidden: &mut dyn HiddenStore,
@@ -1405,7 +1501,7 @@ impl Messages {
             msg_type: super::models::MSG_TYPE_SENT,
             read: 1,
             thread_id: primary,
-            attachments: Vec::new(),
+            attachments: file.map(super::gm::local_attachment).into_iter().collect(),
             all_addresses: members,
         };
         let mut out = self.merge_message(row, store, hidden, now);
@@ -2309,7 +2405,7 @@ mod tests {
             let tid = p.store.gm_local_id("conv", "a");
             p.m.select(tid, &p.store, 0.0);
             let e = p.m.send(tid, "hello");
-            let [Effect::GmSend { thread_id, conv, text, tmp_id }] = e.as_slice() else { panic!("{e:?}") };
+            let [Effect::GmSend { thread_id, conv, text, tmp_id, .. }] = e.as_slice() else { panic!("{e:?}") };
             assert_eq!((*thread_id, conv.as_str(), text.as_str()), (tid, "a", "hello"));
             // The echo carries the tmp id; then its delivery updates.
             let mut echo = gmsg("a", "9", true, 3000);
@@ -2336,7 +2432,22 @@ mod tests {
             p.msg(&failed);
             assert_eq!(p.m.route_of(p.store.gm_local_id("msg", "11")).map(SendRoute::label), Some("RCS · Not sent"));
             // Pictures can't go this way yet; read-only chats refuse.
-            assert_eq!(p.m.send_with(tid, "", vec!["/tmp/a.jpg".into()]), vec![Effect::Toast(TOAST_GM_NO_PICTURES)]);
+            // Pictures go one per message, the text with the first.
+            let e = p.m.send_with(tid, " look ", vec!["/tmp/a.jpg".into(), "/tmp/b.png".into()]);
+            let files: Vec<_> = e
+                .iter()
+                .map(|e| match e {
+                    Effect::GmSend { text, file, .. } => (text.as_str(), file.as_deref()),
+                    _ => panic!("{e:?}"),
+                })
+                .collect();
+            assert_eq!(files, [("look", Some("/tmp/a.jpg")), ("", Some("/tmp/b.png"))]);
+            let Effect::GmSend { tmp_id, text, file, .. } = &e[1] else { panic!() };
+            let uid = p.store.gm_local_id("msg", &format!("pending:{tmp_id}"));
+            p.m.gm_add_pending((tmp_id, text, file.as_deref()), uid, &p.store, &mut p.hidden, 0.0);
+            let shown = p.m.index.get(tid).unwrap().messages.iter().find(|m| m.uid == uid).unwrap();
+            assert_eq!(shown.attachments[0].mime_type, "image/png");
+            assert_eq!(shown.attachments[0].extra["fullPath"], "/tmp/b.png");
             let mut biz = chat("biz", &["shop_agent@rbm.goog"], false, 100);
             biz.read_only = true;
             biz.name = "The Shop".into();
@@ -2351,7 +2462,7 @@ mod tests {
             let e = p.m.send(tid, text);
             let [Effect::GmSend { tmp_id, .. }] = e.as_slice() else { panic!("{e:?}") };
             let uid = p.store.gm_local_id("msg", &format!("pending:{tmp_id}"));
-            let shown = p.m.gm_add_pending(tmp_id, text, uid, &p.store, &mut p.hidden, 0.0);
+            let shown = p.m.gm_add_pending((tmp_id, text, None), uid, &p.store, &mut p.hidden, 0.0);
             (tmp_id.clone(), uid, shown)
         }
 
@@ -2402,6 +2513,40 @@ mod tests {
             let fx = p.m.gm_send_failed(&tmp, &p.store);
             assert!(fx.contains(&Effect::Redraw(tid)) && fx.contains(&Effect::Toast(TOAST_GM_NOT_SENT)));
             assert_eq!(p.m.route_of(uid3).map(SendRoute::label), Some("RCS · Not sent"));
+        }
+
+        #[test]
+        fn pictures_on_screen_download_once_and_land_in_the_cache() {
+            let mut p = panel();
+            p.chat(&chat("a", &["+13165551111"], false, 2000));
+            let tid = p.store.gm_local_id("conv", "a");
+            let mut pic = gmsg("a", "1", false, 1000);
+            pic.attachments = vec![crate::core::gm::GmAttachment { id: "m1".into(), mime: "image/jpeg".into(), key: "a2V5".into(), ..Default::default() }];
+            p.msg(&pic);
+            let uid = p.store.gm_local_id("msg", "1");
+            let dir = tempfile::tempdir().unwrap();
+            let cache = dir.path().join("cache");
+            let on_screen: HashSet<i64> = [uid].into();
+            let want = GmDownload { media: "m1".into(), key: "a2V5".into(), unique: "gm:m1".into() };
+            assert_eq!(p.m.take_gm_downloads(tid, &on_screen, &cache), vec![want.clone()]);
+            assert!(p.m.take_gm_downloads(tid, &on_screen, &cache).is_empty(), "asked once");
+            // A click asks again.
+            assert_eq!(p.m.gm_download_for("gm:m1"), Some(want));
+            let got = dir.path().join("got");
+            std::fs::write(&got, b"jpeg").unwrap();
+            let (t, dest) = p.m.gm_downloaded("gm:m1", &got, &p.store, &cache).unwrap();
+            assert_eq!((t, std::fs::read(&dest).unwrap()), (tid, b"jpeg".to_vec()));
+            let att = &p.m.index.get(tid).unwrap().messages[0].attachments[0];
+            assert_eq!(attachments::existing_full_in(&cache, att), Some(dest));
+            // A row saved without its key takes it when the phone sends it again.
+            let mut old = gmsg("a", "2", false, 1100);
+            old.attachments = vec![crate::core::gm::GmAttachment { id: "m2".into(), mime: "image/png".into(), ..Default::default() }];
+            p.msg(&old);
+            let uid2 = p.store.gm_local_id("msg", "2");
+            assert!(p.m.take_gm_downloads(tid, &[uid2].into(), &cache).is_empty(), "no key yet");
+            old.attachments[0].key = "a2V5Mg==".into();
+            p.msg(&old);
+            assert_eq!(p.m.take_gm_downloads(tid, &[uid2].into(), &cache).len(), 1);
         }
 
         #[test]

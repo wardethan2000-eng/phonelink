@@ -23,7 +23,7 @@ use crate::core::attachments::full_cache_dir;
 use crate::core::contacts::load_contact_map;
 use crate::core::message::parse_message;
 use crate::core::contacts::notification_message_text;
-use crate::core::messages::{Effect, Messages, ReplyableNotification};
+use crate::core::messages::{Effect, GmDownload, Messages, ReplyableNotification};
 use crate::core::models::Device;
 use crate::core::settings::Settings;
 use crate::core::store::MessageStore;
@@ -37,6 +37,7 @@ use crate::dbus::{
 /// Google Messages chats/messages merged per idle callback.
 const GM_BATCH_SIZE: usize = 60;
 /// Messages fetched when a chat is opened.
+const TOAST_GM_DOWNLOAD_FAILED: &str = "Couldn't download that file from Google Messages";
 const GM_FETCH_COUNT: u32 = 50;
 
 fn epoch_now() -> f64 {
@@ -99,6 +100,10 @@ struct Inner {
     full_queue: VecDeque<(i64, String)>,
     /// Requests to the phone in flight (at most FULL_PICTURE_WORKERS).
     full_pumping: usize,
+    /// Google Messages attachments waiting to download (and whether to
+    /// open each once here), and how many are downloading.
+    gm_downloads: VecDeque<(GmDownload, bool)>,
+    gm_downloading: usize,
     /// A full picture arrived: redraw once things settle.
     redraw_pending: Option<glib::SourceId>,
     /// Threads we just asked the daemon to replay (their conversationLoaded
@@ -233,6 +238,8 @@ impl MessagesPage {
                 contact_sync_warned: Default::default(),
                 full_queue: VecDeque::new(),
                 full_pumping: 0,
+                gm_downloads: VecDeque::new(),
+                gm_downloading: 0,
                 redraw_pending: None,
                 recent_requests: Default::default(),
                 kde_device: None,
@@ -586,7 +593,7 @@ impl MessagesPage {
                         })
                     }
                 }
-                Effect::GmSend { thread_id: _, conv, text, tmp_id } => {
+                Effect::GmSend { thread_id: _, conv, text, file, tmp_id } => {
                     // Show it at once as "Sending"; the phone's copy takes
                     // over the same bubble.
                     let shown = {
@@ -594,10 +601,10 @@ impl MessagesPage {
                         let i = &mut *i;
                         let mut settings = i.settings.borrow_mut();
                         let uid = i.store.gm_local_id("msg", &format!("pending:{tmp_id}"));
-                        i.m.gm_add_pending(&tmp_id, &text, uid, &i.store, &mut *settings, now())
+                        i.m.gm_add_pending((&tmp_id, &text, file.as_deref()), uid, &i.store, &mut *settings, now())
                     };
                     self.run(shown);
-                    self.gm_send(conv, text, tmp_id);
+                    self.gm_send(conv, text, file, tmp_id);
                 }
                 Effect::GmFetch { thread_id } => self.gm_fetch(thread_id),
                 Effect::GmSendNew { addresses, text } => self.gm_send_new(addresses, text),
@@ -999,13 +1006,16 @@ impl MessagesPage {
     }
 
     /// Send a text through Google Messages; its echo arrives as a message.
-    fn gm_send(self: &Rc<Self>, conv: String, text: String, tmp_id: String) {
+    fn gm_send(self: &Rc<Self>, conv: String, text: String, file: Option<String>, tmp_id: String) {
         let gm = self.gm.borrow().clone();
         let weak = Rc::downgrade(self);
         let tmp = tmp_id.clone();
         let sent = gm.is_some_and(|gm| {
             gm.request(
-                |id| crate::core::gm::send_text_request(id, &conv, &text, &tmp_id),
+                |id| match &file {
+                    Some(f) => crate::core::gm::send_media_request(id, &conv, f, crate::core::gm::guess_mime(f), &text, &tmp_id),
+                    None => crate::core::gm::send_text_request(id, &conv, &text, &tmp_id),
+                },
                 move |r| {
                     let Some(this) = weak.upgrade() else { return };
                     if r.ok {
@@ -1646,8 +1656,13 @@ impl MessagesPage {
         // A few at a time: one by one was slow, 22 at once timed out the
         // daemon (laptop, 2026-11-06).
         const FULL_PICTURE_WORKERS: usize = 3;
-        // Google Messages pictures are fetched another way (not yet).
         if self.inner.borrow().m.is_gm() {
+            let reqs = {
+                let mut guard = self.inner.borrow_mut();
+                let uids: std::collections::HashSet<i64> = uids.into_iter().collect();
+                guard.m.take_gm_downloads(thread_id, &uids, &full_cache_dir())
+            };
+            self.gm_download(reqs.into_iter().map(|r| (r, false)));
             return;
         }
         let start = {
@@ -1678,8 +1693,13 @@ impl MessagesPage {
     }
 
     /// The user asked for a file (Download, or a picture still loading).
-    fn request_attachment(&self, part_id: i64, unique_identifier: String, file_name: String) {
+    fn request_attachment(self: &Rc<Self>, part_id: i64, unique_identifier: String, file_name: String) {
         if part_id == 0 {
+            let req = self.inner.borrow().m.gm_download_for(&unique_identifier);
+            if let Some(req) = req {
+                log::info!("downloading {file_name} from Google Messages");
+                self.gm_download(std::iter::once((req, true)));
+            }
             return;
         }
         log::info!("asking the phone for {file_name}");
@@ -1688,6 +1708,71 @@ impl MessagesPage {
                 log::warn!("could not request {file_name} from the phone");
             }
         });
+    }
+
+    /// Download Google Messages attachments through the helper, a few at
+    /// a time, then show (or open) them.
+    fn gm_download(self: &Rc<Self>, reqs: impl IntoIterator<Item = (GmDownload, bool)>) {
+        const WORKERS: usize = 3;
+        self.inner.borrow_mut().gm_downloads.extend(reqs);
+        loop {
+            let next = {
+                let mut i = self.inner.borrow_mut();
+                if i.gm_downloading >= WORKERS {
+                    return;
+                }
+                let Some(next) = i.gm_downloads.pop_front() else { return };
+                i.gm_downloading += 1;
+                next
+            };
+            if !self.gm_download_one(next) {
+                self.inner.borrow_mut().gm_downloading -= 1;
+            }
+        }
+    }
+
+    fn gm_download_one(self: &Rc<Self>, (req, open): (GmDownload, bool)) -> bool {
+        let Some(gm) = self.gm.borrow().clone() else { return false };
+        let dir = match crate::core::private_tmp::dir(Some("gm_downloads")) {
+            Ok(d) => d,
+            Err(e) => {
+                log::warn!("download folder: {e}");
+                return false;
+            }
+        };
+        let tmp = dir.join(crate::core::attachments::sanitize_name(&req.unique));
+        let weak = Rc::downgrade(self);
+        let path = tmp.to_string_lossy().into_owned();
+        gm.request(
+            |id| crate::core::gm::download_request(id, &req.media, &req.key, &path),
+            move |r| {
+                let Some(this) = weak.upgrade() else { return };
+                this.inner.borrow_mut().gm_downloading -= 1;
+                let done = if r.ok {
+                    let mut guard = this.inner.borrow_mut();
+                    let i = &mut *guard;
+                    i.m.gm_downloaded(&req.unique, &tmp, &i.store, &full_cache_dir())
+                } else {
+                    log::warn!("Google Messages download failed: {} {}", r.error, r.message);
+                    None
+                };
+                let _ = std::fs::remove_file(&tmp);
+                match done {
+                    Some((tid, dest)) => {
+                        if open {
+                            let uri = gio::File::for_path(&dest).uri();
+                            if let Err(e) = gio::AppInfo::launch_default_for_uri(&uri, gio::AppLaunchContext::NONE) {
+                                log::warn!("open attachment: {e}");
+                            }
+                        }
+                        this.pictures_arrived(tid);
+                    }
+                    None if open => this.toast(TOAST_GM_DOWNLOAD_FAILED),
+                    None => {}
+                }
+                this.gm_download(std::iter::empty());
+            },
+        )
     }
 
     fn attachment_received(self: &Rc<Self>, file_path: &str, file_name: &str) {
@@ -1701,6 +1786,11 @@ impl MessagesPage {
             log::info!("the phone sent {file_name} ({file_path})");
             return;
         };
+        self.pictures_arrived(tid);
+    }
+
+    /// Full pictures for chat `tid` are here: redraw it if it's open.
+    fn pictures_arrived(self: &Rc<Self>, tid: i64) {
         let concerns_open_chat = {
             let i = self.inner.borrow();
             i.m.active_thread().is_some_and(|a| i.m.index.primary_for(a) == i.m.index.primary_for(tid))

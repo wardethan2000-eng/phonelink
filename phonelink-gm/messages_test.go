@@ -63,10 +63,10 @@ func TestMessageEvent(t *testing.T) {
 	}
 
 	m := msg("m3", gmproto.MessageStatusType_INCOMING_COMPLETE, "5")
-	m.MessageInfo = []*gmproto.MessageInfo{{Data: &gmproto.MessageInfo_MediaContent{MediaContent: &gmproto.MediaContent{MediaID: "x", MimeType: "image/jpeg", MediaName: "a.jpg", Size: 9}}}}
+	m.MessageInfo = []*gmproto.MessageInfo{{Data: &gmproto.MessageInfo_MediaContent{MediaContent: &gmproto.MediaContent{MediaID: "x", MimeType: "image/jpeg", MediaName: "a.jpg", Size: 9, DecryptionKey: []byte{1, 2}}}}}
 	m.Type = 1
 	ev, _ = messageEvent(m, c)
-	if len(ev.Attachments) != 1 || ev.Attachments[0].Mime != "image/jpeg" || ev.Text != "" || ev.RCS {
+	if len(ev.Attachments) != 1 || ev.Attachments[0].Mime != "image/jpeg" || string(ev.Attachments[0].Key) != "\x01\x02" || ev.Text != "" || ev.RCS {
 		t.Fatalf("media = %+v", ev)
 	}
 
@@ -100,14 +100,25 @@ func TestSendRequestUsesTheChatsSIM(t *testing.T) {
 		RCSChats:       &gmproto.RCSChats{Enabled: true},
 	}
 	c := &gmproto.Conversation{ConversationID: "7", DefaultOutgoingID: "9", Type: gmproto.ConversationType_RCS, SendMode: gmproto.ConversationSendMode_SEND_MODE_AUTO}
-	req := sendRequest(c, []*gmproto.SIMCard{sim}, "hi", "tmp_1")
+	req := sendRequest(c, []*gmproto.SIMCard{sim}, "hi", nil, "tmp_1")
 	if !req.ForceRCS || req.SIMPayload.GetSIMNumber() != 1 || req.MessagePayload.ParticipantID != "9" ||
 		req.MessagePayload.MessageInfo[0].GetMessageContent().GetContent() != "hi" || req.TmpID != "tmp_1" {
 		t.Fatalf("send = %+v", req)
 	}
 	// No SIMs known: the legacy form, which the phone accepts too.
-	req = sendRequest(c, nil, "hi", "tmp_2")
+	req = sendRequest(c, nil, "hi", nil, "tmp_2")
 	if req.SIMPayload != nil || req.MessagePayload.MessagePayloadContent.GetMessageContent().GetContent() != "hi" {
 		t.Fatalf("legacy send = %+v", req)
+	}
+	// A picture goes first, then its caption.
+	pic := &gmproto.MediaContent{MediaID: "m1", MimeType: "image/jpeg"}
+	req = sendRequest(c, []*gmproto.SIMCard{sim}, "look", pic, "tmp_3")
+	infos := req.MessagePayload.MessageInfo
+	if len(infos) != 2 || infos[0].GetMediaContent().GetMediaID() != "m1" || infos[1].GetMessageContent().GetContent() != "look" {
+		t.Fatalf("media send = %+v", infos)
+	}
+	// Without a caption, only the picture.
+	if infos := sendRequest(c, nil, "", pic, "tmp_4").MessagePayload.MessageInfo; len(infos) != 1 {
+		t.Fatalf("bare picture = %+v", infos)
 	}
 }

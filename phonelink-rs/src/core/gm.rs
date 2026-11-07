@@ -83,6 +83,8 @@ pub struct GmAttachment {
     pub mime: String,
     pub name: String,
     pub size: i64,
+    /// Decrypts the file (base64); the download op takes it back.
+    pub key: String,
 }
 
 /// One message.
@@ -232,6 +234,55 @@ pub fn send_text_request(id: u64, conv: &str, text: &str, tmp_id: &str) -> Strin
     json!({ "id": id, "op": "send_text", "conv": conv, "text": text, "tmp_id": tmp_id }).to_string()
 }
 
+/// A text with a file (a picture...), as `send_text` otherwise.
+pub fn send_media_request(id: u64, conv: &str, path: &str, mime: &str, text: &str, tmp_id: &str) -> String {
+    json!({ "id": id, "op": "send_media", "conv": conv, "path": path, "mime": mime, "text": text, "tmp_id": tmp_id })
+        .to_string()
+}
+
+/// Save one attachment, decrypted, at `path`.
+pub fn download_request(id: u64, media: &str, key: &str, path: &str) -> String {
+    json!({ "id": id, "op": "download", "media": media, "key": key, "path": path }).to_string()
+}
+
+/// A file sent from here, as its bubble shows it before the phone's copy
+/// comes back: the file itself, where it is.
+pub fn local_attachment(path: &str) -> Attachment {
+    let name = std::path::Path::new(path).file_name().map(|n| n.to_string_lossy().into_owned()).unwrap_or_default();
+    let mut att = Attachment { mime_type: guess_mime(path).to_string(), file_name: name, ..Default::default() };
+    att.extra.insert("fullPath".into(), path.into());
+    att
+}
+
+/// The type of a file to send, from its name; empty when unsure (the
+/// helper then looks at the bytes).
+pub fn guess_mime(path: &str) -> &'static str {
+    let ext = path.rsplit_once('.').map(|(_, e)| e.to_ascii_lowercase()).unwrap_or_default();
+    match ext.as_str() {
+        "jpg" | "jpeg" => "image/jpeg",
+        "png" => "image/png",
+        "gif" => "image/gif",
+        "webp" => "image/webp",
+        "heic" => "image/heic",
+        "mp4" => "video/mp4",
+        "mov" => "video/quicktime",
+        "pdf" => "application/pdf",
+        _ => "",
+    }
+}
+
+/// A Google Messages attachment's unique identifier starts with this.
+pub const GM_MEDIA_PREFIX: &str = "gm:";
+/// Its decryption key, kept in the attachment's extra fields.
+pub const GM_KEY: &str = "gmKey";
+
+/// (media id, key) of an attachment that came through Google Messages.
+pub fn gm_media(att: &Attachment) -> Option<(String, String)> {
+    let media = att.unique_identifier.strip_prefix(GM_MEDIA_PREFIX)?;
+    let key = att.extra.get(GM_KEY)?.as_str()?;
+    (!media.is_empty() && !key.is_empty()).then(|| (media.to_string(), key.to_string()))
+}
+
 /// The chat with exactly these numbers, made on the phone if new.
 pub fn open_conversation_request(id: u64, numbers: &[String]) -> String {
     json!({ "id": id, "op": "open_conversation", "numbers": numbers }).to_string()
@@ -255,11 +306,17 @@ pub fn to_sms(m: &GmMessage, thread_id: i64, uid: i64, members: &[String], unrea
     let attachments = m
         .attachments
         .iter()
-        .map(|a| Attachment {
-            mime_type: a.mime.clone(),
-            unique_identifier: format!("gm:{}", a.id),
-            file_name: a.name.clone(),
-            ..Default::default()
+        .map(|a| {
+            let mut att = Attachment {
+                mime_type: a.mime.clone(),
+                unique_identifier: format!("{GM_MEDIA_PREFIX}{}", a.id),
+                file_name: a.name.clone(),
+                ..Default::default()
+            };
+            if !a.key.is_empty() {
+                att.extra.insert(GM_KEY.into(), a.key.clone().into());
+            }
+            att
         })
         .collect();
     SmsMessage {
@@ -381,7 +438,14 @@ mod tests {
         let mine = GmMessage { from_me: true, status: "sent".into(), ..theirs.clone() };
         let row = to_sms(&mine, 4, 8, &members, true);
         assert_eq!((row.address.as_str(), row.msg_type, row.read), ("+13165551111", MSG_TYPE_SENT, 1));
-        let pic = GmMessage { attachments: vec![GmAttachment { id: "m1".into(), mime: "image/jpeg".into(), ..Default::default() }], ..theirs };
-        assert_eq!(to_sms(&pic, 4, 9, &members, false).attachments[0].unique_identifier, "gm:m1");
+        let pic = GmMessage {
+            attachments: vec![GmAttachment { id: "m1".into(), mime: "image/jpeg".into(), key: "a2V5".into(), ..Default::default() }],
+            ..theirs
+        };
+        let att = &to_sms(&pic, 4, 9, &members, false).attachments[0];
+        assert_eq!(att.unique_identifier, "gm:m1");
+        assert_eq!(gm_media(att), Some(("m1".into(), "a2V5".into())));
+        // KDE Connect's attachments aren't Google's.
+        assert_eq!(gm_media(&Attachment { unique_identifier: "PART_1".into(), ..Default::default() }), None);
     }
 }
