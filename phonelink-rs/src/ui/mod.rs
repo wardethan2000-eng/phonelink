@@ -12,6 +12,7 @@ pub mod messages_page;
 pub mod notifications_model;
 pub mod notifications_panel;
 pub mod perf;
+pub mod scale;
 pub mod settings_page;
 pub mod thread_view;
 pub mod tray;
@@ -116,6 +117,9 @@ button.settings-open { background-color: alpha(currentColor, 0.1); }
 .reaction-chip.reaction-mine { background-color: mix(@view_bg_color, @accent_bg_color, 0.25); box-shadow: 0 0 0 1px @accent_color; }
 .reaction-pick { font-size: 1.35em; padding: 2px 6px; min-width: 0; }
 .reaction-pick.reaction-mine { background-color: alpha(@accent_bg_color, 0.25); }
+/* Bubbles in em: they keep their shape when the text is zoomed. */
+.message-bubble-sent { padding: 0.45em 0.85em; border-radius: 1.15em 1.15em 0.3em 1.15em; }
+.message-bubble-received { padding: 0.45em 0.85em; border-radius: 1.15em 1.15em 1.15em 0.3em; }
 .compose-reply-bar { padding: 6px 4px 6px 10px; border-left: 3px solid @accent_color; border-radius: 4px; background-color: alpha(currentColor, 0.05); }
 ";
 
@@ -125,16 +129,13 @@ fn load_css() {
     if let Some(settings) = gtk::Settings::default() {
         settings.set_gtk_error_bell(false);
     }
-    let provider = gtk::CssProvider::new();
-    // The same stylesheet as the Python app, so both look identical.
-    provider.load_from_data(include_str!("../../../phonelink/style.css"));
-    // Rust-only additions (pictures shown on their own, file chips).
-    let extra = gtk::CssProvider::new();
-    extra.load_from_data(EXTRA_CSS);
-    if let Some(display) = gtk::gdk::Display::default() {
-        gtk::style_context_add_provider_for_display(&display, &provider, gtk::STYLE_PROVIDER_PRIORITY_APPLICATION);
-        gtk::style_context_add_provider_for_display(&display, &extra, gtk::STYLE_PROVIDER_PRIORITY_APPLICATION);
-    }
+    scale::apply(crate::core::settings::Settings::new().ui_scale(), &app_css());
+}
+
+/// The same stylesheet as the Python app, so both look identical, plus the
+/// Rust-only additions (pictures shown on their own, file chips).
+pub fn app_css() -> String {
+    format!("{}\n{}", include_str!("../../../phonelink/style.css"), EXTRA_CSS)
 }
 
 /// GTK's CPU renderer unless the user picked one. On Ethan's laptop

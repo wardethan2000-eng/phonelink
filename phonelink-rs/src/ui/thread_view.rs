@@ -340,6 +340,8 @@ impl Bubble {
         frame.set_margin_start(12);
         frame.set_margin_end(12);
         frame.add_css_class(if sent { "message-bubble-sent" } else { "message-bubble-received" });
+        // Its own width, not a wider quote's above it.
+        frame.set_halign(side);
 
         let (markup, has_links) = message_markup(&msg.body);
         let body = gtk::Label::new(None);
@@ -911,7 +913,7 @@ fn file_chip(att: &Attachment, actions: &BubbleActions) -> gtk::Widget {
     row.add_css_class("message-file-chip");
     row.set_cursor_from_name(Some("pointer"));
     let icon = gtk::Image::from_icon_name(&super::icons::resolve(file_icon(&att.mime_type)));
-    icon.set_pixel_size(16);
+    icon.set_pixel_size(super::scale::px(16));
     row.append(&icon);
     let shown_name = match (att.file_name.is_empty(), att.mime_type.split('/').next()) {
         (true, Some("audio")) => "Voice message".to_string(),
@@ -992,6 +994,15 @@ fn save_as(widget: &gtk::Widget, path: &Path, file_name: &str) {
             log::warn!("save attachment: {e}");
         }
     });
+}
+
+/// A little more room where the other side starts talking (or, in a
+/// group, someone else); runs from one person stay close together.
+fn mark_turn(b: &Bubble, prev: Option<&SmsMessage>) {
+    let Some(prev) = prev else { return };
+    if prev.is_sent() != b.message.is_sent() || (!prev.is_sent() && prev.address != b.message.address) {
+        b.widget.set_margin_top(super::scale::px(10));
+    }
 }
 
 fn date_separator(text: &str) -> gtk::Box {
@@ -1099,7 +1110,7 @@ impl ThreadView {
         empty.set_valign(gtk::Align::Center);
         empty.set_halign(gtk::Align::Center);
         let icon = gtk::Image::from_icon_name("mail-unread-symbolic");
-        icon.set_pixel_size(48);
+        icon.set_pixel_size(super::scale::px(48));
         icon.set_opacity(0.2);
         empty.append(&icon);
         let hint = gtk::Label::new(Some("Select a conversation"));
@@ -1159,7 +1170,13 @@ impl ThreadView {
         scroll.set_propagate_natural_width(false);
         let messages_box = gtk::Box::new(gtk::Orientation::Vertical, 0);
         messages_box.set_margin_bottom(8);
-        scroll.set_child(Some(&messages_box));
+        // On a wide window the two sides would sit a screen apart: keep the
+        // conversation a readable width, centered.
+        let column = adw::Clamp::new();
+        column.set_maximum_size(super::scale::px(900));
+        column.set_tightening_threshold(super::scale::px(700));
+        column.set_child(Some(&messages_box));
+        scroll.set_child(Some(&column));
         thread_box.append(&scroll);
 
         thread_box.append(&gtk::Separator::new(gtk::Orientation::Horizontal));
@@ -1223,7 +1240,7 @@ impl ThreadView {
         entry.set_placeholder_text(Some("Type a message…  (Ctrl+V pastes a picture)"));
         entry.set_hexpand(true);
         compose.append(&entry);
-        let send_button = gtk::Button::from_icon_name("mail-send-symbolic");
+        let send_button = gtk::Button::from_icon_name(&super::icons::send_icon());
         send_button.add_css_class("suggested-action");
         send_button.set_tooltip_text(Some("Send"));
         compose.append(&send_button);
@@ -1511,7 +1528,10 @@ impl ThreadView {
         if old.is_nan() || (scale - old).abs() >= 0.001 {
             self.font_scale.set(scale);
             let pct = (scale * 100.0).round() as i64;
-            self.font_provider.load_from_data(&format!(".message-zoomable {{ font-size: {pct}%; }}"));
+            // The whole bubble, so its padding (in em) grows with the text.
+            self.font_provider.load_from_data(&format!(
+                ".message-bubble-sent, .message-bubble-received {{ font-size: {pct}%; }}"
+            ));
         }
         if persist && let Some(f) = self.on_zoom.borrow().as_ref() {
             f(self.font_scale.get());
@@ -1785,7 +1805,7 @@ impl ThreadView {
                 file.set_size_request(120, 96);
                 let mime = crate::core::gm::guess_mime(&path.to_string_lossy());
                 let icon = gtk::Image::from_icon_name(&super::icons::resolve(file_icon(mime)));
-                icon.set_pixel_size(32);
+                icon.set_pixel_size(super::scale::px(32));
                 icon.set_margin_top(14);
                 file.append(&icon);
                 let name = gtk::Label::new(path.file_name().and_then(|n| n.to_str()));
@@ -2027,6 +2047,7 @@ impl ThreadView {
             }
             let newest = i + 1 == shown.len();
             let b = self.make_bubble(m, newest, routes.get(&m.uid).copied());
+            mark_turn(&b, i.checked_sub(1).map(|j| &shown[j]));
             self.messages_box.append(&b.widget);
             bubbles.push(b);
         }
@@ -2110,6 +2131,7 @@ impl ThreadView {
                     put(date_separator(&line).upcast_ref());
                 }
                 let b = this.make_bubble(m, false, routes.get(&m.uid).copied());
+                mark_turn(&b, i.checked_sub(1).map(|x| &shown[x]));
                 put(b.widget.upcast_ref());
                 batch.push(b);
             }
@@ -2177,6 +2199,7 @@ impl ThreadView {
         for (i, m) in changed {
             let old = self.state.borrow().bubbles[i].clone();
             let fresh = self.make_bubble(&m, old.revealer.reveals_child(), route(m.uid));
+            fresh.widget.set_margin_top(old.widget.margin_top());
             self.messages_box.insert_child_after(&fresh.widget, Some(&old.widget));
             self.messages_box.remove(&old.widget);
             self.state.borrow_mut().bubbles[i] = fresh;
@@ -2459,6 +2482,7 @@ impl ThreadView {
             self.messages_box.append(&date_separator(&line));
         }
         let b = self.make_bubble(m, true, route);
+        mark_turn(&b, prev.as_ref().map(|p| &p.message));
         self.messages_box.append(&b.widget);
         self.rendered(vec![m.uid]);
         let mut st = self.state.borrow_mut();

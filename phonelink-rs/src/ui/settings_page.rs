@@ -144,7 +144,7 @@ impl SettingsPage {
             b.set_margin_top(9);
             b.set_margin_bottom(9);
             let img = gtk::Image::from_icon_name(&icons::resolve(icon));
-            img.set_pixel_size(16);
+            img.set_pixel_size(super::scale::px(16));
             b.append(&img);
             let l = gtk::Label::new(Some(label));
             l.set_xalign(0.0);
@@ -267,6 +267,15 @@ impl SettingsPage {
             _ => 0,
         });
         theme.add(&scheme);
+        let size = adw::ComboRow::new();
+        size.set_title("Size");
+        size.set_subtitle("Text and icons in the whole window");
+        let labels: Vec<&str> = super::scale::CHOICES.iter().map(|(l, _)| *l).collect();
+        size.set_model(Some(&gtk::StringList::new(&labels)));
+        let now = settings.borrow().ui_scale();
+        let at = super::scale::CHOICES.iter().position(|(_, f)| (f - now).abs() < 0.001).unwrap_or(0);
+        size.set_selected(at as u32);
+        theme.add(&size);
         content.add_named(&page_with(&[&theme]), Some("appearance"));
 
         // Notifications.
@@ -371,6 +380,12 @@ impl SettingsPage {
             let value = ["system", "light", "dark"][(c.selected() as usize).min(2)];
             let _ = s.borrow_mut().set_color_scheme(value);
             apply_color_scheme(value);
+        });
+        let s = settings.clone();
+        size.connect_selected_notify(move |c| {
+            let (_, f) = super::scale::CHOICES[(c.selected() as usize).min(super::scale::CHOICES.len() - 1)];
+            let _ = s.borrow_mut().set_ui_scale(f);
+            super::scale::apply(f, &super::app_css());
         });
         let weak = Rc::downgrade(&this);
         enabled.connect_active_notify(move |r| {

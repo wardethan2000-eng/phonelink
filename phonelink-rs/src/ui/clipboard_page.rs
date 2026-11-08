@@ -214,7 +214,7 @@ impl ClipboardPage {
         b.set_margin_bottom(8);
         row.set_child(Some(&b));
         let icon = gtk::Image::from_icon_name(entry.source.icon_name());
-        icon.set_pixel_size(16);
+        icon.set_pixel_size(super::scale::px(16));
         icon.set_valign(gtk::Align::Start);
         icon.set_margin_top(4);
         icon.set_opacity(0.6);
@@ -255,7 +255,7 @@ fn placeholder() -> gtk::Box {
     b.set_valign(gtk::Align::Center);
     b.set_margin_top(40);
     let icon = gtk::Image::from_icon_name("edit-paste-symbolic");
-    icon.set_pixel_size(48);
+    icon.set_pixel_size(super::scale::px(48));
     icon.set_opacity(0.3);
     b.append(&icon);
     let l = gtk::Label::new(Some("Clipboard history will appear here"));

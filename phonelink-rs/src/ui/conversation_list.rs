@@ -54,7 +54,7 @@ fn initial(name: &str, phone: &str) -> String {
 fn build_avatar(name: &str, phone: &str, is_group: bool, group_count: usize) -> gtk::Widget {
     if !is_group && let Some(path) = contact_photo_path(phone) {
         let picture = gtk::Picture::new();
-        picture.set_size_request(40, 40);
+        picture.set_size_request(super::scale::px(40), super::scale::px(40));
         picture.set_can_shrink(true);
         picture.set_content_fit(gtk::ContentFit::Cover);
         picture.add_css_class("conversation-avatar-photo");
@@ -77,7 +77,7 @@ fn build_avatar(name: &str, phone: &str, is_group: bool, group_count: usize) -> 
         return picture.upcast();
     }
     let label = gtk::Label::new(None);
-    label.set_size_request(40, 40);
+    label.set_size_request(super::scale::px(40), super::scale::px(40));
     if is_group {
         label.set_label(&group_count.to_string());
         label.add_css_class("conversation-avatar-group");
@@ -200,12 +200,12 @@ impl Row {
 
         // Muted and pinned, beside the time.
         let mute = gtk::Image::from_icon_name("notifications-disabled-symbolic");
-        mute.set_pixel_size(12);
+        mute.set_pixel_size(super::scale::px(12));
         mute.add_css_class("conversation-pin");
         mute.set_tooltip_text(Some("Muted"));
         top.append(&mute);
-        let pin = gtk::Image::from_icon_name("view-pin-symbolic");
-        pin.set_pixel_size(12);
+        let pin = gtk::Image::from_icon_name(&super::icons::resolve("view-pin-symbolic"));
+        pin.set_pixel_size(super::scale::px(12));
         pin.add_css_class("conversation-pin");
         pin.set_tooltip_text(Some("Pinned"));
         top.append(&pin);
@@ -361,7 +361,7 @@ pub struct ConversationList {
 impl ConversationList {
     pub fn new() -> Rc<Self> {
         let widget = gtk::Box::new(gtk::Orientation::Vertical, 0);
-        widget.set_size_request(280, -1);
+        widget.set_size_request(super::scale::px(280), -1);
         widget.set_hexpand(false);
 
         let search_box = gtk::Box::new(gtk::Orientation::Horizontal, 6);
@@ -1202,7 +1202,7 @@ fn placeholder() -> gtk::Box {
     b.set_valign(gtk::Align::Center);
     b.set_margin_top(48);
     let icon = gtk::Image::from_icon_name("mail-unread-symbolic");
-    icon.set_pixel_size(32);
+    icon.set_pixel_size(super::scale::px(32));
     icon.set_opacity(0.3);
     b.append(&icon);
     let label = gtk::Label::new(Some("No conversations yet"));

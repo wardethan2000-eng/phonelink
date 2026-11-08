@@ -211,6 +211,15 @@ fn py_str(v: Option<Value>) -> String {
     }
 }
 
+/// 0 (automatic) or a factor between 1 and 2.
+fn clamp_ui_scale(x: f64) -> f64 {
+    if !x.is_finite() || x <= 0.0 {
+        0.0
+    } else {
+        x.clamp(1.0, 2.0)
+    }
+}
+
 fn clamp_scale(x: f64) -> f64 {
     MESSAGE_FONT_SCALE_MAX.min(MESSAGE_FONT_SCALE_MIN.max(x))
 }
@@ -234,6 +243,8 @@ pub struct Settings {
     /// device id -> conversation key -> deleted_at
     hidden: BTreeMap<String, BTreeMap<String, i64>>,
     message_font_scale: f64,
+    /// Size of the whole window's text and icons; 0 = automatic.
+    ui_scale: f64,
     /// Keys we do not know (written by Python or a newer version); preserved.
     extra: Map<String, Value>,
 
@@ -266,6 +277,7 @@ impl Settings {
             google_last_attempt_ts: 0.0,
             hidden: BTreeMap::new(),
             message_font_scale: 1.0,
+            ui_scale: 0.0,
             extra: Map::new(),
             last_written: None,
             batch_depth: 0,
@@ -319,6 +331,7 @@ impl Settings {
         self.google_last_sync_ts = py_float(m.remove("google_last_sync_ts"), 0.0);
         self.google_last_attempt_ts = py_float(m.remove("google_last_attempt_ts"), 0.0);
         self.message_font_scale = clamp_scale(py_float(m.remove("message_font_scale"), 1.0));
+        self.ui_scale = clamp_ui_scale(py_float(m.remove("ui_scale"), 0.0));
 
         self.hidden = BTreeMap::new();
         if let Some(Value::Object(devices)) = m.remove("hidden_conversations") {
@@ -363,6 +376,7 @@ impl Settings {
             serde_json::to_value(&self.hidden).unwrap_or_else(|_| Value::Object(Map::new())),
         );
         m.insert("message_font_scale".into(), Value::from(self.message_font_scale));
+        m.insert("ui_scale".into(), Value::from(self.ui_scale));
         serde_json::to_string_pretty(&m).unwrap_or_else(|_| "{}".to_string())
     }
 
@@ -416,6 +430,16 @@ impl Settings {
 
     pub fn set_message_font_scale(&mut self, value: f64) -> io::Result<()> {
         self.message_font_scale = clamp_scale(value);
+        self.save()
+    }
+
+    /// The window's size factor; 0 = automatic (see `ui::scale`).
+    pub fn ui_scale(&self) -> f64 {
+        self.ui_scale
+    }
+
+    pub fn set_ui_scale(&mut self, value: f64) -> io::Result<()> {
+        self.ui_scale = clamp_ui_scale(value);
         self.save()
     }
 
@@ -726,6 +750,18 @@ mod tests {
         let before = f.s.write_count();
         f.s.set_notifications_enabled(false).unwrap(); // same value -> no write
         assert_eq!(f.s.write_count(), before);
+    }
+
+    #[test]
+    fn ui_scale_is_automatic_until_set() {
+        let mut f = fixture();
+        assert_eq!(f.s.ui_scale(), 0.0);
+        f.s.set_ui_scale(1.25).unwrap();
+        assert_eq!(read_json(&f.path)["ui_scale"].as_f64().unwrap(), 1.25);
+        f.s.set_ui_scale(9.0).unwrap();
+        assert_eq!(f.s.ui_scale(), 2.0);
+        f.s.set_ui_scale(-1.0).unwrap();
+        assert_eq!(f.s.ui_scale(), 0.0);
     }
 
     #[test]

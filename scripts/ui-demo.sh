@@ -8,6 +8,14 @@
 set -u
 cargo build -q --example mock_daemon --example fake_gm && cargo build -q || exit 1
 demo=$HOME/demo-home; rm -rf "$demo"; mkdir -p "$demo"
+# DEMO_SETTINGS='{...}' starts with those settings; DEMO_FONT='Noto Sans 10'
+# with that desktop font.
+if [ -n "${DEMO_SETTINGS:-}" ]; then
+    mkdir -p "$demo/.local/share/phonelink" && echo "$DEMO_SETTINGS" > "$demo/.local/share/phonelink/settings.json"
+fi
+if [ -n "${DEMO_FONT:-}" ]; then
+    mkdir -p "$demo/.config/gtk-4.0" && printf '[Settings]\ngtk-font-name=%s\n' "$DEMO_FONT" > "$demo/.config/gtk-4.0/settings.ini"
+fi
 if [ "${DEMO_GM:-0}" = 1 ]; then
     mkdir -p "$demo/.local/state/gmcli" && echo '{}' > "$demo/.local/state/gmcli/session.json"
     export PHONELINK_GM=$PWD/target/debug/examples/fake_gm

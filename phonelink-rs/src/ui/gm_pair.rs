@@ -175,7 +175,7 @@ pub fn link_dialog(parent: Option<&gtk::Window>, on_linked: impl Fn() + 'static)
         (status.clone(), start.clone(), close.clone(), proc.clone(), linked.clone());
     start.connect_clicked(move |_| {
         start_c.set_visible(false);
-        status_c.set_icon_name(Some("web-browser-symbolic"));
+        status_c.set_icon_name(Some(&super::icons::resolve("web-browser-symbolic")));
         status_c.set_title("Opening the sign-in window…");
         status_c.set_description(None);
         let (st, st2, cl, lk, lk2, on_linked, again) =
@@ -212,7 +212,7 @@ pub fn link_dialog(parent: Option<&gtk::Window>, on_linked: impl Fn() + 'static)
                 PairStep::Failed { kind, message } => {
                     log::warn!("Google Messages linking: {kind}: {message}");
                     st.remove_css_class("pair-emoji");
-                    st.set_icon_name(Some("dialog-warning-symbolic"));
+                    st.set_icon_name(Some(&super::icons::resolve("dialog-warning-symbolic")));
                     st.set_title("Not linked");
                     st.set_description(Some(failure_text(&kind)));
                 }
@@ -224,7 +224,7 @@ pub fn link_dialog(parent: Option<&gtk::Window>, on_linked: impl Fn() + 'static)
                 } else {
                     if st2.title() != "Not linked" {
                         st2.remove_css_class("pair-emoji");
-                        st2.set_icon_name(Some("dialog-warning-symbolic"));
+                        st2.set_icon_name(Some(&super::icons::resolve("dialog-warning-symbolic")));
                         st2.set_title("Not linked");
                         st2.set_description(Some(failure_text("")));
                     }
