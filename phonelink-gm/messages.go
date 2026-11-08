@@ -487,3 +487,46 @@ func chatChange(conv, change string) (*gmproto.UpdateConversationRequest, bool) 
 	}
 	return nil, false
 }
+
+// blockTries: the shapes of a block, block-and-report or unblock request to
+// try in turn. The phone refused the bare action (no number, 2026-11-08);
+// delete, the closest request the web client is known to send, carries the
+// other person's number, so the number goes first.
+func blockTries(conv, phone string, a gmproto.ConversationActionStatus) []*gmproto.UpdateConversationRequest {
+	bare := &gmproto.UpdateConversationRequest{Action: a, ConversationID: conv}
+	if phone == "" {
+		return []*gmproto.UpdateConversationRequest{bare}
+	}
+	withPhone := func(action5 bool) *gmproto.UpdateConversationRequest {
+		r := &gmproto.UpdateConversationRequest{
+			Action:         a,
+			ConversationID: conv,
+			Data: &gmproto.UpdateConversationRequest_DeleteData{
+				DeleteData: &gmproto.DeleteConversationData{ConversationID: conv, Phone: phone},
+			},
+		}
+		if action5 {
+			r.Action5 = &gmproto.ConversationAction5{Field2: true}
+		}
+		return r
+	}
+	return []*gmproto.UpdateConversationRequest{withPhone(false), withPhone(true), bare}
+}
+
+// otherNumber: the other person's number in a one-to-one chat ("" otherwise).
+func otherNumber(c *gmproto.Conversation) string {
+	if c.GetIsGroupChat() {
+		return ""
+	}
+	for _, p := range c.GetParticipants() {
+		if p.GetIsVisible() && !p.GetIsMe() && p.GetID().GetNumber() != "" {
+			return p.GetID().GetNumber()
+		}
+	}
+	for _, p := range c.GetParticipants() {
+		if !p.GetIsMe() && p.GetID().GetNumber() != "" {
+			return p.GetID().GetNumber()
+		}
+	}
+	return ""
+}

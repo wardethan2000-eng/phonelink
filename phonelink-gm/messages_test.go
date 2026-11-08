@@ -266,3 +266,26 @@ func TestSignInWaitsForEveryNeededCookie(t *testing.T) {
 		}
 	}
 }
+
+func TestBlockSendsTheOtherNumber(t *testing.T) {
+	c := conv("7", part("+13165551111", false), part("+13165550000", true))
+	n := otherNumber(c)
+	if n != "+13165551111" {
+		t.Fatalf("otherNumber = %q", n)
+	}
+	tries := blockTries("7", n, gmproto.ConversationActionStatus_BLOCK)
+	if len(tries) != 3 {
+		t.Fatalf("%d tries", len(tries))
+	}
+	first := tries[0]
+	if first.GetAction() != gmproto.ConversationActionStatus_BLOCK || first.GetDeleteData().GetPhone() != n ||
+		first.GetDeleteData().GetConversationID() != "7" || first.GetAction5() != nil {
+		t.Fatalf("first try = %v", first)
+	}
+	if !tries[1].GetAction5().GetField2() || tries[2].GetDeleteData() != nil {
+		t.Fatalf("later tries = %v %v", tries[1], tries[2])
+	}
+	if got := blockTries("7", "", gmproto.ConversationActionStatus_UNBLOCK); len(got) != 1 || got[0].GetDeleteData() != nil {
+		t.Fatalf("no number: %v", got)
+	}
+}

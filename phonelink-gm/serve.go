@@ -546,7 +546,8 @@ func serve(l *link, timeout time.Duration) int {
 			if req.Conv == "" || !ok {
 				return failed(req.ID, "usage", "update_chat needs conv and a change")
 			}
-			if conversation(ctx, req.Conv) == nil {
+			c := conversation(ctx, req.Conv)
+			if c == nil {
 				return failed(req.ID, "not_found", "no chat %s", req.Conv)
 			}
 			if state.setInactive(false) {
@@ -555,12 +556,26 @@ func serve(l *link, timeout time.Duration) int {
 					return failed(req.ID, "inactive", "Google Messages is open in another browser: %v", err)
 				}
 			}
-			resp, err := l.cli.UpdateConversation(ctx, change)
-			if err != nil {
-				return failed(req.ID, "failed", "%v", err)
+			tries := []*gmproto.UpdateConversationRequest{change}
+			if change.GetAction() != gmproto.ConversationActionStatus_UNKNOWN_ACTION_STATUS {
+				tries = blockTries(req.Conv, otherNumber(c), change.GetAction())
 			}
-			if !resp.GetSuccess() {
-				return failed(req.ID, "refused", "the phone refused that change")
+			done := false
+			for i, try := range tries {
+				resp, err := l.cli.UpdateConversation(ctx, try)
+				if err != nil {
+					return failed(req.ID, "failed", "%v", err)
+				}
+				if resp.GetSuccess() {
+					if len(tries) > 1 {
+						fmt.Fprintf(os.Stderr, "update_chat %s: shape %d of %d accepted\n", req.Change, i+1, len(tries))
+					}
+					done = true
+					break
+				}
+			}
+			if !done {
+				return failed(req.ID, "refused", "the phone refused that change (%d shapes tried)", len(tries))
 			}
 			// The phone usually sends the changed chat; send ours too.
 			if c, err := l.cli.GetConversation(ctx, req.Conv); err == nil && c != nil {
