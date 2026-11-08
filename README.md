@@ -15,7 +15,8 @@ PhoneRelay brings your Android phone's texts, notifications and files to your Li
 - **Files** — browse the phone's storage, see recent photos as a grid, copy, save, or send files to the phone
 - **Battery and status** in the header bar; **ring the phone** to find it
 - **Tray icon** and **Open on Login**
-- **Optional Google Messages link** — delete chats on the phone, and keep read/unread in step both ways (see [Google Messages link](#optional-google-messages-link))
+- **Optional Google Messages link** — texts go as RCS where the chat is RCS, with reactions, replies, typing, read receipts, pictures, voice and video, groups, and archive/mute/pin; chats delete and read/unread stay in step with the phone (see [Google Messages link](#optional-google-messages-link))
+- **Size** setting for the whole window (Settings → Appearance), and Ctrl+scroll to zoom the messages
 
 ---
 
@@ -168,15 +169,18 @@ Start **PhoneRelay** from the menu (or run `phonelink-rs`). Your phone should ap
 
 ## Optional: Google Messages link
 
-KDE Connect can read and send texts, but it can't delete a chat on the phone, mark one read there, or tell the desktop when you read one on the phone. If your phone uses Google Messages, PhoneRelay can do these through a Google Messages "for web" connection:
+KDE Connect sends texts as plain SMS and can't see RCS features. If your phone uses Google Messages, PhoneRelay can run the Messages tab through a Google Messages "for web" connection instead:
 
-- **Delete a chat** in PhoneRelay and it is deleted on the phone too (business chats included).
-- **Open a chat** in PhoneRelay and it is marked read on the phone.
-- **Read a chat on the phone** and its unread dot clears in PhoneRelay.
+- **RCS:** texts go as RCS where the chat is RCS (SMS otherwise), shown as Sending → Delivered → Read.
+- **Reactions and replies:** react to a message or reply to it; others' reactions and quoted replies show in the chat.
+- **Typing** shows both ways; **read receipts** are sent only while PhoneRelay's window is in front.
+- **Pictures, voice messages, videos and files**, several at once (paperclip, drag and drop, or Ctrl+V); full-size pictures; iPhone photos show as Google's JPEG copy.
+- **New chats and groups**, older messages from the phone, and **archive, mute, pin, block and report spam**.
+- **Delete a chat** and it is deleted on the phone too; **opening a chat** marks it read on the phone, and reading one on the phone clears it here.
 
 This runs through a small helper, `phonelink-gm`, installed next to the app. It is AGPL-3.0 because it uses [libgm](https://github.com/mautrix/gmessages) (see `phonelink-gm/LICENSE`); the app itself stays MIT and only runs the helper as a separate program.
 
-For now, linking uses [gmcli](https://github.com/fdsouvenir/gmcli): install it (needs Go: `GOBIN="$HOME/.local/bin" go install github.com/fdsouvenir/gmcli@v1.2.0`) and run `gmcli auth` once. It opens Chrome, Chromium or Edge to sign in to Google, then shows an emoji to tap on the phone. PhoneRelay picks up gmcli's session from `~/.local/state/gmcli/session.json` the next time it starts. Pairing inside the app is planned.
+To link, open **Settings → Google Messages → Link**. A sign-in window opens in Chrome, Chromium, Brave, Edge or Vivaldi (a throwaway profile, not yours); sign in with the Google account Google Messages uses on the phone, then tap the emoji the dialog shows on the phone. **Unlink** there removes the link, on the phone too when it can be reached. An existing gmcli session (`~/.local/state/gmcli/session.json`) is picked up once.
 
 Limits: it's an unofficial protocol, so Google can break it until the helper is updated. The phone must be online. Google drops a link unused for about 14 days. Google Messages allows one web session at a time, so opening messages.google.com in a browser takes the link away from PhoneRelay.
 
