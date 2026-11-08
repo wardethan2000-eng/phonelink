@@ -82,6 +82,7 @@ pub struct Window {
     notif_panel: Rc<NotificationsPanel>,
     notifications: Rc<NotificationsModel>,
     settings_page: Rc<SettingsPage>,
+    settings: Rc<RefCell<Settings>>,
     google: Rc<GoogleSync>,
     /// The tray icon, when a StatusNotifierWatcher took it. Without one,
     /// closing the window quits (else the window would be stranded).
@@ -121,6 +122,14 @@ impl Window {
         window.set_title(Some("PhoneRelay"));
         window.set_default_size(960, 640);
         window.set_size_request(640, 420);
+        // The size at the last close (issue #11, from pgnd's patch). The
+        // position is the window manager's to keep (a KWin rule can).
+        if let Some((w, h)) = settings.borrow().window_size() {
+            window.set_default_size(w.max(640), h.max(420));
+        }
+        if settings.borrow().window_maximized() {
+            window.maximize();
+        }
 
         let outer = gtk::Box::new(gtk::Orientation::Vertical, 0);
         let header_bar = adw::HeaderBar::new();
@@ -289,6 +298,7 @@ impl Window {
             notif_panel,
             notifications,
             settings_page,
+            settings: settings.clone(),
             google,
             tray: RefCell::default(),
             tray_shown: Cell::new(false),
@@ -397,6 +407,7 @@ impl Window {
             let Some(this) = weak.upgrade() else {
                 return glib::Propagation::Proceed;
             };
+            this.save_window_state();
             if this.tray_shown.get() && !this.quitting.get() {
                 w.set_visible(false);
                 return glib::Propagation::Stop;
@@ -405,6 +416,23 @@ impl Window {
         });
         this.start();
         this
+    }
+
+    /// Remember the window's size and maximized state for the next start.
+    /// GTK doesn't update the default size while the window is tiled, so a
+    /// tiled window's current size is saved instead.
+    fn save_window_state(&self) {
+        use gtk::gdk::ToplevelState as S;
+        let tiled_states = S::TILED | S::TOP_TILED | S::RIGHT_TILED | S::BOTTOM_TILED | S::LEFT_TILED;
+        let tiled = self
+            .window
+            .surface()
+            .and_downcast::<gtk::gdk::Toplevel>()
+            .is_some_and(|t| t.state().intersects(tiled_states));
+        let (w, h) = if tiled { (self.window.width(), self.window.height()) } else { self.window.default_size() };
+        if let Err(e) = self.settings.borrow_mut().set_window_state(w, h, self.window.is_maximized()) {
+            log::warn!("save window size: {e}");
+        }
     }
 
     fn start_tray(self: &Rc<Self>, app: &adw::Application) {
@@ -423,6 +451,10 @@ impl Window {
         let (weak, app_weak) = (Rc::downgrade(self), app.downgrade());
         let quit: Rc<dyn Fn()> = Rc::new(move || {
             if let Some(this) = weak.upgrade() {
+                // Hidden to the tray: the close that hid it already saved.
+                if this.window.is_visible() {
+                    this.save_window_state();
+                }
                 this.quitting.set(true);
                 this.tray.borrow_mut().take();
             }

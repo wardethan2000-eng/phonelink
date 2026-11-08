@@ -245,6 +245,10 @@ pub struct Settings {
     message_font_scale: f64,
     /// Size of the whole window's text and icons; 0 = automatic.
     ui_scale: f64,
+    /// Main window size at the last close or quit (0 = never saved).
+    window_width: i32,
+    window_height: i32,
+    window_maximized: bool,
     /// Keys we do not know (written by Python or a newer version); preserved.
     extra: Map<String, Value>,
 
@@ -278,6 +282,9 @@ impl Settings {
             hidden: BTreeMap::new(),
             message_font_scale: 1.0,
             ui_scale: 0.0,
+            window_width: 0,
+            window_height: 0,
+            window_maximized: false,
             extra: Map::new(),
             last_written: None,
             batch_depth: 0,
@@ -332,6 +339,9 @@ impl Settings {
         self.google_last_attempt_ts = py_float(m.remove("google_last_attempt_ts"), 0.0);
         self.message_font_scale = clamp_scale(py_float(m.remove("message_font_scale"), 1.0));
         self.ui_scale = clamp_ui_scale(py_float(m.remove("ui_scale"), 0.0));
+        self.window_width = py_int(m.remove("window_width").as_ref()).clamp(0, 100_000) as i32;
+        self.window_height = py_int(m.remove("window_height").as_ref()).clamp(0, 100_000) as i32;
+        self.window_maximized = py_bool(m.remove("window_maximized"), false);
 
         self.hidden = BTreeMap::new();
         if let Some(Value::Object(devices)) = m.remove("hidden_conversations") {
@@ -377,6 +387,9 @@ impl Settings {
         );
         m.insert("message_font_scale".into(), Value::from(self.message_font_scale));
         m.insert("ui_scale".into(), Value::from(self.ui_scale));
+        m.insert("window_width".into(), Value::from(self.window_width));
+        m.insert("window_height".into(), Value::from(self.window_height));
+        m.insert("window_maximized".into(), Value::from(self.window_maximized));
         serde_json::to_string_pretty(&m).unwrap_or_else(|_| "{}".to_string())
     }
 
@@ -440,6 +453,25 @@ impl Settings {
 
     pub fn set_ui_scale(&mut self, value: f64) -> io::Result<()> {
         self.ui_scale = clamp_ui_scale(value);
+        self.save()
+    }
+
+    /// The main window's size at the last close, once one was saved.
+    pub fn window_size(&self) -> Option<(i32, i32)> {
+        (self.window_width > 0 && self.window_height > 0).then_some((self.window_width, self.window_height))
+    }
+
+    pub fn window_maximized(&self) -> bool {
+        self.window_maximized
+    }
+
+    /// Saves only when something changed (closing to the tray calls this often).
+    pub fn set_window_state(&mut self, width: i32, height: i32, maximized: bool) -> io::Result<()> {
+        let (w, h) = (width.max(0), height.max(0));
+        if (w, h, maximized) == (self.window_width, self.window_height, self.window_maximized) {
+            return Ok(());
+        }
+        (self.window_width, self.window_height, self.window_maximized) = (w, h, maximized);
         self.save()
     }
 
@@ -750,6 +782,17 @@ mod tests {
         let before = f.s.write_count();
         f.s.set_notifications_enabled(false).unwrap(); // same value -> no write
         assert_eq!(f.s.write_count(), before);
+    }
+
+    #[test]
+    fn window_size_is_remembered() {
+        let mut f = fixture();
+        assert_eq!(f.s.window_size(), None);
+        f.s.set_window_state(1200, 800, true).unwrap();
+        let mut again = Settings::with_paths(f.path.clone(), f._dir.path().join("autostart"));
+        again.load();
+        assert_eq!(again.window_size(), Some((1200, 800)));
+        assert!(again.window_maximized());
     }
 
     #[test]
