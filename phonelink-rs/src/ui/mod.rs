@@ -117,6 +117,11 @@ button.settings-open { background-color: alpha(currentColor, 0.1); }
 .reaction-chip.reaction-mine { background-color: mix(@view_bg_color, @accent_bg_color, 0.25); box-shadow: 0 0 0 1px @accent_color; }
 .reaction-pick { font-size: 1.35em; padding: 2px 6px; min-width: 0; }
 .reaction-pick.reaction-mine { background-color: alpha(@accent_bg_color, 0.25); }
+/* Conversation list: a name a little over body size, the preview at it. */
+.conversation-name { font-size: 1.08em; }
+.conversation-preview { font-size: 1em; }
+.conversation-avatar, .conversation-avatar-photo { min-width: 46px; min-height: 46px; }
+.conversation-avatar { font-size: 18px; }
 /* Bubbles in em: they keep their shape when the text is zoomed. */
 .message-bubble-sent { padding: 0.45em 0.85em; border-radius: 1.15em 1.15em 0.3em 1.15em; }
 .message-bubble-received { padding: 0.45em 0.85em; border-radius: 1.15em 1.15em 1.15em 0.3em; }

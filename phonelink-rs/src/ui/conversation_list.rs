@@ -54,17 +54,17 @@ fn initial(name: &str, phone: &str) -> String {
 fn build_avatar(name: &str, phone: &str, is_group: bool, group_count: usize) -> gtk::Widget {
     if !is_group && let Some(path) = contact_photo_path(phone) {
         let picture = gtk::Picture::new();
-        picture.set_size_request(super::scale::px(40), super::scale::px(40));
+        picture.set_size_request(super::scale::px(46), super::scale::px(46));
         picture.set_can_shrink(true);
         picture.set_content_fit(gtk::ContentFit::Cover);
         picture.add_css_class("conversation-avatar-photo");
-        // Decoded off the main thread at 2× (80 px): full-size contact
+        // Decoded off the main thread at 128 px (sharp up to ~2×): full-size contact
         // photos decoded per row made the first list build stall.
         let target = picture.clone();
         glib::spawn_future_local(async move {
             let decoded = gtk::gio::spawn_blocking(move || {
                 super::decodable_image(std::path::Path::new(&path))?;
-                let pb = gtk::gdk_pixbuf::Pixbuf::from_file_at_scale(&path, 80, 80, true).ok()?;
+                let pb = gtk::gdk_pixbuf::Pixbuf::from_file_at_scale(&path, 128, 128, true).ok()?;
                 Some((pb.read_pixel_bytes(), pb.width(), pb.height(), pb.rowstride() as usize, pb.has_alpha()))
             })
             .await;
@@ -77,7 +77,7 @@ fn build_avatar(name: &str, phone: &str, is_group: bool, group_count: usize) -> 
         return picture.upcast();
     }
     let label = gtk::Label::new(None);
-    label.set_size_request(super::scale::px(40), super::scale::px(40));
+    label.set_size_request(super::scale::px(46), super::scale::px(46));
     if is_group {
         label.set_label(&group_count.to_string());
         label.add_css_class("conversation-avatar-group");
@@ -196,6 +196,7 @@ impl Row {
         name.set_hexpand(true);
         name.set_ellipsize(pango::EllipsizeMode::End);
         name.set_max_width_chars(20);
+        name.add_css_class("conversation-name");
         top.append(&name);
 
         // Muted and pinned, beside the time.
@@ -218,9 +219,10 @@ impl Row {
         preview.set_xalign(0.0);
         preview.set_halign(gtk::Align::Start);
         preview.set_ellipsize(pango::EllipsizeMode::End);
-        preview.set_max_width_chars(30);
+        preview.set_max_width_chars(40);
         preview.add_css_class("dim-label");
-        preview.add_css_class("caption");
+        // Body size, not caption (82%): it was too small to read (Ethan).
+        preview.add_css_class("conversation-preview");
         text_col.append(&preview);
 
         // Reserve trailing width so read/unread changes don't resize the row.
@@ -361,7 +363,7 @@ pub struct ConversationList {
 impl ConversationList {
     pub fn new() -> Rc<Self> {
         let widget = gtk::Box::new(gtk::Orientation::Vertical, 0);
-        widget.set_size_request(super::scale::px(280), -1);
+        widget.set_size_request(super::scale::px(360), -1);
         widget.set_hexpand(false);
 
         let search_box = gtk::Box::new(gtk::Orientation::Horizontal, 6);
