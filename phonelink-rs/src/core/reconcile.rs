@@ -137,13 +137,6 @@ pub fn conversation_key<S: AsRef<str>>(
     if identity.is_empty() { format!("thread:{thread_id}") } else { identity }
 }
 
-/// A conversation's identity: its people, plus its own tag for a named
-/// group (so two groups of the same people stay two chats).
-pub fn identity_of(conv: &Conversation, self_key: &str) -> String {
-    let key = conversation_key(&conv.addresses, &conv.address, self_key, conv.thread_id);
-    if conv.separate.is_empty() { key } else { format!("{key}#{}", conv.separate) }
-}
-
 /// [`detect_self_key_with`] using Python's defaults (`min_appearances=3`, `top=5`).
 pub fn detect_self_key<L, K>(message_key_lists: L, contact_keys: &[&str]) -> String
 where
@@ -374,7 +367,7 @@ impl ConversationIndex {
     /// Recomputes the identity and merges into an existing conversation if one
     /// already claims it. Returns the surviving primary thread id.
     pub fn register(&mut self, mut conv: Conversation) -> i64 {
-        conv.identity = identity_of(&conv, &self.self_key);
+        conv.identity = conversation_key(&conv.addresses, &conv.address, &self.self_key, conv.thread_id);
         if conv.thread_ids.is_empty() {
             conv.thread_ids = vec![conv.thread_id];
         }
@@ -414,12 +407,11 @@ impl ConversationIndex {
     /// Drop a conversation (by any of its thread ids); return removed ids.
     pub fn remove(&mut self, thread_id: i64) -> Vec<i64> {
         let primary = self.primary_for(thread_id);
-        if self.conversations.remove(&primary).is_none() {
+        let Some(conv) = self.conversations.remove(&primary) else {
             self.thread_to_primary.remove(&thread_id);
             return Vec::new();
-        }
-        // Every identity that led here (a merge can leave several).
-        self.identity_to_primary.retain(|_, p| *p != primary);
+        };
+        self.identity_to_primary.remove(&conv.identity);
         let mut removed: Vec<i64> = self
             .thread_to_primary
             .iter()

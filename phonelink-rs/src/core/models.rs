@@ -188,9 +188,6 @@ pub struct Conversation {
     pub identity: String,
     /// Every phone thread id merged into this conversation.
     pub thread_ids: Vec<i64>,
-    /// Keeps a named group apart from other chats with the same people
-    /// (Google Messages names some groups). Empty for everything else.
-    pub separate: String,
     /// Calls with this chat's number, oldest first (1:1 chats only; not in
     /// `messages`, so search, sync and the store never see them as texts).
     pub calls: Vec<Call>,

@@ -47,6 +47,11 @@ type attachment struct {
 	Thumb bool `json:"thumb,omitempty"`
 	// Part is the attachment's own id in its message (for the full size).
 	Part string `json:"part,omitempty"`
+	// Preview is Google's small copy (a JPEG), when there is one besides
+	// the file itself: what to show when the file can't be opened here
+	// (HEIC photos on a computer without an HEVC decoder).
+	PreviewID  string `json:"preview_id,omitempty"`
+	PreviewKey []byte `json:"preview_key,omitempty"`
 }
 
 // msgEvent is one message. Status is one of sending, sent, delivered,
@@ -345,6 +350,8 @@ func messageEvent(m *gmproto.Message, conv *gmproto.Conversation) (msgEvent, boo
 			a := attachment{ID: mc.GetMediaID(), Mime: mc.GetMimeType(), Name: mc.GetMediaName(), Size: mc.GetSize(), Key: mc.GetDecryptionKey(), Part: info.GetActionMessageID()}
 			if a.ID == "" && mc.GetThumbnailMediaID() != "" {
 				a.ID, a.Key, a.Thumb = mc.GetThumbnailMediaID(), mc.GetThumbnailDecryptionKey(), true
+			} else if t := mc.GetThumbnailMediaID(); t != "" && t != a.ID {
+				a.PreviewID, a.PreviewKey = t, mc.GetThumbnailDecryptionKey()
 			}
 			if a.ID == "" {
 				continue // not on Google's side yet (still uploading)

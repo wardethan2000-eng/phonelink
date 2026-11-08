@@ -93,6 +93,16 @@ pub struct GmAttachment {
     pub thumb: bool,
     /// The attachment's own id in its message.
     pub part: String,
+    /// Google's small JPEG copy, besides the file (HEIC photos have one).
+    pub preview_id: String,
+    pub preview_key: String,
+}
+
+/// HEIC/HEIF photos (iPhones send them) need an HEVC decoder that most
+/// Linux systems leave out, so these show as Google's JPEG copy.
+fn shown_as_preview(a: &GmAttachment) -> bool {
+    let mime = a.mime.to_ascii_lowercase();
+    (mime == "image/heic" || mime == "image/heif") && !a.preview_id.is_empty() && !a.preview_key.is_empty()
 }
 
 /// One message.
@@ -441,6 +451,17 @@ pub fn to_sms(m: &GmMessage, thread_id: i64, uid: i64, members: &[String], unrea
         .attachments
         .iter()
         .map(|a| {
+            if shown_as_preview(a) {
+                let stem = a.name.rsplit_once('.').map_or(a.name.as_str(), |(s, _)| s);
+                let mut att = Attachment {
+                    mime_type: "image/jpeg".into(),
+                    unique_identifier: format!("{GM_MEDIA_PREFIX}{}", a.preview_id),
+                    file_name: if stem.is_empty() { String::new() } else { format!("{stem}.jpg") },
+                    ..Default::default()
+                };
+                att.extra.insert(GM_KEY.into(), a.preview_key.clone().into());
+                return att;
+            }
             let mut att = Attachment {
                 mime_type: a.mime.clone(),
                 unique_identifier: format!("{GM_MEDIA_PREFIX}{}", a.id),

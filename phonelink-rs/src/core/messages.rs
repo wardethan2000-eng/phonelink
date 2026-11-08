@@ -237,7 +237,6 @@ struct GmChat {
     conv: String,
     read_only: bool,
     last_ts: i64,
-    preview: String,
     members: Vec<String>,
     /// The group's or business's own name.
     name: String,
@@ -250,9 +249,6 @@ struct GmChat {
 pub struct GmMode {
     /// Local thread id → its Google chat.
     chats: HashMap<i64, GmChat>,
-    /// Named groups (local thread ids): each its own chat, never merged
-    /// with another chat of the same people.
-    named: HashSet<i64>,
     /// My messages' route and delivery, by uid.
     delivery: HashMap<i64, SendRoute>,
     /// Texts sent from here whose echo hasn't come: tmp id → (thread,
@@ -357,12 +353,7 @@ pub enum ChatAction {
     Spam,
 }
 
-/// A named group's tag (see `Conversation::separate`).
-fn separate_tag(thread_id: i64) -> String {
-    format!("gm{thread_id}")
-}
-
-/// A group's name the people gave it, not Google's list of members
+/// A name the group was given, not Google's list of its members
 /// ("Ann, Bob and Cy").
 fn own_group_name(name: &str) -> bool {
     !name.trim().is_empty() && !name.contains(',')
@@ -517,7 +508,6 @@ impl Messages {
         };
         if let Some(gm) = self.gm.as_mut() {
             gm.archived = ids_from_meta(store.meta("gm_archived"));
-            gm.named = ids_from_meta(store.meta("gm_named"));
             gm.pinned_phone = ids_from_meta(store.meta("gm_pinned"));
             gm.muted = ids_from_meta(store.meta("gm_muted"));
             let on = ids_from_meta(store.meta("gm_pins_on"));
@@ -533,10 +523,7 @@ impl Messages {
         // Deterministic order, collapsing legacy duplicate rows.
         cached.sort_by_key(|c| c.thread_id);
         self.index.clear();
-        for mut conv in cached {
-            if self.gm.as_ref().is_some_and(|gm| gm.named.contains(&conv.thread_id)) {
-                conv.separate = separate_tag(conv.thread_id);
-            }
+        for conv in cached {
             self.index.register(conv);
         }
         self.refresh_names();
@@ -658,9 +645,7 @@ impl Messages {
     /// Re-resolve every display name (contacts changed).
     pub fn refresh_names(&mut self) {
         self.apply_gm_names();
-        // A named group keeps its own name (saved, or from the phone).
-        for conv in self.index.conversations.values_mut().filter(|c| c.separate.is_empty() || c.display_name.is_empty())
-        {
+        for conv in self.index.conversations.values_mut() {
             conv.display_name = name_for(&self.contact_map, &conv.addresses, &conv.address);
         }
         let tids: Vec<i64> = self.index.conversations.keys().copied().collect();
@@ -837,7 +822,7 @@ impl Messages {
     pub fn visible(&self, hidden: &dyn HiddenStore) -> Vec<&Conversation> {
         let dev = self.device_id.as_deref().unwrap_or("");
         let is_hidden = |c: &Conversation| {
-            let key = reconcile::identity_of(c, &self.index.self_key);
+            let key = self.conversation_key(&c.addresses, &c.address, c.thread_id);
             if key.is_empty() || dev.is_empty() {
                 return false;
             }
@@ -1503,7 +1488,7 @@ impl Messages {
         if conv.thread_id < 0 {
             return String::new();
         }
-        let key = reconcile::identity_of(conv, &self.index.self_key);
+        let key = self.conversation_key(&conv.addresses, &conv.address, conv.thread_id);
         if key.is_empty() {
             return key;
         }
@@ -1588,12 +1573,17 @@ impl Messages {
         let Some(conv) = self.index.conversations.get_mut(&thread_id) else {
             return;
         };
-        let Some(chat) = conv.thread_ids.iter().find_map(|t| gm.chats.get(t)) else {
+        // Merged chats (the same people): a name the group was given wins
+        // over Google's list of its members.
+        let chats: Vec<&GmChat> = conv.thread_ids.iter().filter_map(|t| gm.chats.get(t)).collect();
+        let Some(chat) = chats
+            .iter()
+            .filter(|c| c.group && own_group_name(&c.name))
+            .max_by_key(|c| c.last_ts)
+            .or_else(|| chats.iter().find(|c| !c.name.trim().is_empty()))
+        else {
             return;
         };
-        if chat.name.is_empty() {
-            return;
-        }
         let unnamed = conv.display_name.is_empty() || conv.display_name == conv.address || conv.address.contains('@');
         if chat.group || unnamed {
             conv.display_name = chat.name.trim().to_string();
@@ -1630,35 +1620,12 @@ impl Messages {
                     conv: c.conv.clone(),
                     read_only: c.read_only,
                     last_ts: c.last_ts_ms,
-                    preview: c.preview.clone(),
                     members: members.clone(),
                     name: c.name.clone(),
                     group: c.group,
                     rcs: c.rcs,
                 },
             );
-        }
-        // A named group stands alone; one merged before (with another chat
-        // of the same people) is taken apart again.
-        if let Some(gm) = self.gm.as_mut() {
-            let named = c.group && own_group_name(&c.name);
-            let changed = if named { gm.named.insert(thread_id) } else { gm.named.remove(&thread_id) };
-            if changed {
-                store.set_meta("gm_named", &ids_to_meta(gm.named.iter().copied()));
-            }
-            let primary = self.index.thread_to_primary.get(&thread_id).copied();
-            let wrong = primary.and_then(|p| self.index.get(p)).is_some_and(|conv| {
-                if named {
-                    conv.thread_id != thread_id
-                        || conv.thread_ids.iter().any(|&t| t != thread_id)
-                        || conv.separate != separate_tag(thread_id)
-                } else {
-                    !conv.separate.is_empty()
-                }
-            });
-            if let (true, Some(p)) = (wrong, primary) {
-                self.split_merged(p, store);
-            }
         }
         let known = self.index.thread_to_primary.contains_key(&thread_id);
         if c.blocked {
@@ -1689,13 +1656,16 @@ impl Messages {
             if members.is_empty() {
                 return Vec::new();
             }
-            let conv = self.gm_fresh_conv(thread_id, &members);
-            let identity = reconcile::identity_of(&conv, &self.index.self_key);
+            let identity = self.conversation_key(&members, "", thread_id);
             if !self.index.identity_to_primary.contains_key(&identity)
                 && self.should_keep_hidden(hidden, &identity, c.last_ts_ms)
             {
                 return Vec::new();
             }
+            let mut conv = Conversation::new(thread_id);
+            conv.address = members[0].clone();
+            conv.addresses = members.clone();
+            conv.display_name = name_for(&self.contact_map, &members, &conv.address);
             self.index.register(conv);
         }
         let primary = self.index.primary_for(thread_id);
@@ -1724,46 +1694,6 @@ impl Messages {
             store.upsert_conversation(&dev, conv);
         }
         out
-    }
-
-    /// A new conversation for Google chat `thread_id` (a named group gets
-    /// its own identity).
-    fn gm_fresh_conv(&self, thread_id: i64, members: &[String]) -> Conversation {
-        let mut conv = Conversation::new(thread_id);
-        conv.address = members.first().cloned().unwrap_or_default();
-        conv.addresses = members.to_vec();
-        conv.display_name = name_for(&self.contact_map, members, &conv.address);
-        if self.gm.as_ref().is_some_and(|gm| gm.named.contains(&thread_id)) {
-            conv.separate = separate_tag(thread_id);
-        }
-        conv
-    }
-
-    /// Take apart conversation `primary`, merged from several Google chats
-    /// that should stand apart: each comes back on its own, without the
-    /// mixed history (it reloads from the phone when opened).
-    fn split_merged(&mut self, primary: i64, store: &MessageStore) {
-        let Some(dev) = self.device_id.clone() else { return };
-        let threads = self.index.remove(primary);
-        store.delete_conversation(&dev, primary);
-        for tid in threads {
-            let Some(chat) = self.gm.as_ref().and_then(|gm| gm.chats.get(&tid)) else { continue };
-            let (members, last_ts, preview) = (chat.members.clone(), chat.last_ts, chat.preview.clone());
-            if members.is_empty() {
-                continue;
-            }
-            let mut conv = self.gm_fresh_conv(tid, &members);
-            conv.last_date = last_ts;
-            conv.last_message = preview;
-            let p = self.index.register(conv);
-            self.gm_name(p);
-            if let Some(conv) = self.index.get(p) {
-                store.upsert_conversation(&dev, conv);
-            }
-        }
-        if self.active == Some(primary) {
-            self.active = None;
-        }
     }
 
     /// A message from Google Messages: new, replayed, fetched, or changed
@@ -1863,11 +1793,13 @@ impl Messages {
                     row.attachments.iter().all(|a| a.unique_identifier.starts_with(super::gm::GM_MEDIA_PREFIX));
                 // Never back from the full picture to a preview.
                 let full = m.attachments.iter().all(|a| !a.thumb);
+                // Or a row saved without its pictures (before they came
+                // through), or a photo now shown as Google's JPEG copy.
                 if !fresh.is_empty()
                     && full
                     && from_google
                     && ids(&row.attachments) != ids(&fresh)
-                    && row.attachments.len() == fresh.len()
+                    && (row.attachments.len() == fresh.len() || row.attachments.is_empty())
                 {
                     row.attachments = fresh;
                     store.upsert_message(&dev, primary, row);
@@ -3527,61 +3459,6 @@ mod tests {
         }
 
         #[test]
-        fn a_named_group_stays_apart_from_another_group_of_the_same_people() {
-            let people = ["+13165552222", "+13165553333"];
-            let shown = |p: &Panel| {
-                let mut v: Vec<String> = p.m.visible(&p.hidden).iter().map(|c| c.display_name.clone()).collect();
-                v.sort();
-                v
-            };
-            // Two chats of the same people: the unnamed one comes first...
-            let mut p = panel();
-            p.chat(&chat("plain", &people, false, 2000));
-            let mut named = chat("club", &people, false, 1000);
-            named.name = "Book club".into();
-            p.chat(&named);
-            assert_eq!(p.m.visible(&p.hidden).len(), 2);
-            assert!(shown(&p).contains(&"Book club".to_string()));
-            // ...or the named one does.
-            let mut q = panel();
-            q.chat(&named);
-            q.chat(&chat("plain", &people, false, 2000));
-            assert_eq!(q.m.visible(&q.hidden).len(), 2);
-            // Still apart after a restart.
-            q.m.reset_for_device(Some("gm:3165550000"), true);
-            q.m.load_cached(&q.store);
-            assert_eq!(q.m.visible(&q.hidden).len(), 2);
-            assert!(shown(&q).contains(&"Book club".to_string()));
-            // Unnamed groups of the same people still merge (Google's own
-            // name for them is the list of members).
-            let mut r = panel();
-            r.chat(&chat("x", &people, false, 2000));
-            let mut y = chat("y", &people, false, 1000);
-            y.name = "Ann, Bob".into();
-            r.chat(&y);
-            assert_eq!(r.m.visible(&r.hidden).len(), 1);
-        }
-
-        #[test]
-        fn a_group_merged_before_comes_apart() {
-            let people = ["+13165552222", "+13165553333"];
-            let mut p = panel();
-            // Saved by an older version: both chats in one conversation.
-            p.chat(&chat("plain", &people, false, 2000));
-            p.chat(&chat("club", &people, false, 1000));
-            p.msg(&gmsg("plain", "1", false, 2000));
-            assert_eq!(p.m.visible(&p.hidden).len(), 1);
-            // The phone says one has a name: apart, without the mixed history.
-            let mut named = chat("club", &people, false, 1000);
-            named.name = "Book club".into();
-            p.chat(&named);
-            let v = p.m.visible(&p.hidden);
-            assert_eq!(v.len(), 2);
-            assert!(v.iter().all(|c| c.messages.is_empty()));
-            assert!(v.iter().any(|c| c.display_name == "Book club" && c.last_message == "preview"));
-        }
-
-        #[test]
         fn archive_pin_mute_and_block() {
             let mut p = panel();
             p.chat(&chat("a", &["+13165551111"], false, 3000));
@@ -3671,6 +3548,79 @@ mod tests {
                 sends,
                 [("hi all".into(), Some("/tmp/a.jpg".into())), (String::new(), Some("/tmp/b.pdf".into()))]
             );
+        }
+
+        #[test]
+        fn iphone_photos_show_as_googles_jpeg_copy() {
+            let mut p = panel();
+            p.chat(&chat("a", &["+13165551111"], false, 2000));
+            let tid = p.store.gm_local_id("conv", "a");
+            p.m.select(tid, &p.store, 0.0);
+            let mut m = gmsg("a", "1", false, 1000);
+            m.attachments = vec![crate::core::gm::GmAttachment {
+                id: "heic".into(),
+                mime: "image/heic".into(),
+                name: "IMG_1.HEIC".into(),
+                key: "a2V5".into(),
+                preview_id: "jpg".into(),
+                preview_key: "cHJl".into(),
+                ..Default::default()
+            }];
+            p.msg(&m);
+            let uid = p.store.gm_local_id("msg", "1");
+            let row = p.m.index.get(tid).unwrap().messages.iter().find(|x| x.uid == uid).unwrap().clone();
+            let a = &row.attachments[0];
+            assert_eq!(
+                (a.unique_identifier.as_str(), a.mime_type.as_str(), a.file_name.as_str()),
+                ("gm:jpg", "image/jpeg", "IMG_1.jpg")
+            );
+            assert_eq!(crate::core::gm::gm_media(a), Some(("jpg".into(), "cHJl".into())));
+        }
+
+        #[test]
+        fn pictures_missing_from_a_saved_row_come_in() {
+            let mut p = panel();
+            p.chat(&chat("a", &["+13165551111"], false, 2000));
+            let tid = p.store.gm_local_id("conv", "a");
+            p.m.select(tid, &p.store, 0.0);
+            // Saved before pictures came through: no attachment.
+            let mut m = gmsg("a", "1", false, 1000);
+            m.text = String::new();
+            p.msg(&m);
+            m.attachments = vec![crate::core::gm::GmAttachment {
+                id: "pic".into(),
+                mime: "image/png".into(),
+                key: "a2V5".into(),
+                ..Default::default()
+            }];
+            assert_eq!(p.msg(&m), vec![Effect::Redraw(tid)]);
+            let uid = p.store.gm_local_id("msg", "1");
+            let row = p.m.index.get(tid).unwrap().messages.iter().find(|x| x.uid == uid).unwrap();
+            assert_eq!(row.attachments.len(), 1);
+        }
+
+        #[test]
+        fn a_merged_group_takes_the_name_it_was_given() {
+            let people = ["+13165552222", "+13165553333"];
+            for order in [false, true] {
+                let mut p = panel();
+                let plain = chat("plain", &people, false, 2000);
+                let mut named = chat("club", &people, false, 1000);
+                named.name = "Book club ".into();
+                let mut listed = chat("plain", &people, false, 2000);
+                listed.name = "Ann, Bob".into();
+                if order {
+                    p.chat(&named);
+                    p.chat(&listed);
+                } else {
+                    p.chat(&plain);
+                    p.chat(&listed);
+                    p.chat(&named);
+                }
+                let v = p.m.visible(&p.hidden);
+                assert_eq!(v.len(), 1, "one chat");
+                assert_eq!(v[0].display_name, "Book club");
+            }
         }
 
         #[test]
