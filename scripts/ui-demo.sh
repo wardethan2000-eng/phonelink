@@ -16,6 +16,11 @@ fi
 if [ -n "${DEMO_FONT:-}" ]; then
     mkdir -p "$demo/.config/gtk-4.0" && printf '[Settings]\ngtk-font-name=%s\n' "$DEMO_FONT" > "$demo/.config/gtk-4.0/settings.ini"
 fi
+# DEMO_ICONS=breeze-dark uses that icon theme from ~/demo-icons.
+if [ -n "${DEMO_ICONS:-}" ]; then
+    mkdir -p "$demo/.local/share" "$demo/.config/gtk-4.0" && ln -sfn "$HOME/demo-icons" "$demo/.local/share/icons"
+    printf 'gtk-icon-theme-name=%s\n' "$DEMO_ICONS" >> "$demo/.config/gtk-4.0/settings.ini"
+fi
 if [ "${DEMO_GM:-0}" = 1 ]; then
     mkdir -p "$demo/.local/state/gmcli" && echo '{}' > "$demo/.local/state/gmcli/session.json"
     export PHONELINK_GM=$PWD/target/debug/examples/fake_gm

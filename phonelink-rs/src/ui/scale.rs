@@ -20,7 +20,13 @@ thread_local! {
     static PROVIDER: RefCell<Option<gtk::CssProvider>> = const { RefCell::new(None) };
     /// Icons with their own size, resized when the setting changes.
     static SIZED: RefCell<Vec<(glib::WeakRef<gtk::Image>, i32)>> = const { RefCell::new(Vec::new()) };
+    /// Extra size for icons from a resizable twin (Breeze draws its glyphs
+    /// small: the 16 px bell is 10 x 12).
+    static ICON_BOOST: Cell<f64> = const { Cell::new(1.0) };
 }
+
+/// Breeze's glyphs fill less of their square than Adwaita's.
+const TWIN_BOOST: f64 = 1.2;
 
 /// Give `image` its own size (`n` px at 100%), kept in step with the setting.
 pub fn icon(image: &gtk::Image, n: i32) {
@@ -104,6 +110,7 @@ pub fn scale_css(css: &str, f: f64) -> String {
 /// starting value, which a rule on the window does not pass down), so
 /// libadwaita's own larger icons are restated after it.
 fn icon_css(f: f64) -> String {
+    let f = f * ICON_BOOST.with(Cell::get);
     let at = |n: f64| (n * f).round();
     let sp = "statuspage > scrolledwindow > viewport > box > clamp > box > .icon";
     format!(
@@ -123,9 +130,47 @@ fn icon_css(f: f64) -> String {
     )
 }
 
+/// Fixed-size icon themes (Breeze) never draw an icon bigger than their
+/// folders: switch to a resizable twin of the theme (`core::icon_twin`).
+fn resizable_icons(settings: &gtk::Settings) {
+    use crate::core::icon_twin;
+    let Some(name) = settings.gtk_icon_theme_name().map(|n| n.to_string()) else { return };
+    let Some(display) = gtk::gdk::Display::default() else { return };
+    let theme = gtk::IconTheme::for_display(&display);
+    let Some(src) = theme.search_path().into_iter().map(|p| p.join(&name)).find(|p| p.join("index.theme").is_file())
+    else {
+        return;
+    };
+    let Ok(index) = std::fs::read_to_string(src.join("index.theme")) else { return };
+    let Some((twin_index, links)) = icon_twin::twin(&index, &name) else { return };
+    let root = crate::core::attachments::full_cache_dir().with_file_name("icon-themes");
+    let dir = root.join(icon_twin::twin_name(&name));
+    let made = (|| -> std::io::Result<()> {
+        if dir.exists() {
+            std::fs::remove_dir_all(&dir)?;
+        }
+        std::fs::create_dir_all(&dir)?;
+        for (link, sub) in &links {
+            std::os::unix::fs::symlink(src.join(sub), dir.join(link))?;
+        }
+        std::fs::write(dir.join("index.theme"), twin_index)
+    })();
+    if let Err(e) = made {
+        log::warn!("resizable icons: {e}");
+        return;
+    }
+    theme.add_search_path(&root);
+    settings.set_gtk_icon_theme_name(Some(&icon_twin::twin_name(&name)));
+    ICON_BOOST.with(|b| b.set(TWIN_BOOST));
+    log::info!("icons: {name} is fixed-size; using a resizable view of it");
+}
+
 /// Load `css` (the app's stylesheet) at `setting`, replacing an earlier load.
 pub fn apply(setting: f64, css: &str) {
     let Some(settings) = gtk::Settings::default() else { return };
+    if BASE_FONT.with_borrow(Option::is_none) {
+        resizable_icons(&settings);
+    }
     let base = BASE_FONT.with_borrow_mut(|b| {
         b.get_or_insert_with(|| settings.gtk_font_name().map(|s| s.to_string()).unwrap_or_default()).clone()
     });
