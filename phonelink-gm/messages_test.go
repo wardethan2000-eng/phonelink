@@ -174,3 +174,95 @@ func TestRepliesAndReactionsAsTheBridgeSendsThem(t *testing.T) {
 		t.Fatal("unknown reaction action accepted")
 	}
 }
+
+func TestPreviewOnlyPicturesAskForTheFullSize(t *testing.T) {
+	c := conv("7", part("+13165551111", false), part("+13165550000", true))
+	media := func(mc *gmproto.MediaContent, part string) *gmproto.MessageInfo {
+		return &gmproto.MessageInfo{ActionMessageID: &part, Data: &gmproto.MessageInfo_MediaContent{MediaContent: mc}}
+	}
+	m := msg("m1", gmproto.MessageStatusType_INCOMING_COMPLETE, "5",
+		media(&gmproto.MediaContent{ThumbnailMediaID: "th", ThumbnailDecryptionKey: []byte{1}, MimeType: "image/jpeg"}, "p1"),
+		media(&gmproto.MediaContent{MediaID: "full", DecryptionKey: []byte{2}, ThumbnailMediaID: "th2", MimeType: "image/png"}, "p2"),
+		media(&gmproto.MediaContent{MimeType: "video/mp4"}, "p3"))
+	ev, _ := messageEvent(m, c)
+	if len(ev.Attachments) != 2 {
+		t.Fatalf("attachments = %+v (one still uploading is left out)", ev.Attachments)
+	}
+	a, b := ev.Attachments[0], ev.Attachments[1]
+	if a.ID != "th" || !a.Thumb || a.Key[0] != 1 || a.Part != "p1" || b.ID != "full" || b.Thumb || b.Key[0] != 2 {
+		t.Fatalf("attachments = %+v", ev.Attachments)
+	}
+	if got := thumbParts(ev); len(got) != 1 || got[0] != "p1" {
+		t.Fatalf("thumbParts = %v", got)
+	}
+}
+
+func TestChatChanges(t *testing.T) {
+	for change, want := range map[string]string{
+		"archive": "status:ARCHIVED", "unarchive": "status:ACTIVE", "mute": "mute:MUTE", "unmute": "mute:UNMUTE",
+		"block": "action:BLOCK", "spam": "action:BLOCK_AND_REPORT", "unblock": "action:UNBLOCK",
+	} {
+		req, ok := chatChange("7", change)
+		if !ok || req.GetConversationID() != "7" {
+			t.Fatalf("%s: %v %v", change, req, ok)
+		}
+		var got string
+		d := req.GetUpdateData()
+		switch {
+		case d.GetData() != nil && d.GetConversationID() != "7":
+			t.Fatalf("%s: data for chat %q", change, d.GetConversationID())
+		case d != nil && d.GetData() != nil:
+			if _, isMute := d.GetData().(*gmproto.UpdateConversationData_Mute); isMute {
+				got = "mute:" + d.GetMute().String()
+			} else {
+				got = "status:" + d.GetStatus().String()
+			}
+		default:
+			got = "action:" + req.GetAction().String()
+		}
+		if got != want {
+			t.Errorf("%s = %s, want %s", change, got, want)
+		}
+	}
+	if _, ok := chatChange("7", "pin"); ok {
+		t.Fatal("pin isn't something the phone takes from the web")
+	}
+}
+
+func TestConversationEventPinnedAndBlocked(t *testing.T) {
+	c := conv("7", part("+13165551111", false), part("+13165550000", true))
+	c.Pinned = true
+	c.Status = gmproto.ConversationStatus_SPAM_FOLDER
+	ev, ok := conversationEvent(c)
+	if !ok || !ev.Pinned || !ev.Blocked || ev.Archived {
+		t.Fatalf("event = %+v", ev)
+	}
+	c.Status = gmproto.ConversationStatus_KEEP_ARCHIVED
+	if ev, _ := conversationEvent(c); !ev.Archived || ev.Blocked {
+		t.Fatalf("event = %+v", ev)
+	}
+}
+
+func TestSignInWaitsForEveryNeededCookie(t *testing.T) {
+	all := map[string]string{"SID": "a", "HSID": "b", "SSID": "c", "APISID": "d", "SAPISID": "e", "OSID": "f", "OTHER": "x"}
+	got, ok := needCookies(all)
+	if !ok || len(got) != 6 || got["OTHER"] != "" {
+		t.Fatalf("got %v %v", got, ok)
+	}
+	delete(all, "OSID")
+	if _, ok := needCookies(all); ok {
+		t.Fatal("OSID is required")
+	}
+	for raw, want := range map[string]bool{
+		"https://messages.google.com/web/config":          true,
+		"https://messages.google.com/web/config?x=1":      true,
+		"https://messages.google.com.evil.com/web/config": false,
+		"http://messages.google.com/web/config":           false,
+		"https://messages.google.com/web/conversations":   false,
+		"https://user@messages.google.com/web/config":     false,
+	} {
+		if isConfigURL(raw) != want {
+			t.Errorf("isConfigURL(%q) != %v", raw, want)
+		}
+	}
+}

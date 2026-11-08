@@ -1,6 +1,8 @@
 package main
 
 import (
+	"os"
+	"path/filepath"
 	"strings"
 	"testing"
 
@@ -99,5 +101,35 @@ func TestLogsNeverCarryPayload(t *testing.T) {
 	}
 	if strings.Contains(string(redact([]byte("not json Mom says hi"))), "Mom") {
 		t.Fatal("non-JSON line leaked")
+	}
+}
+
+func TestGmcliPairingIsCopiedInOnce(t *testing.T) {
+	dir := t.TempDir()
+	t.Setenv("PHONELINK_GM_SESSION", "")
+	t.Setenv("XDG_DATA_HOME", filepath.Join(dir, "data"))
+	t.Setenv("XDG_STATE_HOME", filepath.Join(dir, "state"))
+	own := filepath.Join(dir, "data", "phonelink", "gm", "session.json")
+	if got := defaultSession(); got != own {
+		t.Fatalf("session = %s", got)
+	}
+	if _, err := os.Stat(own); !os.IsNotExist(err) {
+		t.Fatal("nothing to copy yet")
+	}
+	gm := filepath.Join(dir, "state", "gmcli", "session.json")
+	_ = os.MkdirAll(filepath.Dir(gm), 0o700)
+	_ = os.WriteFile(gm, []byte(`{"x":1}`), 0o600)
+	defaultSession()
+	if b, err := os.ReadFile(own); err != nil || string(b) != `{"x":1}` {
+		t.Fatalf("copy = %q %v", b, err)
+	}
+	if fi, _ := os.Stat(own); fi.Mode().Perm() != 0o600 {
+		t.Fatalf("mode %v", fi.Mode())
+	}
+	// Unlinked (the file removed): gmcli's isn't copied back.
+	_ = os.Remove(own)
+	defaultSession()
+	if _, err := os.Stat(own); !os.IsNotExist(err) {
+		t.Fatal("unlinking must stay unlinked")
 	}
 }

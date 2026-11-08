@@ -2,7 +2,7 @@
 //!
 //! KDE Connect only reads texts, and only the default SMS app may delete
 //! them, so PhoneRelay runs the `phonelink-gm` helper (Go, libgm), which
-//! deletes through the Google Messages web link paired with gmcli. The
+//! deletes through the Google Messages web link (linked in Settings). The
 //! helper is matched by the chat's members; it refuses a chat it can't pin
 //! to exactly one Google Messages conversation.
 
@@ -24,17 +24,34 @@ pub fn helper_path() -> Option<PathBuf> {
     beside.into_iter().chain([local]).find(|p| p.is_file())
 }
 
-/// gmcli's paired session (what the helper uses).
+/// PhoneRelay's Google Messages session (the helper's `ownSession`).
 pub fn session_path(home: &Path) -> PathBuf {
-    let state = std::env::var_os("XDG_STATE_HOME")
-        .map(PathBuf::from)
-        .unwrap_or_else(|| home.join(".local").join("state"));
+    let data =
+        std::env::var_os("XDG_DATA_HOME").map(PathBuf::from).unwrap_or_else(|| home.join(".local").join("share"));
+    data.join("phonelink").join("gm").join("session.json")
+}
+
+/// A pairing gmcli made, which the helper copies in once.
+fn gmcli_session_path(home: &Path) -> PathBuf {
+    let state =
+        std::env::var_os("XDG_STATE_HOME").map(PathBuf::from).unwrap_or_else(|| home.join(".local").join("state"));
     state.join("gmcli").join("session.json")
 }
 
-/// Can chats be deleted on the phone? (No network: helper + pairing exist.)
+/// Is Google Messages linked on this computer? (Ours, or gmcli's not yet
+/// copied in; after an unlink gmcli's no longer counts.)
+pub fn linked(home: &Path) -> bool {
+    let own = session_path(home);
+    if own.is_file() {
+        return true;
+    }
+    let copied = own.parent().is_some_and(|d| d.join(".from-gmcli").exists());
+    !copied && gmcli_session_path(home).is_file()
+}
+
+/// Can the helper run? (No network: helper + a link exist.)
 pub fn available() -> bool {
-    helper_path().is_some() && session_path(&home_dir()).is_file()
+    helper_path().is_some() && linked(&home_dir())
 }
 
 /// One chat's outcome, in the order asked.
@@ -49,7 +66,8 @@ pub enum Outcome {
 /// Parse the helper's JSON. `Err` = the whole run failed (not paired,
 /// couldn't connect...), with a message for the user.
 pub fn parse_output(stdout: &str, chats: usize) -> Result<Vec<Outcome>, String> {
-    let v: Value = serde_json::from_str(stdout.trim()).map_err(|_| "the Google Messages helper gave no answer".to_string())?;
+    let v: Value =
+        serde_json::from_str(stdout.trim()).map_err(|_| "the Google Messages helper gave no answer".to_string())?;
     let Some(results) = v.get("results").and_then(Value::as_array) else {
         let msg = v.get("message").and_then(Value::as_str).unwrap_or("unknown error");
         return Err(match v.get("error").and_then(Value::as_str) {
@@ -114,7 +132,11 @@ pub fn summary(result: &Result<Vec<Outcome>, String>) -> String {
     let unmatched = outcomes.iter().filter(|o| **o == Outcome::NotMatched).count();
     let failed = total - deleted - unmatched;
     if deleted == total {
-        return if total == 1 { "Deleted on your phone too".into() } else { format!("Deleted all {total} on your phone too") };
+        return if total == 1 {
+            "Deleted on your phone too".into()
+        } else {
+            format!("Deleted all {total} on your phone too")
+        };
     }
     let mut parts = Vec::new();
     if deleted > 0 {
@@ -124,7 +146,10 @@ pub fn summary(result: &Result<Vec<Outcome>, String>) -> String {
         parts.push(format!("{unmatched} not found in Google Messages"));
     }
     if failed > 0 {
-        let why = outcomes.iter().find_map(|o| if let Outcome::Failed(m) = o { Some(m.as_str()) } else { None }).unwrap_or("");
+        let why = outcomes
+            .iter()
+            .find_map(|o| if let Outcome::Failed(m) = o { Some(m.as_str()) } else { None })
+            .unwrap_or("");
         parts.push(format!("{failed} failed ({why})"));
     }
     let tail = if total == 1 { "removed from PhoneRelay only" } else { "the rest removed from PhoneRelay only" };
@@ -148,7 +173,10 @@ mod tests {
     #[test]
     fn a_failed_run_is_one_error() {
         let out = r#"{"ok":false,"error":"connect_failed","message":"the phone did not answer in 1m30s"}"#;
-        assert_eq!(parse_output(out, 2), Err("couldn't reach Google Messages (the phone did not answer in 1m30s)".into()));
+        assert_eq!(
+            parse_output(out, 2),
+            Err("couldn't reach Google Messages (the phone did not answer in 1m30s)".into())
+        );
         assert!(parse_output("", 1).is_err());
     }
 
@@ -156,7 +184,10 @@ mod tests {
     fn summaries_say_what_happened_on_the_phone() {
         assert_eq!(summary(&Ok(vec![Outcome::Deleted])), "Deleted on your phone too");
         assert_eq!(summary(&Ok(vec![Outcome::Deleted, Outcome::Deleted])), "Deleted all 2 on your phone too");
-        assert_eq!(summary(&Ok(vec![Outcome::NotMatched])), "Not found in Google Messages; removed from PhoneRelay only");
+        assert_eq!(
+            summary(&Ok(vec![Outcome::NotMatched])),
+            "Not found in Google Messages; removed from PhoneRelay only"
+        );
         assert_eq!(
             summary(&Ok(vec![Outcome::Deleted, Outcome::NotMatched, Outcome::Failed("x".into())])),
             "1 deleted on your phone, 1 not found in Google Messages, 1 failed (x); the rest removed from PhoneRelay only"

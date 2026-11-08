@@ -10,10 +10,11 @@ use std::cell::RefCell;
 use std::collections::HashMap;
 use std::rc::Rc;
 
+use adw::prelude::*;
 use gtk::{glib, pango};
-use gtk::prelude::*;
 
 use crate::core::contacts::contact_photo_path;
+use crate::core::messages::{ChatAction, ChatFlags};
 use crate::core::models::Conversation;
 use crate::core::search::{self, Hit};
 
@@ -40,7 +41,13 @@ fn avatar_hue_class(key: &str) -> String {
 
 /// First letter, uppercased, as Python's `(name or phone or "?")[0].upper()`.
 fn initial(name: &str, phone: &str) -> String {
-    let src = if !name.is_empty() { name } else if !phone.is_empty() { phone } else { "?" };
+    let src = if !name.is_empty() {
+        name
+    } else if !phone.is_empty() {
+        phone
+    } else {
+        "?"
+    };
     src.chars().next().map(|c| c.to_uppercase().collect()).unwrap_or_default()
 }
 
@@ -107,13 +114,17 @@ struct Summary {
     preview: String,
     last_message: String,
     is_read: bool,
+    pinned: bool,
+    muted: bool,
     /// Rebuild the row when this changes (group, size, initial).
     avatar_key: (bool, usize, String),
 }
 
 impl Summary {
-    fn of(c: &Conversation) -> Self {
+    fn of(c: &Conversation, flags: ChatFlags) -> Self {
         Self {
+            pinned: flags.pinned,
+            muted: flags.muted,
             name: display_text(c),
             address: c.address.clone(),
             addresses: c.addresses.clone(),
@@ -127,7 +138,9 @@ impl Summary {
 
     /// Matches by name or number (message text is [`Hit`]s).
     fn matches(&self, needle: &str) -> bool {
-        let Some(q) = search::fold_query(needle) else { return true };
+        let Some(q) = search::fold_query(needle) else {
+            return true;
+        };
         search::fold_query(&self.name).is_some_and(|n| n.contains(&q))
             || self.address.to_lowercase().contains(&q)
             || search::number_matches(&self.addresses, needle)
@@ -152,14 +165,16 @@ struct Row {
     time: gtk::Label,
     preview: gtk::Label,
     dot: gtk::Label,
+    pin: gtk::Image,
+    mute: gtk::Image,
     summary: Summary,
     /// The message hit shown as the preview: (uid, snippet, count).
     showing_hit: Option<(i64, String, usize)>,
 }
 
 impl Row {
-    fn new(c: &Conversation) -> Self {
-        let summary = Summary::of(c);
+    fn new(c: &Conversation, flags: ChatFlags) -> Self {
+        let summary = Summary::of(c, flags);
         let row = gtk::ListBoxRow::new();
         let hbox = gtk::Box::new(gtk::Orientation::Horizontal, 12);
         hbox.set_margin_top(10);
@@ -183,6 +198,17 @@ impl Row {
         name.set_max_width_chars(20);
         top.append(&name);
 
+        // Muted and pinned, beside the time.
+        let mute = gtk::Image::from_icon_name("notifications-disabled-symbolic");
+        mute.set_pixel_size(12);
+        mute.add_css_class("conversation-pin");
+        mute.set_tooltip_text(Some("Muted"));
+        top.append(&mute);
+        let pin = gtk::Image::from_icon_name("view-pin-symbolic");
+        pin.set_pixel_size(12);
+        pin.add_css_class("conversation-pin");
+        pin.set_tooltip_text(Some("Pinned"));
+        top.append(&pin);
         let time = gtk::Label::new(None);
         time.add_css_class("dim-label");
         time.add_css_class("caption");
@@ -204,7 +230,7 @@ impl Row {
         dot.set_valign(gtk::Align::Center);
         hbox.append(&dot);
 
-        let r = Self { row, name, time, preview, dot, summary, showing_hit: None };
+        let r = Self { row, name, time, preview, dot, pin, mute, summary, showing_hit: None };
         r.show(&r.summary.clone());
         r
     }
@@ -236,6 +262,8 @@ impl Row {
     }
 
     fn show(&self, s: &Summary) {
+        self.pin.set_visible(s.pinned);
+        self.mute.set_visible(s.muted);
         self.name.set_label(&s.name);
         self.time.set_label(&s.time);
         self.preview.set_use_markup(false);
@@ -266,6 +294,10 @@ struct State {
     last_emitted: Option<i64>,
     /// Where a Shift+click range starts: the last plain or Ctrl click.
     anchor: Option<i64>,
+    /// Pin, mute and archive state by thread (Google Messages).
+    flags: HashMap<i64, ChatFlags>,
+    /// Showing the archive.
+    archive_shown: bool,
 }
 
 /// Rows created in the first fill, then per later call.
@@ -277,11 +309,32 @@ type SelectedHandler = Box<dyn Fn(i64)>;
 /// Everything else the list asks of the page.
 pub enum ListEvent {
     /// Start (or open) a chat with a suggested contact or typed number.
-    Start { address: String, name: String },
-    Rename { thread_id: i64, address: String },
-    Delete { thread_id: i64 },
+    Start {
+        address: String,
+        name: String,
+    },
+    /// Start (or open) a group chat with these people.
+    StartGroup {
+        addresses: Vec<String>,
+    },
+    /// Pin, mute, archive or block a chat (its menu).
+    ChatAction {
+        thread_id: i64,
+        action: ChatAction,
+    },
+    /// Show the archived chats (true) or the others.
+    ShowArchived(bool),
+    Rename {
+        thread_id: i64,
+        address: String,
+    },
+    Delete {
+        thread_id: i64,
+    },
     /// Several chats selected with Shift/Ctrl+click.
-    DeleteMany { thread_ids: Vec<i64> },
+    DeleteMany {
+        thread_ids: Vec<i64>,
+    },
     ImportContacts,
     /// The search text changed; the page answers with [`ConversationList::set_hits`].
     Search(String),
@@ -301,6 +354,8 @@ pub struct ConversationList {
     /// "N selected · Cancel · Delete", while more than one chat is selected.
     selection_bar: gtk::ActionBar,
     selection_label: gtk::Label,
+    /// "Archived chats (N)" / "Back to chats", under the list.
+    archive_button: gtk::Button,
 }
 
 impl ConversationList {
@@ -319,7 +374,7 @@ impl ConversationList {
         search.set_hexpand(true);
         search_box.append(&search);
         let new_btn = gtk::Button::from_icon_name("list-add-symbolic");
-        new_btn.set_tooltip_text(Some("New message"));
+        new_btn.set_tooltip_text(Some("New message or group"));
         search_box.append(&new_btn);
         let import_btn = gtk::Button::from_icon_name("system-users-symbolic");
         import_btn.set_tooltip_text(Some("Import contacts"));
@@ -355,6 +410,15 @@ impl ConversationList {
         scroll_box.append(&contacts_list);
         scrolled.set_child(Some(&scroll_box));
 
+        let archive_button = gtk::Button::new();
+        archive_button.add_css_class("flat");
+        archive_button.set_margin_top(4);
+        archive_button.set_margin_bottom(4);
+        archive_button.set_margin_start(8);
+        archive_button.set_margin_end(8);
+        archive_button.set_visible(false);
+        widget.append(&archive_button);
+
         let selection_bar = gtk::ActionBar::new();
         let selection_label = gtk::Label::new(None);
         selection_label.add_css_class("heading");
@@ -378,6 +442,14 @@ impl ConversationList {
             contacts_list: contacts_list.clone(),
             selection_bar,
             selection_label,
+            archive_button: archive_button.clone(),
+        });
+        let weak = Rc::downgrade(&this);
+        archive_button.connect_clicked(move |_| {
+            if let Some(this) = weak.upgrade() {
+                let on = !this.state.borrow().archive_shown;
+                this.emit(ListEvent::ShowArchived(on));
+            }
         });
         let weak = Rc::downgrade(&this);
         delete_selected.connect_clicked(move |_| {
@@ -405,8 +477,12 @@ impl ConversationList {
             let state = g.current_event_state();
             let shift = state.contains(gtk::gdk::ModifierType::SHIFT_MASK);
             let ctrl = state.contains(gtk::gdk::ModifierType::CONTROL_MASK);
-            let Some(row) = this.listbox.row_at_y(y as i32) else { return };
-            let Some(tid) = this.thread_of(&row) else { return };
+            let Some(row) = this.listbox.row_at_y(y as i32) else {
+                return;
+            };
+            let Some(tid) = this.thread_of(&row) else {
+                return;
+            };
             g.set_state(gtk::EventSequenceState::Claimed);
             if !shift && !ctrl {
                 // A plain click: just this chat, opened. (In multiple mode
@@ -454,19 +530,19 @@ impl ConversationList {
         // Esc leaves multi-select, keeping the open chat selected.
         let keys = gtk::EventControllerKey::new();
         let weak = Rc::downgrade(&this);
-        keys.connect_key_pressed(move |_, key, _, _| {
-            match (key, weak.upgrade()) {
-                (gtk::gdk::Key::Escape, Some(this)) if this.selected_threads().len() > 1 => {
-                    this.collapse_selection();
-                    glib::Propagation::Stop
-                }
-                _ => glib::Propagation::Proceed,
+        keys.connect_key_pressed(move |_, key, _, _| match (key, weak.upgrade()) {
+            (gtk::gdk::Key::Escape, Some(this)) if this.selected_threads().len() > 1 => {
+                this.collapse_selection();
+                glib::Propagation::Stop
             }
+            _ => glib::Propagation::Proceed,
         });
         listbox.add_controller(keys);
-        let focus = search.clone();
+        let weak = Rc::downgrade(&this);
         new_btn.connect_clicked(move |_| {
-            focus.grab_focus();
+            if let Some(this) = weak.upgrade() {
+                this.new_chat_dialog();
+            }
         });
         let weak = Rc::downgrade(&this);
         import_btn.connect_clicked(move |_| {
@@ -479,7 +555,11 @@ impl ConversationList {
             let Some(this) = weak.upgrade() else { return };
             let (name, address) = {
                 let st = this.state.borrow();
-                let s = crate::core::contacts::contact_suggestions(&st.search.to_lowercase(), &st.contacts, &st.conversation_phones);
+                let s = crate::core::contacts::contact_suggestions(
+                    &st.search.to_lowercase(),
+                    &st.contacts,
+                    &st.conversation_phones,
+                );
                 match usize::try_from(row.index()).ok().and_then(|i| s.get(i).cloned()) {
                     Some(x) => x,
                     None => return,
@@ -494,7 +574,9 @@ impl ConversationList {
         let weak = Rc::downgrade(&this);
         right.connect_pressed(move |g, _, x, y| {
             let Some(this) = weak.upgrade() else { return };
-            let Some(row) = this.listbox.row_at_y(y as i32) else { return };
+            let Some(row) = this.listbox.row_at_y(y as i32) else {
+                return;
+            };
             let Some(tid) = usize::try_from(row.index()).ok().and_then(|i| this.state.borrow().order.get(i).copied())
             else {
                 return;
@@ -625,11 +707,42 @@ impl ConversationList {
         popover.set_parent(&self.listbox);
         popover.set_pointing_to(Some(&gtk::gdk::Rectangle::new(x as i32, y as i32, 1, 1)));
         let menu = gtk::Box::new(gtk::Orientation::Vertical, 2);
+        let flags = self.state.borrow().flags.get(&thread_id).copied().unwrap_or_default();
+        if flags.gm {
+            let items = [
+                if flags.pinned { ("Unpin", ChatAction::Unpin) } else { ("Pin to top", ChatAction::Pin) },
+                if flags.muted { ("Unmute", ChatAction::Unmute) } else { ("Mute", ChatAction::Mute) },
+                if flags.archived { ("Unarchive", ChatAction::Unarchive) } else { ("Archive", ChatAction::Archive) },
+                ("Block…", ChatAction::Block),
+                ("Report spam…", ChatAction::Spam),
+            ];
+            for (label, action) in items {
+                let b = gtk::Button::with_label(label);
+                b.add_css_class("flat");
+                if let Some(l) = b.child().and_downcast::<gtk::Label>() {
+                    l.set_xalign(0.0);
+                }
+                let (weak, pop) = (Rc::downgrade(self), popover.clone());
+                b.connect_clicked(move |_| {
+                    pop.popdown();
+                    if let Some(this) = weak.upgrade() {
+                        this.emit(ListEvent::ChatAction { thread_id, action });
+                    }
+                });
+                menu.append(&b);
+            }
+            menu.append(&gtk::Separator::new(gtk::Orientation::Horizontal));
+        }
         let rename = gtk::Button::with_label("Set contact name");
         rename.add_css_class("flat");
         let delete = gtk::Button::with_label("Delete conversation");
         delete.add_css_class("flat");
         delete.add_css_class("destructive-action");
+        for b in [&rename, &delete] {
+            if let Some(l) = b.child().and_downcast::<gtk::Label>() {
+                l.set_xalign(0.0);
+            }
+        }
         menu.append(&rename);
         menu.append(&delete);
         popover.set_child(Some(&menu));
@@ -656,6 +769,192 @@ impl ConversationList {
     }
 
     /// The contact names used for suggestions.
+    /// Pin, mute and archive state, and the archive button: `archive` is
+    /// (archived chats, showing them), or None when there is no archive
+    /// (KDE Connect).
+    pub fn set_flags(&self, flags: HashMap<i64, ChatFlags>, archive: Option<(usize, bool)>) {
+        let mut st = self.state.borrow_mut();
+        st.flags = flags;
+        st.archive_shown = archive.is_some_and(|a| a.1);
+        match archive {
+            Some((_, true)) => {
+                self.archive_button.set_label("← Back to chats");
+                self.archive_button.set_visible(true);
+            }
+            Some((n, false)) if n > 0 => {
+                self.archive_button.set_label(&format!("Archived chats ({n})"));
+                self.archive_button.set_visible(true);
+            }
+            _ => self.archive_button.set_visible(false),
+        }
+    }
+
+    /// "+": pick one person or several (a group) to text.
+    fn new_chat_dialog(self: &Rc<Self>) {
+        let window = adw::Window::new();
+        window.set_title(Some("New message"));
+        window.set_modal(true);
+        window.set_default_size(380, 520);
+        if let Some(root) = self.widget.root().and_downcast::<gtk::Window>() {
+            window.set_transient_for(Some(&root));
+        }
+        let column = gtk::Box::new(gtk::Orientation::Vertical, 0);
+        let header = adw::HeaderBar::new();
+        header.set_show_end_title_buttons(false);
+        let cancel = gtk::Button::with_label("Cancel");
+        header.pack_start(&cancel);
+        let start = gtk::Button::with_label("Start");
+        start.add_css_class("suggested-action");
+        start.set_sensitive(false);
+        header.pack_end(&start);
+        column.append(&header);
+
+        let chosen_box = gtk::FlowBox::new();
+        chosen_box.set_selection_mode(gtk::SelectionMode::None);
+        chosen_box.set_margin_start(12);
+        chosen_box.set_margin_end(12);
+        chosen_box.set_margin_top(8);
+        chosen_box.set_column_spacing(6);
+        chosen_box.set_row_spacing(6);
+        column.append(&chosen_box);
+        let entry = gtk::SearchEntry::new();
+        entry.set_placeholder_text(Some("Name or number (add several for a group)"));
+        entry.set_margin_start(12);
+        entry.set_margin_end(12);
+        entry.set_margin_top(8);
+        entry.set_margin_bottom(8);
+        column.append(&entry);
+        let scrolled = gtk::ScrolledWindow::new();
+        scrolled.set_vexpand(true);
+        scrolled.set_policy(gtk::PolicyType::Never, gtk::PolicyType::Automatic);
+        let list = gtk::ListBox::new();
+        list.set_selection_mode(gtk::SelectionMode::None);
+        list.set_activate_on_single_click(true);
+        list.add_css_class("navigation-sidebar");
+        scrolled.set_child(Some(&list));
+        column.append(&scrolled);
+        window.set_content(Some(&column));
+
+        // (name, number) chosen so far, and the suggestions shown.
+        let chosen: Rc<RefCell<Vec<(String, String)>>> = Rc::default();
+        let shown: Rc<RefCell<Vec<(String, String)>>> = Rc::default();
+        let contacts = self.state.borrow().contacts.clone();
+        let refresh_chosen: Rc<dyn Fn()> = {
+            let (chosen, chosen_box, start) = (chosen.clone(), chosen_box.clone(), start.clone());
+            Rc::new(move || {
+                while let Some(c) = chosen_box.first_child() {
+                    chosen_box.remove(&c);
+                }
+                for (name, number) in chosen.borrow().iter() {
+                    let chip = gtk::Box::new(gtk::Orientation::Horizontal, 2);
+                    chip.add_css_class("card");
+                    let l = gtk::Label::new(Some(if name.is_empty() { number } else { name }));
+                    l.set_margin_start(8);
+                    l.set_tooltip_text(Some(number));
+                    chip.append(&l);
+                    let x = gtk::Button::from_icon_name("window-close-symbolic");
+                    x.add_css_class("flat");
+                    x.add_css_class("circular");
+                    x.set_tooltip_text(Some("Remove"));
+                    let (chosen, again, start, number) =
+                        (chosen.clone(), chosen_box.clone(), start.clone(), number.clone());
+                    x.connect_clicked(move |b| {
+                        chosen.borrow_mut().retain(|(_, n)| *n != number);
+                        // The chip (inside its FlowBox child) goes.
+                        if let Some(child) = b.parent().and_then(|chip| chip.parent()) {
+                            again.remove(&child);
+                        }
+                        let n = chosen.borrow().len();
+                        start.set_sensitive(n > 0);
+                        start.set_label(if n > 1 { "Start group" } else { "Start" });
+                    });
+                    chip.append(&x);
+                    chosen_box.append(&chip);
+                }
+                start.set_sensitive(!chosen.borrow().is_empty());
+                start.set_label(if chosen.borrow().len() > 1 { "Start group" } else { "Start" });
+            })
+        };
+        let refresh_list: Rc<dyn Fn(&str)> = {
+            let (list, shown) = (list.clone(), shown.clone());
+            Rc::new(move |q: &str| {
+                while let Some(r) = list.row_at_index(0) {
+                    list.remove(&r);
+                }
+                let found = crate::core::contacts::contact_suggestions(&q.to_lowercase(), &contacts, &[]);
+                for (name, phone) in &found {
+                    list.append(&suggestion_row(name, phone));
+                }
+                *shown.borrow_mut() = found;
+            })
+        };
+        let add: Rc<dyn Fn((String, String))> = {
+            let (chosen, entry, refresh_chosen) = (chosen.clone(), entry.clone(), refresh_chosen.clone());
+            Rc::new(move |(name, number): (String, String)| {
+                let n = crate::core::contacts::normalize_phone(&number);
+                let dup = chosen.borrow().iter().any(|(_, x)| crate::core::contacts::normalize_phone(x) == n);
+                if !dup && !number.trim().is_empty() {
+                    chosen.borrow_mut().push((name, number));
+                }
+                entry.set_text("");
+                refresh_chosen();
+            })
+        };
+        {
+            let refresh_list = refresh_list.clone();
+            entry.connect_search_changed(move |e| refresh_list(&e.text()));
+        }
+        {
+            let (add, shown) = (add.clone(), shown.clone());
+            list.connect_row_activated(move |_, row| {
+                let pick = usize::try_from(row.index()).ok().and_then(|i| shown.borrow().get(i).cloned());
+                if let Some(p) = pick {
+                    add(p);
+                }
+            });
+        }
+        {
+            let (add, shown) = (add.clone(), shown.clone());
+            entry.connect_activate(move |_| {
+                let first = shown.borrow().first().cloned();
+                if let Some(p) = first {
+                    add(p);
+                }
+            });
+        }
+        {
+            let w = window.clone();
+            cancel.connect_clicked(move |_| w.close());
+        }
+        {
+            let (w, weak, chosen) = (window.clone(), Rc::downgrade(self), chosen.clone());
+            start.connect_clicked(move |_| {
+                let people = chosen.borrow().clone();
+                w.close();
+                let Some(this) = weak.upgrade() else { return };
+                match people.as_slice() {
+                    [] => {}
+                    [(name, number)] => this.emit(ListEvent::Start { address: number.clone(), name: name.clone() }),
+                    _ => this.emit(ListEvent::StartGroup { addresses: people.iter().map(|p| p.1.clone()).collect() }),
+                }
+            });
+        }
+        let esc = gtk::EventControllerKey::new();
+        {
+            let w = window.clone();
+            esc.connect_key_pressed(move |_, key, _, _| {
+                if key == gtk::gdk::Key::Escape {
+                    w.close();
+                    return glib::Propagation::Stop;
+                }
+                glib::Propagation::Proceed
+            });
+        }
+        window.add_controller(esc);
+        window.present();
+        entry.grab_focus();
+    }
+
     pub fn set_contacts(&self, contacts: HashMap<String, String>) {
         self.state.borrow_mut().contacts = contacts;
         self.update_suggestions();
@@ -679,11 +978,15 @@ impl ConversationList {
         let tid = {
             // Busy means the list itself is moving rows (GTK emits
             // row-selected synchronously from remove/insert).
-            let Ok(st) = self.state.try_borrow() else { return };
+            let Ok(st) = self.state.try_borrow() else {
+                return;
+            };
             if st.rebuilding {
                 return;
             }
-            let Some(&tid) = usize::try_from(row.index()).ok().and_then(|i| st.order.get(i)) else { return };
+            let Some(&tid) = usize::try_from(row.index()).ok().and_then(|i| st.order.get(i)) else {
+                return;
+            };
             if st.last_emitted == Some(tid) {
                 return;
             }
@@ -749,10 +1052,11 @@ impl ConversationList {
     /// (Building all 326 rows at once stalled startup 496 ms on the laptop.)
     pub fn set_conversations(&self, conversations: &[&Conversation]) -> bool {
         let mut convs: Vec<&Conversation> = conversations.to_vec();
-        convs.sort_by_key(|c| std::cmp::Reverse(c.sort_key()));
-
         let mut guard = self.state.borrow_mut();
         let st = &mut *guard;
+        let flags_of = |tid: i64| st.flags.get(&tid).copied().unwrap_or_default();
+        // Pinned chats first, then newest first.
+        convs.sort_by_key(|c| std::cmp::Reverse((flags_of(c.thread_id).pinned, c.sort_key())));
         st.rebuilding = true;
         let selected: Vec<i64> = self
             .listbox
@@ -788,7 +1092,8 @@ impl ConversationList {
                 }
                 budget -= 1;
             }
-            let summary = Summary::of(c);
+            let flags = st.flags.get(&tid).copied().unwrap_or_default();
+            let summary = Summary::of(c, flags);
             // A different avatar means a new row.
             if st.rows.get(&tid).is_some_and(|r| r.summary.avatar_key != summary.avatar_key)
                 && let Some(old) = st.rows.remove(&tid)
@@ -805,7 +1110,7 @@ impl ConversationList {
                     }
                 }
                 None => {
-                    let row = Row::new(c);
+                    let row = Row::new(c, flags);
                     self.listbox.insert(&row.row, pos as i32);
                     st.order.insert(pos, tid);
                     st.rows.insert(tid, row);

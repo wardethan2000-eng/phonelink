@@ -21,18 +21,15 @@ use super::notifications_model::{NoteEvent, NotificationsModel, Props};
 use super::thread_view::{BubbleActions, ThreadView};
 use crate::core::attachments::full_cache_dir;
 use crate::core::contacts::load_contact_map;
-use crate::core::message::parse_message;
 use crate::core::contacts::notification_message_text;
+use crate::core::message::parse_message;
 use crate::core::messages::{Effect, GmDownload, Messages, ReplyableNotification};
 use crate::core::models::Device;
 use crate::core::settings::Settings;
 use crate::core::store::MessageStore;
 use crate::core::sync::{self, Action, SIGNAL_BATCH_SIZE};
 use crate::dbus::signals::{self, Subscription};
-use crate::dbus::{
-    Client, IFACE_CONTACTS, IFACE_CONVERSATIONS, IFACE_SHARE, IFACE_TELEPHONY, device_path,
-    variant,
-};
+use crate::dbus::{Client, IFACE_CONTACTS, IFACE_CONVERSATIONS, IFACE_SHARE, IFACE_TELEPHONY, device_path, variant};
 
 /// Google Messages chats/messages merged per idle callback.
 const GM_BATCH_SIZE: usize = 60;
@@ -116,6 +113,8 @@ struct Inner {
     /// per idle callback (about 240 chats arrive at connect).
     gm_queue: VecDeque<crate::core::gm::Incoming>,
     gm_draining: bool,
+    /// Clears "… is typing" when it runs out.
+    typing_timer: Option<glib::SourceId>,
 }
 
 impl Inner {
@@ -152,11 +151,20 @@ pub struct MessagesPage {
     phone_read: RefCell<std::collections::HashMap<String, i64>>,
     /// An apply of `phone_read` is queued on idle.
     phone_read_queued: std::cell::Cell<bool>,
+    /// Chats opened while the window wasn't in front: marked read on the
+    /// phone (which tells the sender) once it is, and only if still open.
+    unseen_reads: RefCell<std::collections::HashSet<i64>>,
+    /// The window's focus is watched (set once the page is in a window).
+    watching_window: std::cell::Cell<bool>,
     inner: RefCell<Inner>,
 }
 
 impl MessagesPage {
-    pub fn new(store: MessageStore, settings: Rc<RefCell<Settings>>, notifications: Rc<NotificationsModel>) -> Rc<Self> {
+    pub fn new(
+        store: MessageStore,
+        settings: Rc<RefCell<Settings>>,
+        notifications: Rc<NotificationsModel>,
+    ) -> Rc<Self> {
         let stack = gtk::Stack::new();
         stack.set_vexpand(true);
         stack.set_hexpand(true);
@@ -240,6 +248,8 @@ impl MessagesPage {
             gm: RefCell::default(),
             phone_read: RefCell::default(),
             phone_read_queued: Default::default(),
+            unseen_reads: RefCell::default(),
+            watching_window: Default::default(),
             inner: RefCell::new(Inner {
                 m: Messages::new(),
                 store,
@@ -262,15 +272,11 @@ impl MessagesPage {
                 kde_device: None,
                 gm_queue: VecDeque::new(),
                 gm_draining: false,
+                typing_timer: None,
             }),
         });
         *download_target.borrow_mut() = Rc::downgrade(&this);
-        let weak = Rc::downgrade(&this);
-        *this.gm.borrow_mut() = super::gm_link::GmLink::start(move |e| {
-            if let Some(this) = weak.upgrade() {
-                this.gm_event(e);
-            }
-        });
+        this.start_gm_link();
         let weak = Rc::downgrade(&this);
         this.gm_banner.connect_button_clicked(move |_| {
             if let Some(this) = weak.upgrade() {
@@ -312,9 +318,31 @@ impl MessagesPage {
             }
         });
         let weak = Rc::downgrade(&this);
-        this.thread.connect_send(move |tid, text, picture, reply_to| {
-            let Some(this) = weak.upgrade() else { return false };
-            this.send(tid, text, picture, reply_to)
+        this.thread.connect_send(move |tid, text, files, reply_to| {
+            let Some(this) = weak.upgrade() else {
+                return false;
+            };
+            this.send(tid, text, files, reply_to)
+        });
+        let weak = Rc::downgrade(&this);
+        this.thread.connect_older(move |tid| {
+            let Some(this) = weak.upgrade() else { return };
+            let effects = this.inner.borrow_mut().m.gm_older(tid);
+            this.run(effects);
+        });
+        let weak = Rc::downgrade(&this);
+        this.thread.connect_typing(move |tid| {
+            let Some(this) = weak.upgrade() else { return };
+            let effects = this.inner.borrow_mut().m.gm_typing_out(tid, now());
+            this.run(effects);
+        });
+        // Read receipts wait until the window is in front (see `unseen_reads`).
+        let weak = Rc::downgrade(&this);
+        this.widget.connect_map(move |_| {
+            if let Some(this) = weak.upgrade() {
+                this.watch_window();
+                this.flush_unseen_reads();
+            }
         });
         let weak = Rc::downgrade(&this);
         this.list.connect_selected(move |tid| {
@@ -465,7 +493,9 @@ impl MessagesPage {
         }
         let weak = Rc::downgrade(self);
         subs.push(signals::subscribe(bus, &path, IFACE_CONVERSATIONS, "conversationLoaded", move |p| {
-            let (Some(this), Some(tid)) = (weak.upgrade(), variant::first_int(p)) else { return };
+            let (Some(this), Some(tid)) = (weak.upgrade(), variant::first_int(p)) else {
+                return;
+            };
             let effects = this.inner.borrow_mut().m.on_conversation_loaded(tid, now());
             // Our own request (a gap fill, or its replay) finishing: the
             // messages come as signals, so there is nothing to reload. A
@@ -506,7 +536,9 @@ impl MessagesPage {
         }));
         let weak = Rc::downgrade(self);
         subs.push(signals::subscribe(bus, &path, IFACE_CONVERSATIONS, "conversationRemoved", move |p| {
-            let (Some(this), Some(tid)) = (weak.upgrade(), variant::first_int(p)) else { return };
+            let (Some(this), Some(tid)) = (weak.upgrade(), variant::first_int(p)) else {
+                return;
+            };
             let effects = {
                 let mut guard = this.inner.borrow_mut();
                 let i = &mut *guard;
@@ -578,7 +610,9 @@ impl MessagesPage {
         if let Some(id) = i.timer.take() {
             id.remove();
         }
-        let Some(deadline) = i.m.catch_up.next_deadline() else { return };
+        let Some(deadline) = i.m.catch_up.next_deadline() else {
+            return;
+        };
         let delay = Duration::from_secs_f64((deadline - now()).max(0.0));
         let weak: Weak<Self> = Rc::downgrade(self);
         i.timer = Some(glib::timeout_add_local_once(delay, move || {
@@ -602,14 +636,7 @@ impl MessagesPage {
                 Effect::RefreshList => refresh = true,
                 Effect::Sync(_) if self.inner.borrow().m.is_gm() => {}
                 Effect::Sync(action) => self.sync(action),
-                Effect::MarkRead { thread_id } => {
-                    self.mark_read_on_google(thread_id);
-                    if !self.inner.borrow().m.is_gm() {
-                        self.with_device(move |c, d| async move {
-                            c.mark_conversation_as_read(&d, thread_id).await;
-                        })
-                    }
-                }
+                Effect::MarkRead { thread_id } => self.mark_read(thread_id),
                 Effect::GmSend { thread_id: _, conv, text, file, tmp_id, reply_to } => {
                     // Show it at once as "Sending"; the phone's copy takes
                     // over the same bubble.
@@ -626,9 +653,20 @@ impl MessagesPage {
                     self.run(shown);
                     self.gm_send(conv, text, file, tmp_id, reply_to);
                 }
-                Effect::GmReact { thread_id, conv, msg, emoji, action } => self.gm_react(thread_id, conv, msg, emoji, action),
+                Effect::GmReact { thread_id, conv, msg, emoji, action } => {
+                    self.gm_react(thread_id, conv, msg, emoji, action)
+                }
                 Effect::GmFetch { thread_id } => self.gm_fetch(thread_id),
-                Effect::GmSendNew { addresses, text } => self.gm_send_new(addresses, text),
+                Effect::GmSendNew { addresses, text, attachments } => self.gm_send_new(addresses, text, attachments),
+                Effect::GmTyping { conv } => {
+                    if let Some(gm) = self.gm.borrow().clone() {
+                        gm.request(|id| crate::core::gm::typing_request(id, &conv), |_| {});
+                    }
+                }
+                Effect::GmFetchOlder { thread_id, conv, cursor } => self.gm_fetch_older(thread_id, conv, cursor),
+                Effect::GmUpdateChat { thread_id, conv, change } => self.gm_update_chat(thread_id, conv, change),
+                Effect::Typing(tid) => self.show_typing(tid),
+                Effect::MoreHistory(tid) => self.show_more_history(tid),
                 Effect::Redraw(tid) => {
                     {
                         let i = self.inner.borrow();
@@ -638,7 +676,10 @@ impl MessagesPage {
                     }
                     self.show_extras(tid);
                 }
-                Effect::ShowThread(tid) => self.show_thread(tid),
+                Effect::ShowThread(tid) => {
+                    self.show_thread(tid);
+                    self.after_open(tid);
+                }
                 Effect::ShowEmpty => self.thread.show_empty(),
                 Effect::Toast(text) => self.toast(text),
                 Effect::Reply { conversation_id, text, attachments } => {
@@ -654,9 +695,15 @@ impl MessagesPage {
                 Effect::ReplyViaNotification { thread_id, reply_id, text } => {
                     let weak = Rc::downgrade(self);
                     self.with_device(move |c, d| async move {
-                        let Err(e) = c.try_send_notification_reply_by_id(&d, &reply_id, &text).await else { return };
+                        let Err(e) = c.try_send_notification_reply_by_id(&d, &reply_id, &text).await else {
+                            return;
+                        };
                         let refused = crate::dbus::client::is_definite_refusal(&e);
-                        log::warn!("notification reply failed ({}): {}", if refused { "refused" } else { "unclear" }, e.message());
+                        log::warn!(
+                            "notification reply failed ({}): {}",
+                            if refused { "refused" } else { "unclear" },
+                            e.message()
+                        );
                         let Some(this) = weak.upgrade() else { return };
                         let effects = this.inner.borrow_mut().m.notification_reply_failed(thread_id, &text, refused);
                         this.run(effects);
@@ -673,6 +720,8 @@ impl MessagesPage {
             let more = {
                 let i = self.inner.borrow();
                 let _t = super::perf::span("refreshing the conversation list");
+                self.list
+                    .set_flags(i.m.chat_flags(), i.m.is_gm().then(|| (i.m.archived_count(), i.m.showing_archived())));
                 self.list.set_conversations(&i.m.visible(&*i.settings.borrow()))
             };
             // Matches follow new and removed messages.
@@ -703,8 +752,8 @@ impl MessagesPage {
             Action::ReplayFromDaemon { thread_id, start, end } => {
                 self.inner.borrow_mut().recent_requests.insert(thread_id, now());
                 self.with_device(move |c, d| async move {
-                let clamp = |n: i64| i32::try_from(n).unwrap_or(i32::MAX);
-                c.request_conversation(&d, thread_id, clamp(start), clamp(end)).await;
+                    let clamp = |n: i64| i32::try_from(n).unwrap_or(i32::MAX);
+                    c.request_conversation(&d, thread_id, clamp(start), clamp(end)).await;
                 })
             }
         }
@@ -729,6 +778,18 @@ impl MessagesPage {
                 if effects.is_empty() {
                     self.toast(crate::core::messages::TOAST_NOT_CONNECTED);
                 }
+                self.run(effects);
+            }
+            ListEvent::StartGroup { addresses } => {
+                let effects = self.inner.borrow_mut().m.open_group(&addresses, "");
+                if effects.is_empty() {
+                    self.toast(crate::core::messages::TOAST_NOT_CONNECTED);
+                }
+                self.run(effects);
+            }
+            ListEvent::ChatAction { thread_id, action } => self.chat_action(thread_id, action),
+            ListEvent::ShowArchived(on) => {
+                let effects = self.inner.borrow_mut().m.set_show_archived(on);
                 self.run(effects);
             }
             ListEvent::Rename { thread_id, address } => self.rename_dialog(thread_id, address),
@@ -840,7 +901,9 @@ impl MessagesPage {
                 self.inner.borrow_mut().m.gm_me = me.clone();
                 self.gm_banner.set_revealed(false);
                 // Linked: Google Messages becomes the tab's source.
-                let Some(dev) = crate::core::gm::device_id(&me) else { return };
+                let Some(dev) = crate::core::gm::device_id(&me) else {
+                    return;
+                };
                 if self.inner.borrow().m.device_id() != Some(dev.as_str()) {
                     self.switch_to_gm(&dev);
                 }
@@ -856,7 +919,16 @@ impl MessagesPage {
                 self.phone_read.borrow_mut().insert(c.chat, c.last_ts_ms);
                 self.apply_phone_read();
             }
-            Incoming::Message(_) | Incoming::Reply(_) => {}
+            Incoming::Typing { conv, from, typing } if gm_source => {
+                let effects = {
+                    let mut guard = self.inner.borrow_mut();
+                    let i = &mut *guard;
+                    let tid = i.store.gm_local_id("conv", &conv);
+                    i.m.gm_typing(tid, &from, typing, now())
+                };
+                self.run(effects);
+            }
+            Incoming::Message(_) | Incoming::Reply(_) | Incoming::Typing { .. } => {}
             Incoming::Inactive => {
                 if gm_source {
                     self.show_gm_banner("Google Messages is open in another browser", Some("Use here"));
@@ -881,6 +953,58 @@ impl MessagesPage {
         }
     }
 
+    /// Start the Google Messages link if it is linked (and not running).
+    fn start_gm_link(self: &Rc<Self>) {
+        let existing = self.gm.borrow().clone();
+        if let Some(gm) = existing {
+            gm.resume();
+            return;
+        }
+        let weak = Rc::downgrade(self);
+        *self.gm.borrow_mut() = super::gm_link::GmLink::start(move |e| {
+            if let Some(this) = weak.upgrade() {
+                this.gm_event(e);
+            }
+        });
+    }
+
+    /// Settings' Link / Unlink.
+    pub fn gm_controls(self: &Rc<Self>) -> super::settings_page::GmControls {
+        let (w1, w2) = (Rc::downgrade(self), Rc::downgrade(self));
+        super::settings_page::GmControls {
+            linked: Rc::new(crate::core::phone_delete::available),
+            linked_now: Rc::new(move || {
+                if let Some(this) = w1.upgrade() {
+                    this.show_gm_banner("Connecting to Google Messages…", None);
+                    this.start_gm_link();
+                }
+            }),
+            unlink: Rc::new(move |done| {
+                let Some(this) = w2.upgrade() else { return };
+                this.unlink_google(done);
+            }),
+        }
+    }
+
+    /// Stop the link, unlink on the phone, and go back to KDE Connect.
+    fn unlink_google(self: &Rc<Self>, done: super::settings_page::UnlinkDone) {
+        let weak = Rc::downgrade(self);
+        let after_stop = move || {
+            super::gm_pair::unpair(move |ok, told| {
+                if let Some(this) = weak.upgrade() {
+                    this.switch_to_kde();
+                    this.gm_banner.set_revealed(false);
+                }
+                done(ok, told);
+            });
+        };
+        let gm = self.gm.borrow().clone();
+        match gm {
+            Some(gm) => gm.stop(after_stop),
+            None => after_stop(),
+        }
+    }
+
     fn show_gm_banner(&self, title: &str, button: Option<&str>) {
         self.gm_banner.set_title(title);
         self.gm_banner.set_button_label(button);
@@ -888,7 +1012,9 @@ impl MessagesPage {
     }
 
     fn gm_banner_clicked(self: &Rc<Self>) {
-        let Some(gm) = self.gm.borrow().clone() else { return };
+        let Some(gm) = self.gm.borrow().clone() else {
+            return;
+        };
         let weak = Rc::downgrade(self);
         gm.request(crate::core::gm::set_active_request, move |r| {
             let Some(this) = weak.upgrade() else { return };
@@ -994,14 +1120,24 @@ impl MessagesPage {
                         }
                         Incoming::Message(msg) => {
                             let tid = store.gm_local_id("conv", &msg.conv);
-                            let uid = match (store.gm_known("msg", &msg.msg), m.gm_pending_uid(msg, tid)) {
-                (Some(uid), _) => uid,
-                (None, Some(uid)) => {
-                    store.gm_alias("msg", &msg.msg, uid);
-                    uid
-                }
-                (None, None) => store.gm_local_id("msg", &msg.msg),
-            };
+                            let known = store.gm_known("msg", &msg.msg);
+                            // Seen before (an update, or the full-size picture
+                            // for a preview): never unread again.
+                            let again;
+                            let msg = if known.is_some() && !msg.old {
+                                again = crate::core::gm::GmMessage { old: true, ..msg.clone() };
+                                &again
+                            } else {
+                                msg
+                            };
+                            let uid = match (known, m.gm_pending_uid(msg, tid)) {
+                                (Some(uid), _) => uid,
+                                (None, Some(uid)) => {
+                                    store.gm_alias("msg", &msg.msg, uid);
+                                    uid
+                                }
+                                (None, None) => store.gm_local_id("msg", &msg.msg),
+                            };
                             effects.extend(m.gm_message(msg, tid, uid, store, settings, t));
                         }
                         _ => {}
@@ -1030,7 +1166,14 @@ impl MessagesPage {
     }
 
     /// Send a text through Google Messages; its echo arrives as a message.
-    fn gm_send(self: &Rc<Self>, conv: String, text: String, file: Option<String>, tmp_id: String, reply_to: Option<String>) {
+    fn gm_send(
+        self: &Rc<Self>,
+        conv: String,
+        text: String,
+        file: Option<String>,
+        tmp_id: String,
+        reply_to: Option<String>,
+    ) {
         let gm = self.gm.borrow().clone();
         let weak = Rc::downgrade(self);
         let tmp = tmp_id.clone();
@@ -1100,9 +1243,15 @@ impl MessagesPage {
     /// Reply on bubble `uid`: the compose bar says what it answers.
     fn start_reply(&self, uid: i64) {
         let i = self.inner.borrow();
-        let Some(tid) = i.m.active_thread() else { return };
-        let Some(e) = i.m.gm_extras(tid, &i.store).remove(&uid).filter(|e| !e.msg_id.is_empty()) else { return };
-        let Some(m) = i.m.index.get(tid).and_then(|c| c.messages.iter().find(|m| m.uid == uid)) else { return };
+        let Some(tid) = i.m.active_thread() else {
+            return;
+        };
+        let Some(e) = i.m.gm_extras(tid, &i.store).remove(&uid).filter(|e| !e.msg_id.is_empty()) else {
+            return;
+        };
+        let Some(m) = i.m.index.get(tid).and_then(|c| c.messages.iter().find(|m| m.uid == uid)) else {
+            return;
+        };
         let author = if m.msg_type == crate::core::models::MSG_TYPE_RECEIVED {
             crate::core::contacts::resolve_name(&i.m.contact_map, &m.address)
         } else {
@@ -1125,7 +1274,7 @@ impl MessagesPage {
     }
 
     /// A text to a new chat: have the phone find or make it, then send.
-    fn gm_send_new(self: &Rc<Self>, addresses: Vec<String>, text: String) {
+    fn gm_send_new(self: &Rc<Self>, addresses: Vec<String>, text: String, attachments: Vec<String>) {
         let gm = self.gm.borrow().clone();
         let weak = Rc::downgrade(self);
         let sent = gm.is_some_and(|gm| {
@@ -1146,7 +1295,7 @@ impl MessagesPage {
                             let mut guard = this.inner.borrow_mut();
                             let i = &mut *guard;
                             let tid = i.store.gm_local_id("conv", &r.conv);
-                            i.m.gm_opened(tid, &r.conv, &text)
+                            i.m.gm_opened(tid, &r.conv, &text, attachments)
                         };
                         this.run(effects);
                     });
@@ -1160,10 +1309,13 @@ impl MessagesPage {
 
     /// Fetch a chat's newest messages (each of its Google chats).
     fn gm_fetch(self: &Rc<Self>, thread_id: i64) {
-        let Some(gm) = self.gm.borrow().clone() else { return };
+        let Some(gm) = self.gm.borrow().clone() else {
+            return;
+        };
         let convs = self.inner.borrow().m.gm_convs(thread_id);
         for conv in convs {
             let weak = Rc::downgrade(self);
+            let conv_for_page = conv.clone();
             gm.request(
                 |id| crate::core::gm::fetch_request(id, &conv, GM_FETCH_COUNT, None),
                 move |r| {
@@ -1172,12 +1324,237 @@ impl MessagesPage {
                         log::info!("Google Messages fetch: {} {}", r.error, r.message);
                         return;
                     }
+                    let effects =
+                        this.inner.borrow_mut().m.gm_page(&conv_for_page, r.cursor.clone(), false, r.messages.len());
                     for mut m in r.messages {
                         m.old = true;
                         this.gm_enqueue(crate::core::gm::Incoming::Message(m));
                     }
+                    this.run(effects);
                 },
             );
+        }
+    }
+
+    /// An older page of a chat, as the user scrolls back.
+    fn gm_fetch_older(self: &Rc<Self>, thread_id: i64, conv: String, cursor: crate::core::gm::Cursor) {
+        let Some(gm) = self.gm.borrow().clone() else {
+            return;
+        };
+        let weak = Rc::downgrade(self);
+        let before = cursor.clone();
+        let sent = gm.request(|id| crate::core::gm::fetch_request(id, &conv, GM_FETCH_COUNT, Some(&before)), {
+            let conv = conv.clone();
+            move |r| {
+                let Some(this) = weak.upgrade() else { return };
+                if !r.ok {
+                    log::info!("Google Messages older page: {} {}", r.error, r.message);
+                }
+                // A failed page ends paging for now (the cursor stays).
+                let cursor = if r.ok { r.cursor.clone() } else { Some(cursor) };
+                let got = if r.ok { r.messages.len() } else { 1 };
+                for mut m in r.messages {
+                    m.old = true;
+                    this.gm_enqueue(crate::core::gm::Incoming::Message(m));
+                }
+                let effects = this.inner.borrow_mut().m.gm_page(&conv, cursor, true, got);
+                this.run(effects);
+            }
+        });
+        if !sent {
+            let effects = self.inner.borrow_mut().m.gm_page(&conv, None, true, 0);
+            self.run(effects);
+        }
+        self.show_more_history(thread_id);
+    }
+
+    /// Archive, mute or block a chat on the phone.
+    fn gm_update_chat(self: &Rc<Self>, thread_id: i64, conv: String, change: crate::core::gm::ChatChange) {
+        let gm = self.gm.borrow().clone();
+        let weak = Rc::downgrade(self);
+        let done = move |ok: bool, why: String| {
+            let Some(this) = weak.upgrade() else { return };
+            if !ok {
+                log::warn!("Google Messages: {} refused: {why}", change.as_str());
+            }
+            let effects = {
+                let mut guard = this.inner.borrow_mut();
+                let i = &mut *guard;
+                i.m.gm_chat_changed(thread_id, change, ok, &i.store)
+            };
+            this.run(effects);
+        };
+        let done = Rc::new(RefCell::new(Some(done)));
+        let d = done.clone();
+        let sent = gm.is_some_and(|gm| {
+            gm.request(
+                |id| crate::core::gm::update_chat_request(id, &conv, change),
+                move |r| {
+                    if let Some(f) = d.borrow_mut().take() {
+                        f(r.ok, format!("{} {}", r.error, r.message));
+                    }
+                },
+            )
+        });
+        if !sent && let Some(f) = done.borrow_mut().take() {
+            f(false, "the link isn't running".into());
+        }
+    }
+
+    /// A chat's menu: pin, mute, archive, block.
+    fn chat_action(self: &Rc<Self>, thread_id: i64, action: crate::core::messages::ChatAction) {
+        use crate::core::messages::ChatAction;
+        if matches!(action, ChatAction::Block | ChatAction::Spam) {
+            self.block_dialog(thread_id, action == ChatAction::Spam);
+            return;
+        }
+        let effects = {
+            let mut guard = self.inner.borrow_mut();
+            let i = &mut *guard;
+            i.m.chat_action(thread_id, action, &i.store)
+        };
+        self.run(effects);
+    }
+
+    /// Blocking is hard to undo from here (blocked chats leave the list):
+    /// ask first.
+    fn block_dialog(self: &Rc<Self>, thread_id: i64, spam: bool) {
+        use crate::core::messages::ChatAction;
+        let name = self
+            .inner
+            .borrow()
+            .m
+            .index
+            .get(thread_id)
+            .map(|c| if c.display_name.is_empty() { c.address.clone() } else { c.display_name.clone() });
+        let Some(name) = name else { return };
+        let (heading, body, button) = if spam {
+            (
+                format!("Report {name} as spam?"),
+                "Google Messages blocks them and reports the chat as spam. The chat leaves this list; unblock it on your phone (Google Messages → Spam & blocked).",
+                "Report spam",
+            )
+        } else {
+            (
+                format!("Block {name}?"),
+                "You won't get texts from them on your phone. The chat leaves this list; unblock it on your phone (Google Messages → Spam & blocked).",
+                "Block",
+            )
+        };
+        let dialog = adw::MessageDialog::new(self.parent_window().as_ref(), Some(&heading), Some(body));
+        dialog.add_response("cancel", "Cancel");
+        dialog.add_response("block", button);
+        dialog.set_response_appearance("block", adw::ResponseAppearance::Destructive);
+        dialog.set_default_response(Some("cancel"));
+        dialog.set_close_response("cancel");
+        let weak = Rc::downgrade(self);
+        dialog.connect_response(None, move |_, response| {
+            if response != "block" {
+                return;
+            }
+            let Some(this) = weak.upgrade() else { return };
+            let action = if spam { ChatAction::Spam } else { ChatAction::Block };
+            let effects = {
+                let mut guard = this.inner.borrow_mut();
+                let i = &mut *guard;
+                i.m.chat_action(thread_id, action, &i.store)
+            };
+            this.run(effects);
+        });
+        dialog.present();
+    }
+
+    /// "… is typing" under the open chat, cleared when it runs out.
+    fn show_typing(self: &Rc<Self>, tid: i64) {
+        let label = {
+            let i = self.inner.borrow();
+            if i.m.active_thread().map(|a| i.m.index.primary_for(a)) != Some(tid) {
+                return;
+            }
+            i.m.typing_label(tid, now())
+        };
+        if let Some(old) = self.inner.borrow_mut().typing_timer.take() {
+            old.remove();
+        }
+        self.thread.set_typing(label.as_ref().map(|(t, _)| t.as_str()));
+        if let Some((_, until)) = label {
+            let wait = Duration::from_secs_f64((until - now()).max(0.0) + 0.05);
+            let weak = Rc::downgrade(self);
+            let id = glib::timeout_add_local_once(wait, move || {
+                let Some(this) = weak.upgrade() else { return };
+                this.inner.borrow_mut().typing_timer = None;
+                this.show_typing(tid);
+            });
+            self.inner.borrow_mut().typing_timer = Some(id);
+        }
+    }
+
+    /// Tell the open chat whether the phone has older messages.
+    fn show_more_history(&self, tid: i64) {
+        let (more, loading) = {
+            let i = self.inner.borrow();
+            if i.m.active_thread() != Some(tid) {
+                return;
+            }
+            (i.m.gm_more_history(tid), i.m.gm_loading_older(tid))
+        };
+        self.thread.set_more_history(tid, more, loading);
+    }
+
+    /// Mark a chat read here and on the phone. On the phone that tells the
+    /// sender ("Read"), so it waits until the window is in front.
+    fn mark_read(self: &Rc<Self>, thread_id: i64) {
+        if !self.in_front() {
+            self.unseen_reads.borrow_mut().insert(thread_id);
+            return;
+        }
+        self.mark_read_on_google(thread_id);
+        if !self.inner.borrow().m.is_gm() {
+            self.with_device(move |c, d| async move {
+                c.mark_conversation_as_read(&d, thread_id).await;
+            })
+        }
+    }
+
+    /// Is the Messages tab on screen in the focused window?
+    fn in_front(&self) -> bool {
+        self.widget.is_mapped() && self.parent_window().is_some_and(|w| w.is_active())
+    }
+
+    fn watch_window(self: &Rc<Self>) {
+        if self.watching_window.get() {
+            return;
+        }
+        let Some(window) = self.parent_window() else {
+            return;
+        };
+        self.watching_window.set(true);
+        let weak = Rc::downgrade(self);
+        window.connect_is_active_notify(move |w| {
+            if w.is_active()
+                && let Some(this) = weak.upgrade()
+            {
+                this.flush_unseen_reads();
+            }
+        });
+    }
+
+    /// The window came to the front: send the reads still waiting, for the
+    /// chat still open (others were left unseen).
+    fn flush_unseen_reads(self: &Rc<Self>) {
+        if !self.in_front() {
+            return;
+        }
+        let waiting: Vec<i64> = self.unseen_reads.borrow_mut().drain().collect();
+        let active = {
+            let i = self.inner.borrow();
+            i.m.active_thread().map(|a| i.m.index.primary_for(a))
+        };
+        for tid in waiting {
+            let primary = self.inner.borrow().m.index.primary_for(tid);
+            if Some(primary) == active {
+                self.mark_read(tid);
+            }
         }
     }
 
@@ -1206,7 +1583,9 @@ impl MessagesPage {
 
     /// Opened on the laptop: mark it read on the phone too.
     fn mark_read_on_google(&self, thread_id: i64) {
-        let Some(gm) = self.gm.borrow().clone() else { return };
+        let Some(gm) = self.gm.borrow().clone() else {
+            return;
+        };
         let convs = self.inner.borrow().m.gm_convs(thread_id);
         if !convs.is_empty() {
             for conv in convs {
@@ -1221,7 +1600,9 @@ impl MessagesPage {
             }
             return;
         }
-        let Some(key) = self.inner.borrow().m.gm_chat_key(thread_id) else { return };
+        let Some(key) = self.inner.borrow().m.gm_chat_key(thread_id) else {
+            return;
+        };
         gm.request(
             |id| crate::core::gm::mark_read_request(id, &key),
             |r| {
@@ -1304,10 +1685,11 @@ impl MessagesPage {
             let can_delete_on_phone = kde_deletes || google_deletes;
             let (heading, mut body) = if let [thread_id] = thread_ids.as_slice() {
                 let i = this.inner.borrow();
-                let name = i.m.index
-                    .get(*thread_id)
-                    .map(|c| if c.display_name.is_empty() { c.address.clone() } else { c.display_name.clone() })
-                    .unwrap_or_else(|| format!("Thread {thread_id}"));
+                let name =
+                    i.m.index
+                        .get(*thread_id)
+                        .map(|c| if c.display_name.is_empty() { c.address.clone() } else { c.display_name.clone() })
+                        .unwrap_or_else(|| format!("Thread {thread_id}"));
                 ("Delete Conversation".to_string(), format!("Remove the conversation with {name} from PhoneRelay?"))
             } else {
                 let n = thread_ids.len();
@@ -1342,7 +1724,13 @@ impl MessagesPage {
                     let mut effects = Vec::new();
                     i.store.batch(|store| {
                         for &tid in &thread_ids {
-                            effects.extend(i.m.delete(tid, can_delete_on_phone, store, &mut *i.settings.borrow_mut(), now_ms));
+                            effects.extend(i.m.delete(
+                                tid,
+                                can_delete_on_phone,
+                                store,
+                                &mut *i.settings.borrow_mut(),
+                                now_ms,
+                            ));
                         }
                     });
                     // Google deletes go to the helper in one run (it connects
@@ -1451,7 +1839,9 @@ impl MessagesPage {
         dialog.set_filters(Some(&filters));
         let weak = Rc::downgrade(self);
         dialog.open(self.parent_window().as_ref(), gio::Cancellable::NONE, move |res| {
-            let (Some(this), Some(path)) = (weak.upgrade(), res.ok().and_then(|f| f.path())) else { return };
+            let (Some(this), Some(path)) = (weak.upgrade(), res.ok().and_then(|f| f.path())) else {
+                return;
+            };
             let count = this.import_contacts_file(&path, true);
             this.toast(&format!("Imported {count} contacts"));
         });
@@ -1464,41 +1854,58 @@ impl MessagesPage {
         let mut subs = Vec::new();
         // KDE Connect finished syncing the phone's contacts (vCards).
         let weak = Rc::downgrade(self);
-        subs.push(signals::subscribe(client.bus(), &format!("{base}/contacts"), IFACE_CONTACTS, "localCacheSynchronized", move |_| {
-            if let Some(this) = weak.upgrade() {
-                this.reload_contacts();
-            }
-        }));
+        subs.push(signals::subscribe(
+            client.bus(),
+            &format!("{base}/contacts"),
+            IFACE_CONTACTS,
+            "localCacheSynchronized",
+            move |_| {
+                if let Some(this) = weak.upgrade() {
+                    this.reload_contacts();
+                }
+            },
+        ));
         // Incoming and missed calls name their caller.
         let weak = Rc::downgrade(self);
-        subs.push(signals::subscribe(client.bus(), &format!("{base}/telephony"), IFACE_TELEPHONY, "callReceived", move |p| {
-            let Some(this) = weak.upgrade() else { return };
-            let Some((event, number, name)) = p.get::<(String, String, String)>() else { return };
-            // KDE Connect 26.08 says "callReceived" for a ringing call.
-            if crate::core::calls::CallEvent::parse(&event).is_none() {
-                return;
-            }
-            // The call, as a line in that number's chat.
-            let effects = {
-                let mut guard = this.inner.borrow_mut();
-                let i = &mut *guard;
-                i.m.call_event(&event, &number, chrono::Utc::now().timestamp_millis(), &i.store)
-            };
-            this.run(effects);
-            if let Some((norm, name)) = crate::core::contacts::harvest_contact_from_telephony_signal(&number, &name) {
+        subs.push(signals::subscribe(
+            client.bus(),
+            &format!("{base}/telephony"),
+            IFACE_TELEPHONY,
+            "callReceived",
+            move |p| {
+                let Some(this) = weak.upgrade() else { return };
+                let Some((event, number, name)) = p.get::<(String, String, String)>() else {
+                    return;
+                };
+                // KDE Connect 26.08 says "callReceived" for a ringing call.
+                if crate::core::calls::CallEvent::parse(&event).is_none() {
+                    return;
+                }
+                // The call, as a line in that number's chat.
                 let effects = {
                     let mut guard = this.inner.borrow_mut();
                     let i = &mut *guard;
-                    i.m.learn_contacts([(norm, name)].into(), &i.store)
+                    i.m.call_event(&event, &number, chrono::Utc::now().timestamp_millis(), &i.store)
                 };
-                this.list.set_contacts(this.inner.borrow().m.contact_map.clone());
                 this.run(effects);
-            }
-        }));
+                if let Some((norm, name)) = crate::core::contacts::harvest_contact_from_telephony_signal(&number, &name)
+                {
+                    let effects = {
+                        let mut guard = this.inner.borrow_mut();
+                        let i = &mut *guard;
+                        i.m.learn_contacts([(norm, name)].into(), &i.store)
+                    };
+                    this.list.set_contacts(this.inner.borrow().m.contact_map.clone());
+                    this.run(effects);
+                }
+            },
+        ));
         // A contacts file shared from the phone is imported.
         let weak = Rc::downgrade(self);
         subs.push(signals::subscribe(client.bus(), &format!("{base}/share"), IFACE_SHARE, "shareReceived", move |p| {
-            let (Some(this), Some((url,))) = (weak.upgrade(), p.get::<(String,)>()) else { return };
+            let (Some(this), Some((url,))) = (weak.upgrade(), p.get::<(String,)>()) else {
+                return;
+            };
             let path = if url.starts_with("file://") {
                 gio::File::for_uri(&url).path()
             } else {
@@ -1516,7 +1923,9 @@ impl MessagesPage {
         let effects = {
             let mut guard = self.inner.borrow_mut();
             let i = &mut *guard;
-            let Some(dev) = i.kde_device_id().or_else(|| i.m.device_id().map(str::to_string)) else { return };
+            let Some(dev) = i.kde_device_id().or_else(|| i.m.device_id().map(str::to_string)) else {
+                return;
+            };
             i.m.contact_map = load_contact_map(&dev, i.store.load_contacts(), i.store.load_contact_overrides());
             i.m.refresh_names();
             let mut e = vec![Effect::RefreshList];
@@ -1538,8 +1947,12 @@ impl MessagesPage {
         let weak = Rc::downgrade(self);
         glib::timeout_add_seconds_local_once(8, move || {
             let Some(this) = weak.upgrade() else { return };
-            let Some(dev) = this.inner.borrow().kde_device_id() else { return };
-            if crate::core::contacts::synced_vcard_count(&dev) > 0 || !this.inner.borrow_mut().contact_sync_warned.insert(dev) {
+            let Some(dev) = this.inner.borrow().kde_device_id() else {
+                return;
+            };
+            if crate::core::contacts::synced_vcard_count(&dev) > 0
+                || !this.inner.borrow_mut().contact_sync_warned.insert(dev)
+            {
                 return;
             }
             this.toast(
@@ -1555,7 +1968,9 @@ impl MessagesPage {
             return;
         }
         let downloads = crate::core::settings::home_dir().join("Downloads");
-        let Ok(entries) = std::fs::read_dir(&downloads) else { return };
+        let Ok(entries) = std::fs::read_dir(&downloads) else {
+            return;
+        };
         let newest = entries
             .flatten()
             .map(|e| e.path())
@@ -1607,8 +2022,8 @@ impl MessagesPage {
     }
 
     /// The compose bar's send. Returns whether it was taken.
-    fn send(self: &Rc<Self>, thread_id: i64, text: &str, picture: Option<&std::path::Path>, reply_to: Option<&str>) -> bool {
-        let attachments: Vec<String> = picture.map(|p| p.to_string_lossy().into_owned()).into_iter().collect();
+    fn send(self: &Rc<Self>, thread_id: i64, text: &str, files: &[std::path::PathBuf], reply_to: Option<&str>) -> bool {
+        let attachments: Vec<String> = files.iter().map(|p| p.to_string_lossy().into_owned()).collect();
         let (effects, taken) = {
             let mut i = self.inner.borrow_mut();
             i.m.gm_reply_next(reply_to.map(str::to_string));
@@ -1728,12 +2143,20 @@ impl MessagesPage {
 
     fn show_thread(&self, tid: i64) {
         let i = self.inner.borrow();
-        let Some(conv) = i.m.index.get(tid) else { return };
+        let Some(conv) = i.m.index.get(tid) else {
+            return;
+        };
         self.list.select_thread(conv.thread_id);
         let _t = super::perf::span("updating the open chat");
         self.thread.sync(conv, &|uid| i.m.route_of(uid));
         drop(i);
         self.show_extras(tid);
+    }
+
+    /// After a chat opens: its typing line and whether older messages wait.
+    fn after_open(self: &Rc<Self>, tid: i64) {
+        self.show_typing(tid);
+        self.show_more_history(tid);
     }
 
     /// Messages just went on screen: ask the phone for their full pictures
@@ -1807,7 +2230,9 @@ impl MessagesPage {
                 if i.gm_downloading >= WORKERS {
                     return;
                 }
-                let Some(next) = i.gm_downloads.pop_front() else { return };
+                let Some(next) = i.gm_downloads.pop_front() else {
+                    return;
+                };
                 i.gm_downloading += 1;
                 next
             };
@@ -1818,7 +2243,9 @@ impl MessagesPage {
     }
 
     fn gm_download_one(self: &Rc<Self>, (req, open): (GmDownload, bool)) -> bool {
-        let Some(gm) = self.gm.borrow().clone() else { return false };
+        let Some(gm) = self.gm.borrow().clone() else {
+            return false;
+        };
         let dir = match crate::core::private_tmp::dir(Some("gm_downloads")) {
             Ok(d) => d,
             Err(e) => {

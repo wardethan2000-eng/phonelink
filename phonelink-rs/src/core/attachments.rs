@@ -40,7 +40,9 @@ pub fn is_app_file(path: &Path) -> bool {
 }
 
 fn is_app_file_in(dirs: &[PathBuf], path: &Path) -> bool {
-    let Ok(real) = path.canonicalize() else { return false };
+    let Ok(real) = path.canonicalize() else {
+        return false;
+    };
     dirs.iter().filter_map(|d| d.canonicalize().ok()).any(|d| real.starts_with(&d) && real != d)
 }
 
@@ -53,6 +55,19 @@ pub fn image_ext(mime_type: &str) -> &'static str {
         "image/webp" => ".webp",
         "image/heic" => ".heic",
         "image/heif" => ".heif",
+        // Other files keep a type players and viewers know them by.
+        "video/mp4" => ".mp4",
+        "video/quicktime" => ".mov",
+        "video/webm" => ".webm",
+        "video/3gpp" => ".3gp",
+        "audio/mpeg" => ".mp3",
+        "audio/mp4" | "audio/x-m4a" => ".m4a",
+        "audio/aac" => ".aac",
+        "audio/ogg" | "audio/opus" => ".ogg",
+        "audio/amr" => ".amr",
+        "audio/wav" | "audio/x-wav" => ".wav",
+        "application/pdf" => ".pdf",
+        "text/vcard" | "text/x-vcard" => ".vcf",
         _ => "",
     }
 }
@@ -138,7 +153,6 @@ mod tests {
         assert!(!safe_image_size(i32::MAX, i32::MAX));
     }
 
-
     #[test]
     fn only_the_apps_own_files_count() {
         let t = tempfile::tempdir().unwrap();
@@ -156,5 +170,4 @@ mod tests {
         std::os::unix::fs::symlink(&secret, &link).unwrap();
         assert!(!is_app_file_in(&dirs, &link));
     }
-
 }

@@ -10,13 +10,15 @@
 use std::collections::{HashMap, HashSet};
 
 use super::attachments;
-use super::private_tmp;
-use super::contacts::{is_messaging_app, is_texting_notification, looks_like_phone_number, normalize_phone, resolve_name};
+use super::calls::{self as call_log, CallEvent};
+use super::contacts::{
+    is_messaging_app, is_texting_notification, looks_like_phone_number, normalize_phone, resolve_name,
+};
+use super::gm::{ChatChange, Cursor, Delivery, GmConversation, GmMessage};
 use super::hidden_texts::{HiddenTextDetector, body_matches, normalize_text, reply_preview_matches};
 use super::message::{RawMessage, parse_message};
-use super::calls::{self as call_log, CallEvent};
-use super::gm::{Delivery, GmConversation, GmMessage};
 use super::models::{Attachment, Call, Conversation, SmsMessage};
+use super::private_tmp;
 use super::reconcile::{self, ConversationIndex};
 use super::settings::Settings;
 use super::store::MessageStore;
@@ -51,38 +53,100 @@ pub enum Effect {
     Sync(sync::Action),
     /// `markConversationAsRead(thread)` — absent in daemon 26.08; ignore
     /// `UnknownMethod`.
-    MarkRead { thread_id: i64 },
+    MarkRead {
+        thread_id: i64,
+    },
     /// `replyToConversation(conversation_id, text, attachments)` — the only
     /// send the S25 reliably delivers.
-    Reply { conversation_id: i64, text: String, attachments: Vec<String> },
+    Reply {
+        conversation_id: i64,
+        text: String,
+        attachments: Vec<String>,
+    },
     /// `notifications.sendReply(reply_id, text)`: answer through the texting
     /// app's own notification, so the app (Google Messages) sends it, as RCS
     /// in an RCS thread (Phase 9 route A). If the call fails, the UI calls
     /// [`Messages::notification_reply_failed`].
-    ReplyViaNotification { thread_id: i64, reply_id: String, text: String },
+    ReplyViaNotification {
+        thread_id: i64,
+        reply_id: String,
+        text: String,
+    },
     /// A notification reply got no clear answer (e.g. a D-Bus timeout): the
     /// phone may already have sent it, so nothing is resent. The UI waits
     /// briefly for the phone's echo ([`Messages::awaiting_echo`]), then
     /// shows "may not have sent" with a retry button.
-    MaybeNotSent { thread_id: i64, text: String },
+    MaybeNotSent {
+        thread_id: i64,
+        text: String,
+    },
     /// `sendWithoutConversation(addresses, text)` — only for brand-new
     /// conversations; the phone silently drops it otherwise.
-    SendNew { addresses: Vec<String>, text: String, attachments: Vec<String> },
+    SendNew {
+        addresses: Vec<String>,
+        text: String,
+        attachments: Vec<String>,
+    },
     /// Delete on the phone: KDE Connect's `deleteConversation(thread)` when
     /// the daemon has it, else Google Messages by the chat's members.
-    DeleteOnPhone { thread_id: i64, addresses: Vec<String> },
+    DeleteOnPhone {
+        thread_id: i64,
+        addresses: Vec<String>,
+    },
     /// Send through Google Messages (`send_text`, or `send_media` with a
     /// file): RCS where the chat is.
     /// `reply_to`: the Google id of the message it answers.
-    GmSend { thread_id: i64, conv: String, text: String, file: Option<String>, tmp_id: String, reply_to: Option<String> },
+    GmSend {
+        thread_id: i64,
+        conv: String,
+        text: String,
+        file: Option<String>,
+        tmp_id: String,
+        reply_to: Option<String>,
+    },
     /// Add, take back or switch my reaction on a message.
-    GmReact { thread_id: i64, conv: String, msg: String, emoji: String, action: &'static str },
-    /// A text to a chat that isn't in the list yet: find or make it on the
-    /// phone (`open_conversation`), then [`Messages::gm_opened`].
-    GmSendNew { addresses: Vec<String>, text: String },
+    GmReact {
+        thread_id: i64,
+        conv: String,
+        msg: String,
+        emoji: String,
+        action: &'static str,
+    },
+    /// A text to a chat that isn't in the list yet (one person or a
+    /// group): find or make it on the phone (`open_conversation`), then
+    /// [`Messages::gm_opened`] sends it with its files.
+    GmSendNew {
+        addresses: Vec<String>,
+        text: String,
+        attachments: Vec<String>,
+    },
+    /// Tell the phone "I'm typing" in this Google chat.
+    GmTyping {
+        conv: String,
+    },
+    /// Fetch the page of chat `conv` older than `cursor`, then
+    /// [`Messages::gm_page`].
+    GmFetchOlder {
+        thread_id: i64,
+        conv: String,
+        cursor: Cursor,
+    },
+    /// Archive, mute, block... a Google chat; then [`Messages::gm_chat_changed`].
+    GmUpdateChat {
+        thread_id: i64,
+        conv: String,
+        change: ChatChange,
+    },
+    /// Who is typing in the open chat changed: show [`Messages::typing_label`].
+    Typing(i64),
+    /// Whether the phone has older messages for this open chat changed
+    /// ([`Messages::gm_more_history`]).
+    MoreHistory(i64),
     /// Fetch a chat's newest messages from Google Messages (each of its
     /// Google chats, when several merged into one).
-    GmFetch { thread_id: i64 },
+    GmFetch {
+        thread_id: i64,
+    },
     /// A shown message changed (its delivery state): redraw the open chat.
     Redraw(i64),
     RefreshList,
@@ -93,7 +157,7 @@ pub enum Effect {
 
 pub const TOAST_NOT_CONNECTED: &str = "Can't send — your phone isn't connected right now";
 pub const TOAST_GM_REACT_FAILED: &str = "The phone didn't take that reaction";
-pub const TOAST_GM_NO_PICTURES: &str = "Send a text first to start the chat, then the pictures";
+pub const TOAST_GM_CHAT_CHANGE_FAILED: &str = "The phone didn't take that change";
 pub const TOAST_GM_READ_ONLY: &str = "This chat can't be replied to";
 pub const TOAST_GM_NOT_SENT: &str = "Couldn't send through Google Messages. Check the phone is online and try again.";
 pub const TOAST_LOCAL_DELETE_ONLY: &str =
@@ -146,7 +210,11 @@ pub struct GmDownload {
 }
 
 /// Copy a full attachment into the (private) cache and note it on `att`.
-fn cache_full(att: &mut Attachment, file_path: &std::path::Path, cache_dir: &std::path::Path) -> Option<std::path::PathBuf> {
+fn cache_full(
+    att: &mut Attachment,
+    file_path: &std::path::Path,
+    cache_dir: &std::path::Path,
+) -> Option<std::path::PathBuf> {
     let dest = attachments::full_cache_path_in(cache_dir, att)?;
     // Pictures people sent: the cache folder and its copies are private.
     let copied = cache_dir
@@ -200,6 +268,99 @@ pub struct GmMode {
     rich: HashMap<i64, Rich>,
     /// The next send replies to this Google message id.
     reply_next: Option<String>,
+    /// Who is typing, by primary thread: (number, shown until, epoch s).
+    typing: HashMap<i64, Vec<(String, f64)>>,
+    /// When "I'm typing" last went to each Google chat (epoch s).
+    typing_sent: HashMap<String, f64>,
+    /// Where each Google chat's older messages start: `None` once the
+    /// phone has no more. Missing until its first fetch.
+    cursors: HashMap<String, Option<Cursor>>,
+    /// Google chats whose older page is on its way.
+    loading_older: HashSet<String>,
+    /// Chats archived (on the phone, or here on the way), pinned on the
+    /// phone, and pinned or muted here: by local thread id. Kept in the
+    /// store's meta table, so the list is right before the link connects.
+    archived: HashSet<i64>,
+    pinned_phone: HashSet<i64>,
+    /// Pinned or unpinned here (wins over the phone's pin).
+    pins: HashMap<i64, bool>,
+    muted: HashSet<i64>,
+    /// The list shows archived chats instead of the others.
+    show_archived: bool,
+}
+
+impl GmMode {
+    /// The sends for a text and its files into Google chat `conv`: each
+    /// file as its own message (Google Messages takes one per message),
+    /// the text with the first; `reply_to` goes on the first.
+    fn sends_for(
+        &mut self,
+        primary: i64,
+        conv: &str,
+        text: &str,
+        attachments: Vec<String>,
+        reply_to: Option<String>,
+    ) -> Vec<Effect> {
+        let mut reply_to = reply_to;
+        let now_ms = chrono::Utc::now().timestamp_millis();
+        let files: Vec<Option<String>> =
+            if attachments.is_empty() { vec![None] } else { attachments.into_iter().map(Some).collect() };
+        let mut out = Vec::new();
+        for (i, file) in files.into_iter().enumerate() {
+            let text = if i == 0 { text.trim().to_string() } else { String::new() };
+            self.sends += 1;
+            let tmp_id = super::gm::new_tmp_id(now_ms, self.sends % 1000);
+            self.sent_here.insert(tmp_id.clone(), (primary, normalize_text(&text), 0));
+            out.push(Effect::GmSend {
+                thread_id: primary,
+                conv: conv.to_string(),
+                text,
+                file,
+                tmp_id,
+                reply_to: reply_to.take(),
+            });
+        }
+        out
+    }
+}
+
+/// How long "… is typing" stays without news (the mautrix bridge's 15 s).
+const TYPING_SHOWN_SECS: f64 = 15.0;
+/// "I'm typing" goes to the phone at most this often per chat.
+const TYPING_SEND_EVERY_SECS: f64 = 5.0;
+
+/// What the chat list shows on a row, and offers in its menu.
+#[derive(Debug, Clone, Copy, PartialEq, Eq, Default)]
+pub struct ChatFlags {
+    pub pinned: bool,
+    pub muted: bool,
+    pub archived: bool,
+    /// Google Messages actions (archive, mute, block) apply.
+    pub gm: bool,
+}
+
+/// What the user can do to a chat from its menu (Google Messages only).
+#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+pub enum ChatAction {
+    Pin,
+    Unpin,
+    Mute,
+    Unmute,
+    Archive,
+    Unarchive,
+    Block,
+    /// Block and report as spam.
+    Spam,
+}
+
+fn ids_to_meta(ids: impl IntoIterator<Item = i64>) -> String {
+    let mut v: Vec<i64> = ids.into_iter().collect();
+    v.sort_unstable();
+    v.iter().map(i64::to_string).collect::<Vec<_>>().join(",")
+}
+
+fn ids_from_meta(s: Option<String>) -> HashSet<i64> {
+    s.unwrap_or_default().split(',').filter_map(|x| x.trim().parse().ok()).collect()
 }
 
 /// What Google Messages says about one message beyond its text.
@@ -315,7 +476,9 @@ impl Messages {
     }
 
     fn should_keep_hidden(&self, hidden: &mut dyn HiddenStore, key: &str, message_date: i64) -> bool {
-        let Some(dev) = self.device_id.as_deref() else { return false };
+        let Some(dev) = self.device_id.as_deref() else {
+            return false;
+        };
         if key.is_empty() {
             return false;
         }
@@ -334,7 +497,17 @@ impl Messages {
 
     /// Show persisted history immediately, before the daemon responds.
     pub fn load_cached(&mut self, store: &MessageStore) -> Vec<Effect> {
-        let Some(dev) = self.device_id.clone() else { return Vec::new() };
+        let Some(dev) = self.device_id.clone() else {
+            return Vec::new();
+        };
+        if let Some(gm) = self.gm.as_mut() {
+            gm.archived = ids_from_meta(store.meta("gm_archived"));
+            gm.pinned_phone = ids_from_meta(store.meta("gm_pinned"));
+            gm.muted = ids_from_meta(store.meta("gm_muted"));
+            let on = ids_from_meta(store.meta("gm_pins_on"));
+            let off = ids_from_meta(store.meta("gm_pins_off"));
+            gm.pins = on.into_iter().map(|t| (t, true)).chain(off.into_iter().map(|t| (t, false))).collect();
+        }
         self.calls = store.load_calls(&dev);
         let mut cached: Vec<Conversation> = store.load_conversations(&dev).into_values().collect();
         if cached.is_empty() {
@@ -356,10 +529,17 @@ impl Messages {
 
     /// `telephony.callReceived` from the daemon.
     pub fn call_event(&mut self, kind: &str, number: &str, now_ms: i64, store: &MessageStore) -> Vec<Effect> {
-        let (Some(dev), Some(event)) = (self.device_id.clone(), CallEvent::parse(kind)) else { return Vec::new() };
-        let Some(mut call) = call_log::record(&mut self.calls, event, number, now_ms) else { return Vec::new() };
+        let (Some(dev), Some(event)) = (self.device_id.clone(), CallEvent::parse(kind)) else {
+            return Vec::new();
+        };
+        let Some(mut call) = call_log::record(&mut self.calls, event, number, now_ms) else {
+            return Vec::new();
+        };
         // Ringing while its chat is open: seen as it happens.
-        let open = self.active.and_then(|a| self.index.get(a)).is_some_and(|c| !c.is_group() && call_log::belongs(&call, &c.address));
+        let open = self
+            .active
+            .and_then(|a| self.index.get(a))
+            .is_some_and(|c| !c.is_group() && call_log::belongs(&call, &c.address));
         if open && !call.seen {
             call.seen = true;
             if let Some(c) = self.calls.iter_mut().rev().find(|c| c.date == call.date && call_log::belongs(c, number)) {
@@ -387,12 +567,15 @@ impl Messages {
         }
         // Real 1:1 threads first, so a call-only chat gives way to one.
         let mut owner: HashMap<String, i64> = HashMap::new();
-        let mut ids: Vec<(bool, i64)> = self.index.conversations.values().map(|c| (c.thread_id < 0, c.thread_id)).collect();
+        let mut ids: Vec<(bool, i64)> =
+            self.index.conversations.values().map(|c| (c.thread_id < 0, c.thread_id)).collect();
         ids.sort();
         let active = self.active;
         let mut stale_drafts = Vec::new();
         for (_, tid) in ids {
-            let Some(conv) = self.index.conversations.get_mut(&tid) else { continue };
+            let Some(conv) = self.index.conversations.get_mut(&tid) else {
+                continue;
+            };
             let k = if conv.is_group() { String::new() } else { key(&conv.address) };
             let want = match by_key.get(&k) {
                 Some(calls) if !k.is_empty() && !owner.contains_key(&k) => {
@@ -432,8 +615,12 @@ impl Messages {
 
     /// The chat was opened: its calls are seen.
     fn see_calls(&mut self, thread_id: i64, store: &MessageStore) {
-        let Some(dev) = self.device_id.clone() else { return };
-        let Some(conv) = self.index.get(thread_id) else { return };
+        let Some(dev) = self.device_id.clone() else {
+            return;
+        };
+        let Some(conv) = self.index.get(thread_id) else {
+            return;
+        };
         if conv.is_group() || conv.calls.iter().all(|c| c.seen) {
             return;
         }
@@ -462,7 +649,13 @@ impl Messages {
     }
 
     /// The daemon's `activeConversations` reply (newest message per thread).
-    pub fn apply_active(&mut self, raw: &[RawMessage], store: &MessageStore, hidden: &mut dyn HiddenStore, now: f64) -> Vec<Effect> {
+    pub fn apply_active(
+        &mut self,
+        raw: &[RawMessage],
+        store: &MessageStore,
+        hidden: &mut dyn HiddenStore,
+        now: f64,
+    ) -> Vec<Effect> {
         if self.device_id.is_none() {
             return Vec::new();
         }
@@ -484,10 +677,8 @@ impl Messages {
     /// Learn the user's own number from multi-address threads; group
     /// identities depend on it, so re-key when it changes.
     fn detect_self_number(&mut self, msgs: &[SmsMessage]) {
-        let key_lists: Vec<Vec<String>> = msgs
-            .iter()
-            .map(|m| m.all_addresses.iter().map(|a| reconcile::phone_key(a)).collect())
-            .collect();
+        let key_lists: Vec<Vec<String>> =
+            msgs.iter().map(|m| m.all_addresses.iter().map(|a| reconcile::phone_key(a)).collect()).collect();
         let contact_keys: Vec<&str> = self.contact_map.keys().map(String::as_str).collect();
         let self_key = reconcile::detect_self_key(&key_lists, &contact_keys);
         if self.index.set_self_key(&self_key) {
@@ -504,7 +695,13 @@ impl Messages {
 
     /// Merge one message (a signal, or one row of a bulk reply). Call inside
     /// `store.batch` when merging many.
-    pub fn merge_message(&mut self, msg: SmsMessage, store: &MessageStore, hidden: &mut dyn HiddenStore, now: f64) -> Vec<Effect> {
+    pub fn merge_message(
+        &mut self,
+        msg: SmsMessage,
+        store: &MessageStore,
+        hidden: &mut dyn HiddenStore,
+        now: f64,
+    ) -> Vec<Effect> {
         let mut out = Vec::new();
         let all_addrs: Vec<String> = if !msg.all_addresses.is_empty() {
             msg.all_addresses.clone()
@@ -627,6 +824,10 @@ impl Messages {
             until != 0 && c.sort_key() <= until
         };
         let mut v = self.index.visible(Some(&is_hidden));
+        if let Some(gm) = &self.gm {
+            // The archive and the inbox are shown apart, as on the phone.
+            v.retain(|c| gm.archived.contains(&c.thread_id) == gm.show_archived);
+        }
         v.sort_by_key(|c| std::cmp::Reverse(c.sort_key()));
         v
     }
@@ -641,7 +842,9 @@ impl Messages {
         }
         self.active = Some(thread_id);
         self.see_calls(thread_id, store);
-        let Some(conv) = self.index.get_mut(thread_id) else { return out };
+        let Some(conv) = self.index.get_mut(thread_id) else {
+            return out;
+        };
         self.read_thread_ids.insert(thread_id);
         let was_unread = !conv.is_read;
         conv.is_read = true;
@@ -698,7 +901,9 @@ impl Messages {
     /// ms) are read on the phone: clear their unread dot here, unless this
     /// side has a newer text the phone's state doesn't cover yet.
     pub fn read_on_phone(&mut self, read: &HashMap<String, i64>, store: &MessageStore) -> Vec<Effect> {
-        let Some(dev) = self.device_id.clone() else { return Vec::new() };
+        let Some(dev) = self.device_id.clone() else {
+            return Vec::new();
+        };
         let me = self.gm_me_keys();
         let mut changed = false;
         for conv in self.index.conversations.values_mut() {
@@ -707,7 +912,9 @@ impl Messages {
                 continue;
             }
             let key = super::gm::chat_key(&conv.addresses, &conv.address, &me);
-            let Some(&phone_ts) = read.get(&key) else { continue };
+            let Some(&phone_ts) = read.get(&key) else {
+                continue;
+            };
             if conv.last_date > phone_ts + super::gm::READ_SLACK_MS {
                 continue;
             }
@@ -775,6 +982,69 @@ impl Messages {
             .map(|c| c.thread_id)
     }
 
+    /// An existing real chat with exactly these members (a group).
+    pub fn find_thread_for_members(&self, addresses: &[String]) -> Option<i64> {
+        let want: HashSet<String> = addresses.iter().map(|a| normalize_phone(a)).filter(|a| !a.is_empty()).collect();
+        if want.is_empty() {
+            return None;
+        }
+        self.index
+            .conversations
+            .values()
+            .filter(|c| c.thread_id >= 0)
+            .find(|c| {
+                let have: HashSet<String> =
+                    c.addresses.iter().map(|a| normalize_phone(a)).filter(|a| !a.is_empty()).collect();
+                have.len() == want.len() && want.iter().all(|w| have.iter().any(|h| same_number(h, w)))
+            })
+            .map(|c| c.thread_id)
+    }
+
+    /// Start (or open) a chat with several people: the group already
+    /// there, else a draft the first send makes on the phone.
+    pub fn open_group(&mut self, addresses: &[String], display_name: &str) -> Vec<Effect> {
+        let mut members: Vec<String> = Vec::new();
+        for a in addresses {
+            let n = normalize_phone(a);
+            if !a.trim().is_empty() && !members.iter().any(|m| same_number(&normalize_phone(m), &n)) {
+                members.push(a.trim().to_string());
+            }
+        }
+        match members.len() {
+            0 => return Vec::new(),
+            1 => return self.open_or_create(&members[0], display_name),
+            _ => {}
+        }
+        if self.device_id.is_none() || !self.reachable {
+            return Vec::new();
+        }
+        let existing = self.find_thread_for_members(&members).or_else(|| {
+            self.index
+                .conversations
+                .values()
+                .filter(|c| c.thread_id < 0 && c.addresses.len() == members.len())
+                .find(|c| members.iter().all(|m| c.addresses.contains(m)))
+                .map(|c| c.thread_id)
+        });
+        if let Some(tid) = existing {
+            self.active = Some(tid);
+            self.read_thread_ids.insert(tid);
+            if let Some(c) = self.index.get_mut(tid) {
+                c.is_read = true;
+            }
+            return vec![Effect::RefreshList, Effect::ShowThread(tid)];
+        }
+        let draft_id = self.next_draft_id;
+        self.next_draft_id -= 1;
+        let mut conv = Conversation::new(draft_id);
+        conv.address = members[0].clone();
+        conv.addresses = members.clone();
+        conv.display_name = name_for(&self.contact_map, &members, &conv.address);
+        self.index.conversations.insert(draft_id, conv);
+        self.active = Some(draft_id);
+        vec![Effect::RefreshList, Effect::ShowThread(draft_id)]
+    }
+
     /// Send from the compose bar.
     pub fn send(&mut self, thread_id: i64, text: &str) -> Vec<Effect> {
         self.send_with(thread_id, text, Vec::new())
@@ -794,10 +1064,18 @@ impl Messages {
             return self.send_existing(thread_id, text, attachments);
         }
         // A draft: a real thread may have loaded since it was created.
-        let Some(draft) = self.index.conversations.get(&thread_id) else { return Vec::new() };
+        let Some(draft) = self.index.conversations.get(&thread_id) else {
+            return Vec::new();
+        };
         let address = draft.address.clone();
+        let addresses = if draft.addresses.len() > 1 { draft.addresses.clone() } else { vec![address.clone()] };
         self.index.conversations.remove(&thread_id);
-        match self.find_thread_for_address(&address) {
+        let existing = if addresses.len() > 1 {
+            self.find_thread_for_members(&addresses)
+        } else {
+            self.find_thread_for_address(&address)
+        };
+        match existing {
             Some(existing) => {
                 self.active = Some(existing);
                 self.read_thread_ids.insert(existing);
@@ -807,15 +1085,12 @@ impl Messages {
             }
             None if self.gm.is_some() => {
                 self.active = None;
-                if !attachments.is_empty() {
-                    return vec![Effect::Toast(TOAST_GM_NO_PICTURES)];
-                }
-                vec![Effect::GmSendNew { addresses: vec![address], text: text.to_string() }, Effect::RefreshList]
+                vec![Effect::GmSendNew { addresses, text: text.to_string(), attachments }, Effect::RefreshList]
             }
             None => {
                 self.active = None;
                 vec![
-                    Effect::SendNew { addresses: vec![address], text: text.to_string(), attachments },
+                    Effect::SendNew { addresses, text: text.to_string(), attachments },
                     Effect::ShowEmpty,
                     Effect::RefreshList,
                 ]
@@ -834,7 +1109,11 @@ impl Messages {
         let (route, effect) = match notification {
             Some(n) => (
                 SendRoute::Notification,
-                Effect::ReplyViaNotification { thread_id: primary, reply_id: n.reply_id.clone(), text: text.to_string() },
+                Effect::ReplyViaNotification {
+                    thread_id: primary,
+                    reply_id: n.reply_id.clone(),
+                    text: text.to_string(),
+                },
             ),
             None => (SendRoute::Sms, self.reply(primary, text, attachments)),
         };
@@ -923,9 +1202,11 @@ impl Messages {
             && is_messaging_app(app)
             && self.hidden_texts.note_notification(&super::contacts::notification_message_text(props), now_epoch);
         let mut out = Vec::new();
-        if let Some((norm, name)) =
-            super::contacts::match_contact_from_notification_props(props, self.index.conversations.values(), &self.contact_map)
-        {
+        if let Some((norm, name)) = super::contacts::match_contact_from_notification_props(
+            props,
+            self.index.conversations.values(),
+            &self.contact_map,
+        ) {
             store.save_contact(&norm, &name);
             self.contact_map.insert(norm, name);
             self.refresh_names();
@@ -998,10 +1279,15 @@ impl Messages {
         if !self.reachable || thread_id < 0 {
             return Vec::new();
         }
-        let Some(conv) = self.index.get(thread_id) else { return Vec::new() };
+        let Some(conv) = self.index.get(thread_id) else {
+            return Vec::new();
+        };
         let mut out = Vec::new();
         for att in conv.messages.iter().filter(|m| uids.contains(&m.uid)).flat_map(|m| &m.attachments) {
-            if !attachments::is_image(att) || att.part_id == 0 || attachments::existing_full_in(cache_dir, att).is_some() {
+            if !attachments::is_image(att)
+                || att.part_id == 0
+                || attachments::existing_full_in(cache_dir, att).is_some()
+            {
                 continue;
             }
             let key = attachments::attachment_key(att);
@@ -1014,18 +1300,27 @@ impl Messages {
 
     /// Google Messages pictures in `uids` (those on screen) not yet here,
     /// to download through the helper. Each is returned once per session.
-    pub fn take_gm_downloads(&mut self, thread_id: i64, uids: &HashSet<i64>, cache_dir: &std::path::Path) -> Vec<GmDownload> {
+    pub fn take_gm_downloads(
+        &mut self,
+        thread_id: i64,
+        uids: &HashSet<i64>,
+        cache_dir: &std::path::Path,
+    ) -> Vec<GmDownload> {
         if self.gm.is_none() {
             return Vec::new();
         }
         let mut out = Vec::new();
         for tid in self.conversation_threads(thread_id) {
-            let Some(conv) = self.index.get(tid) else { continue };
+            let Some(conv) = self.index.get(tid) else {
+                continue;
+            };
             for att in conv.messages.iter().filter(|m| uids.contains(&m.uid)).flat_map(|m| &m.attachments) {
-                if !attachments::is_image(att) || attachments::existing_full_in(cache_dir, att).is_some() {
+                if !super::gm::fetch_on_sight(att) || attachments::existing_full_in(cache_dir, att).is_some() {
                     continue;
                 }
-                let Some((media, key)) = super::gm::gm_media(att) else { continue };
+                let Some((media, key)) = super::gm::gm_media(att) else {
+                    continue;
+                };
                 if self.full_requested.insert(att.unique_identifier.clone()) {
                     out.push(GmDownload { media, key, unique: att.unique_identifier.clone() });
                 }
@@ -1038,7 +1333,13 @@ impl Messages {
     /// if it was asked for before.
     pub fn gm_download_for(&self, unique: &str) -> Option<GmDownload> {
         self.gm.as_ref()?;
-        let att = self.index.conversations.values().flat_map(|c| &c.messages).flat_map(|m| &m.attachments).find(|a| a.unique_identifier == unique)?;
+        let att = self
+            .index
+            .conversations
+            .values()
+            .flat_map(|c| &c.messages)
+            .flat_map(|m| &m.attachments)
+            .find(|a| a.unique_identifier == unique)?;
         let (media, key) = super::gm::gm_media(att)?;
         Some(GmDownload { media, key, unique: unique.to_string() })
     }
@@ -1055,7 +1356,9 @@ impl Messages {
         let dev = self.device_id.clone()?;
         for conv in self.index.conversations.values_mut() {
             for msg in conv.messages.iter_mut() {
-                let Some(att) = msg.attachments.iter_mut().find(|a| a.unique_identifier == unique) else { continue };
+                let Some(att) = msg.attachments.iter_mut().find(|a| a.unique_identifier == unique) else {
+                    continue;
+                };
                 let dest = cache_full(att, file_path, cache_dir)?;
                 store.upsert_message(&dev, conv.thread_id, msg);
                 return Some((conv.thread_id, dest));
@@ -1189,7 +1492,9 @@ impl Messages {
 
     /// Drop a hidden conversation from memory and the store.
     pub fn purge(&mut self, key: &str, store: &MessageStore) -> Vec<Effect> {
-        let Some(&primary) = self.index.identity_to_primary.get(key) else { return Vec::new() };
+        let Some(&primary) = self.index.identity_to_primary.get(key) else {
+            return Vec::new();
+        };
         let removed = self.index.remove(primary);
         if removed.is_empty() {
             return Vec::new();
@@ -1259,8 +1564,12 @@ impl Messages {
     /// none (a group's name, a business's, a stranger the phone knows).
     fn gm_name(&mut self, thread_id: i64) {
         let Some(gm) = &self.gm else { return };
-        let Some(conv) = self.index.conversations.get_mut(&thread_id) else { return };
-        let Some(chat) = conv.thread_ids.iter().find_map(|t| gm.chats.get(t)) else { return };
+        let Some(conv) = self.index.conversations.get_mut(&thread_id) else {
+            return;
+        };
+        let Some(chat) = conv.thread_ids.iter().find_map(|t| gm.chats.get(t)) else {
+            return;
+        };
         if chat.name.is_empty() {
             return;
         }
@@ -1279,7 +1588,9 @@ impl Messages {
         store: &MessageStore,
         hidden: &mut dyn HiddenStore,
     ) -> Vec<Effect> {
-        let (Some(dev), Some(_)) = (self.device_id.clone(), self.gm.as_ref()) else { return Vec::new() };
+        let (Some(dev), Some(_)) = (self.device_id.clone(), self.gm.as_ref()) else {
+            return Vec::new();
+        };
         let members = c.addresses();
         // The phone's names for people the desktop has no name for.
         if let Some(gm) = self.gm.as_mut() {
@@ -1306,9 +1617,32 @@ impl Messages {
             );
         }
         let known = self.index.thread_to_primary.contains_key(&thread_id);
+        if c.blocked {
+            // Blocked or moved to spam on the phone: gone from the list.
+            if let Some(gm) = self.gm.as_mut() {
+                gm.chats.remove(&thread_id);
+            }
+            return if known { self.remove_conversation(thread_id, store) } else { Vec::new() };
+        }
+        if let Some(gm) = self.gm.as_mut() {
+            let (a, p) = (gm.archived.contains(&thread_id), gm.pinned_phone.contains(&thread_id));
+            if a != c.archived || p != c.pinned {
+                if c.archived {
+                    gm.archived.insert(thread_id);
+                } else {
+                    gm.archived.remove(&thread_id);
+                }
+                if c.pinned {
+                    gm.pinned_phone.insert(thread_id);
+                } else {
+                    gm.pinned_phone.remove(&thread_id);
+                }
+                store.set_meta("gm_archived", &ids_to_meta(gm.archived.iter().copied()));
+                store.set_meta("gm_pinned", &ids_to_meta(gm.pinned_phone.iter().copied()));
+            }
+        }
         if !known {
-            // Archived chats stay out of the list, as on the phone.
-            if c.archived || members.is_empty() {
+            if members.is_empty() {
                 return Vec::new();
             }
             let identity = self.conversation_key(&members, "", thread_id);
@@ -1362,13 +1696,26 @@ impl Messages {
         hidden: &mut dyn HiddenStore,
         now: f64,
     ) -> Vec<Effect> {
-        let (Some(dev), Some(gm)) = (self.device_id.clone(), self.gm.as_mut()) else { return Vec::new() };
+        let (Some(dev), Some(gm)) = (self.device_id.clone(), self.gm.as_mut()) else {
+            return Vec::new();
+        };
         let members = match gm.chats.get(&thread_id) {
             Some(c) => c.members.clone(),
             None if !m.from.is_empty() => vec![m.from.clone()],
             None => return Vec::new(),
         };
         let mut changed = false;
+        // A text from someone typing: they stopped.
+        let mut typing_changed = false;
+        if !m.from_me && !m.old && !m.from.is_empty() {
+            let primary = self.index.primary_for(thread_id);
+            let key = normalize_phone(&m.from);
+            if let Some(list) = gm.typing.get_mut(&primary) {
+                let before = list.len();
+                list.retain(|(n, _)| !same_number(&normalize_phone(n), &key));
+                typing_changed = list.len() != before && self.active == Some(primary);
+            }
+        }
         if m.from_me
             && let Some(delivery) = Delivery::parse(&m.status)
         {
@@ -1376,10 +1723,22 @@ impl Messages {
             changed = gm.delivery.insert(uid, route).is_some_and(|old| old != route);
         }
         if !m.deleted && !m.msg.is_empty() {
-            let rich = Rich { conv: m.conv.clone(), msg: m.msg.clone(), reply_to: m.reply_to.clone(), reactions: m.reactions.clone() };
+            let rich = Rich {
+                conv: m.conv.clone(),
+                msg: m.msg.clone(),
+                reply_to: m.reply_to.clone(),
+                reactions: m.reactions.clone(),
+            };
             // A bubble shown at send time carries its reply link until the echo.
             let had = gm.rich.get(&uid).cloned();
-            let rich = Rich { reply_to: if rich.reply_to.is_empty() { had.as_ref().map(|h| h.reply_to.clone()).unwrap_or_default() } else { rich.reply_to }, ..rich };
+            let rich = Rich {
+                reply_to: if rich.reply_to.is_empty() {
+                    had.as_ref().map(|h| h.reply_to.clone()).unwrap_or_default()
+                } else {
+                    rich.reply_to
+                },
+                ..rich
+            };
             if had.as_ref() != Some(&rich) {
                 changed |= had.is_some_and(|h| h.reactions != rich.reactions || h.reply_to != rich.reply_to);
                 gm.rich.insert(uid, rich);
@@ -1403,12 +1762,37 @@ impl Messages {
         }
         let shown = self.index.get(primary).is_some_and(|c| c.messages.iter().any(|x| x.uid == uid));
         if m.deleted {
-            let Some(conv) = self.index.get_mut(primary).filter(|_| shown) else { return Vec::new() };
+            let Some(conv) = self.index.get_mut(primary).filter(|_| shown) else {
+                return Vec::new();
+            };
             conv.messages.retain(|x| x.uid != uid);
             store.delete_message(&dev, uid);
             return if self.active == Some(primary) { vec![Effect::ShowThread(primary)] } else { Vec::new() };
         }
+        if typing_changed {
+            changed = true;
+        }
         if shown {
+            // A picture that was only a preview came again with its full
+            // file (a new id): show that one.
+            let fresh = super::gm::to_sms(m, thread_id, uid, &members, false).attachments;
+            if let Some(row) = self.index.get_mut(primary).and_then(|c| c.messages.iter_mut().find(|x| x.uid == uid)) {
+                let ids = |v: &[Attachment]| v.iter().map(|a| a.unique_identifier.clone()).collect::<Vec<_>>();
+                let from_google =
+                    row.attachments.iter().all(|a| a.unique_identifier.starts_with(super::gm::GM_MEDIA_PREFIX));
+                // Never back from the full picture to a preview.
+                let full = m.attachments.iter().all(|a| !a.thumb);
+                if !fresh.is_empty()
+                    && full
+                    && from_google
+                    && ids(&row.attachments) != ids(&fresh)
+                    && row.attachments.len() == fresh.len()
+                {
+                    row.attachments = fresh;
+                    store.upsert_message(&dev, primary, row);
+                    changed = true;
+                }
+            }
             // Rows saved before keys were kept: take the phone's keys now.
             let keys: Vec<(String, String)> = m
                 .attachments
@@ -1417,7 +1801,8 @@ impl Messages {
                 .map(|a| (format!("{}{}", super::gm::GM_MEDIA_PREFIX, a.id), a.key.clone()))
                 .collect();
             if !keys.is_empty()
-                && let Some(row) = self.index.get_mut(primary).and_then(|c| c.messages.iter_mut().find(|x| x.uid == uid))
+                && let Some(row) =
+                    self.index.get_mut(primary).and_then(|c| c.messages.iter_mut().find(|x| x.uid == uid))
             {
                 let mut keyed = false;
                 for att in row.attachments.iter_mut().filter(|a| !a.extra.contains_key(super::gm::GM_KEY)) {
@@ -1431,7 +1816,14 @@ impl Messages {
                     changed = true;
                 }
             }
-            return if changed && self.active == Some(primary) { vec![Effect::Redraw(primary)] } else { Vec::new() };
+            let mut out = Vec::new();
+            if changed && self.active == Some(primary) {
+                out.push(Effect::Redraw(primary));
+            }
+            if typing_changed {
+                out.push(Effect::Typing(primary));
+            }
+            return out;
         }
         // A new text arriving live is unread until seen.
         let unread = !m.from_me && !m.old;
@@ -1441,14 +1833,20 @@ impl Messages {
         if unread && self.active == Some(primary) {
             out.push(Effect::MarkRead { thread_id: primary });
         }
+        if typing_changed {
+            out.push(Effect::Typing(primary));
+        }
         self.gm_name(primary);
         out
     }
 
     /// The Google chats behind a thread (several when merged), newest first.
     pub fn gm_convs(&self, thread_id: i64) -> Vec<String> {
-        let Some(gm) = &self.gm else { return Vec::new() };
-        let mut chats: Vec<&GmChat> = self.conversation_threads(thread_id).iter().filter_map(|t| gm.chats.get(t)).collect();
+        let Some(gm) = &self.gm else {
+            return Vec::new();
+        };
+        let mut chats: Vec<&GmChat> =
+            self.conversation_threads(thread_id).iter().filter_map(|t| gm.chats.get(t)).collect();
         chats.sort_by_key(|c| std::cmp::Reverse(c.last_ts));
         chats.into_iter().map(|c| c.conv.clone()).collect()
     }
@@ -1459,32 +1857,24 @@ impl Messages {
     /// message), the text with the first.
     fn gm_send(&mut self, primary: i64, text: &str, attachments: Vec<String>) -> Vec<Effect> {
         let threads = self.conversation_threads(primary);
-        let Some(gm) = self.gm.as_mut() else { return vec![Effect::Toast(TOAST_GM_NOT_SENT)] };
+        let Some(gm) = self.gm.as_mut() else {
+            return vec![Effect::Toast(TOAST_GM_NOT_SENT)];
+        };
         let chat = threads
             .iter()
             .filter_map(|t| gm.chats.get(t))
             .filter(|c| !c.read_only)
             .max_by_key(|c| c.last_ts)
             .map(|c| c.conv.clone());
-        let Some(mut conv) = chat else { return vec![Effect::Toast(TOAST_GM_READ_ONLY)] };
+        let Some(mut conv) = chat else {
+            return vec![Effect::Toast(TOAST_GM_READ_ONLY)];
+        };
         // A reply goes to the chat the message is in (merged chats have several).
         let reply_to = gm.reply_next.take();
         if let Some(r) = reply_to.as_ref().and_then(|id| gm.rich.values().find(|x| &x.msg == id)) {
             conv = r.conv.clone();
         }
-        let mut reply_to = reply_to;
-        let now_ms = chrono::Utc::now().timestamp_millis();
-        let files: Vec<Option<String>> = if attachments.is_empty() { vec![None] } else { attachments.into_iter().map(Some).collect() };
-        let mut out = Vec::new();
-        for (i, file) in files.into_iter().enumerate() {
-            let text = if i == 0 { text.trim().to_string() } else { String::new() };
-            gm.sends += 1;
-            let tmp_id = super::gm::new_tmp_id(now_ms, gm.sends % 1000);
-            gm.sent_here.insert(tmp_id.clone(), (primary, normalize_text(&text), 0));
-            // Words and a picture go as one reply: the first part carries it.
-            out.push(Effect::GmSend { thread_id: primary, conv: conv.clone(), text, file, tmp_id, reply_to: reply_to.take() });
-        }
-        out
+        gm.sends_for(primary, &conv, text, attachments, reply_to)
     }
 
     /// The next text sent replies to Google's message `msg` (None: not a reply).
@@ -1497,23 +1887,39 @@ impl Messages {
     /// A bubble shown at send time answers `reply_to`: show the quote at once.
     pub fn gm_pending_reply(&mut self, uid: i64, conv: &str, reply_to: &str) {
         if let Some(gm) = self.gm.as_mut() {
-            gm.rich.entry(uid).or_insert_with(|| Rich { conv: conv.into(), reply_to: reply_to.into(), ..Default::default() });
+            gm.rich.entry(uid).or_insert_with(|| Rich {
+                conv: conv.into(),
+                reply_to: reply_to.into(),
+                ..Default::default()
+            });
         }
     }
 
     /// Reactions and quotes for the bubbles of thread `primary`, by uid.
     pub fn gm_extras(&self, primary: i64, store: &MessageStore) -> HashMap<i64, super::rcs::Extras> {
-        let (Some(gm), Some(conv)) = (&self.gm, self.index.get(primary)) else { return HashMap::new() };
+        let (Some(gm), Some(conv)) = (&self.gm, self.index.get(primary)) else {
+            return HashMap::new();
+        };
         let name_of = |n: &str| resolve_name(&self.contact_map, n);
         let mut out = HashMap::new();
         for m in &conv.messages {
-            let Some(r) = gm.rich.get(&m.uid) else { continue };
+            let Some(r) = gm.rich.get(&m.uid) else {
+                continue;
+            };
             let quote = (!r.reply_to.is_empty()).then(|| {
                 let uid = store.gm_known("msg", &r.reply_to);
                 match uid.and_then(|u| conv.messages.iter().find(|q| q.uid == u)) {
                     Some(q) => super::rcs::Quote {
-                        author: if q.msg_type == super::models::MSG_TYPE_RECEIVED { name_of(&q.address) } else { "You".into() },
-                        text: if q.body.is_empty() && !q.attachments.is_empty() { "Picture".into() } else { q.body.clone() },
+                        author: if q.msg_type == super::models::MSG_TYPE_RECEIVED {
+                            name_of(&q.address)
+                        } else {
+                            "You".into()
+                        },
+                        text: if q.body.is_empty() && !q.attachments.is_empty() {
+                            "Picture".into()
+                        } else {
+                            q.body.clone()
+                        },
                         uid: Some(q.uid),
                     },
                     None => super::rcs::Quote::default(),
@@ -1531,13 +1937,21 @@ impl Messages {
 
     /// The user picked `emoji` on bubble `uid`: show it at once and ask the phone.
     pub fn gm_react(&mut self, uid: i64, emoji: &str) -> Vec<Effect> {
-        let Some(primary) = self.active else { return Vec::new() };
+        let Some(primary) = self.active else {
+            return Vec::new();
+        };
         let Some(r) = self.gm.as_mut().and_then(|gm| gm.rich.get_mut(&uid)).filter(|r| !r.msg.is_empty()) else {
             return Vec::new();
         };
         let action = super::rcs::toggle(&mut r.reactions, emoji);
         vec![
-            Effect::GmReact { thread_id: primary, conv: r.conv.clone(), msg: r.msg.clone(), emoji: emoji.into(), action },
+            Effect::GmReact {
+                thread_id: primary,
+                conv: r.conv.clone(),
+                msg: r.msg.clone(),
+                emoji: emoji.into(),
+                action,
+            },
             Effect::Redraw(primary),
         ]
     }
@@ -1545,27 +1959,27 @@ impl Messages {
     /// A reaction was refused: fetch the chat again for the phone's truth.
     pub fn gm_react_failed(&mut self, thread_id: i64) -> Vec<Effect> {
         let primary = self.index.primary_for(thread_id);
-        let Some(gm) = self.gm.as_mut() else { return Vec::new() };
+        let Some(gm) = self.gm.as_mut() else {
+            return Vec::new();
+        };
         gm.fetched.remove(&primary);
         vec![Effect::Toast(TOAST_GM_REACT_FAILED), Effect::GmFetch { thread_id: primary }]
     }
 
     /// The phone found or made the chat for a [`Effect::GmSendNew`]
-    /// (`thread_id` is its local id, `conv` Google's): open it and send.
-    pub fn gm_opened(&mut self, thread_id: i64, conv: &str, text: &str) -> Vec<Effect> {
+    /// (`thread_id` is its local id, `conv` Google's): open it and send
+    /// the text and its files.
+    pub fn gm_opened(&mut self, thread_id: i64, conv: &str, text: &str, attachments: Vec<String>) -> Vec<Effect> {
         let primary = self.index.primary_for(thread_id);
-        let Some(gm) = self.gm.as_mut() else { return Vec::new() };
+        let Some(gm) = self.gm.as_mut() else {
+            return Vec::new();
+        };
         gm.fetched.insert(primary);
-        gm.sends += 1;
-        let tmp_id = super::gm::new_tmp_id(chrono::Utc::now().timestamp_millis(), gm.sends % 1000);
-        gm.sent_here.insert(tmp_id.clone(), (primary, normalize_text(text), 0));
+        let mut out = gm.sends_for(primary, conv, text, attachments, None);
         self.active = Some(primary);
         self.read_thread_ids.insert(primary);
-        vec![
-            Effect::GmSend { thread_id: primary, conv: conv.to_string(), text: text.to_string(), file: None, tmp_id, reply_to: None },
-            Effect::RefreshList,
-            Effect::ShowThread(primary),
-        ]
+        out.extend([Effect::RefreshList, Effect::ShowThread(primary)]);
+        out
     }
 
     /// Show a text sent through Google Messages at once, as "Sending",
@@ -1580,9 +1994,13 @@ impl Messages {
         hidden: &mut dyn HiddenStore,
         now: f64,
     ) -> Vec<Effect> {
-        let Some(&(primary, _, _)) = self.gm.as_ref().and_then(|gm| gm.sent_here.get(tmp_id)) else { return Vec::new() };
+        let Some(&(primary, _, _)) = self.gm.as_ref().and_then(|gm| gm.sent_here.get(tmp_id)) else {
+            return Vec::new();
+        };
         let threads = self.conversation_threads(primary);
-        let Some(gm) = self.gm.as_mut() else { return Vec::new() };
+        let Some(gm) = self.gm.as_mut() else {
+            return Vec::new();
+        };
         if let Some(entry) = gm.sent_here.get_mut(tmp_id) {
             entry.2 = uid;
         }
@@ -1642,6 +2060,283 @@ impl Messages {
             out.push(Effect::Redraw(primary));
         }
         out
+    }
+
+    // ── Google Messages: typing ────────────────────────────────────
+
+    /// Someone in Google chat (local thread) `thread_id` started or stopped
+    /// typing (`now`: epoch seconds).
+    pub fn gm_typing(&mut self, thread_id: i64, from: &str, typing: bool, now: f64) -> Vec<Effect> {
+        let primary = self.index.primary_for(thread_id);
+        let Some(gm) = self.gm.as_mut() else {
+            return Vec::new();
+        };
+        let key = normalize_phone(from);
+        let list = gm.typing.entry(primary).or_default();
+        list.retain(|(n, until)| *until > now && !same_number(&normalize_phone(n), &key));
+        if typing {
+            list.push((from.to_string(), now + TYPING_SHOWN_SECS));
+        }
+        if self.active == Some(primary) { vec![Effect::Typing(primary)] } else { Vec::new() }
+    }
+
+    /// "Sam is typing…" for chat `primary`, and when it next needs looking
+    /// at (epoch seconds); `None` when nobody is.
+    pub fn typing_label(&self, primary: i64, now: f64) -> Option<(String, f64)> {
+        let gm = self.gm.as_ref()?;
+        let who: Vec<&(String, f64)> = gm.typing.get(&primary)?.iter().filter(|(_, until)| *until > now).collect();
+        let next = who.iter().map(|w| w.1).reduce(f64::min)?;
+        let first = |n: &str| {
+            let name = resolve_name(&self.contact_map, n);
+            // A group shows first names; a bare number stays whole.
+            if looks_like_phone_number(&name) {
+                name
+            } else {
+                name.split_whitespace().next().unwrap_or(&name).to_string()
+            }
+        };
+        let text = match who.as_slice() {
+            [one] => format!("{} is typing…", first(&one.0)),
+            [a, b] => format!("{} and {} are typing…", first(&a.0), first(&b.0)),
+            _ => "Several people are typing…".to_string(),
+        };
+        Some((text, next))
+    }
+
+    /// The user is typing in chat `primary`: tell the phone, at most every
+    /// few seconds, and only in RCS chats (SMS has no typing).
+    pub fn gm_typing_out(&mut self, primary: i64, now: f64) -> Vec<Effect> {
+        let threads = self.conversation_threads(primary);
+        let Some(gm) = self.gm.as_mut() else {
+            return Vec::new();
+        };
+        let chat = threads.iter().filter_map(|t| gm.chats.get(t)).filter(|c| !c.read_only).max_by_key(|c| c.last_ts);
+        let Some(conv) = chat.filter(|c| c.rcs).map(|c| c.conv.clone()) else {
+            return Vec::new();
+        };
+        if gm.typing_sent.get(&conv).is_some_and(|t| now - t < TYPING_SEND_EVERY_SECS && now >= *t) {
+            return Vec::new();
+        }
+        gm.typing_sent.insert(conv.clone(), now);
+        vec![Effect::GmTyping { conv }]
+    }
+
+    // ── Google Messages: older messages ────────────────────────────
+
+    /// A fetch of Google chat `conv` came back: `cursor` is where older
+    /// messages start (`None`: no more), `older` whether it was an older
+    /// page, `got` how many messages it had.
+    pub fn gm_page(&mut self, conv: &str, cursor: Option<Cursor>, older: bool, got: usize) -> Vec<Effect> {
+        let Some(gm) = self.gm.as_mut() else {
+            return Vec::new();
+        };
+        let cursor = cursor.filter(|_| got > 0);
+        if older {
+            gm.loading_older.remove(conv);
+            gm.cursors.insert(conv.to_string(), cursor);
+        } else if !gm.cursors.contains_key(conv) {
+            // A newest page again (reopened) doesn't undo older ones.
+            gm.cursors.insert(conv.to_string(), cursor);
+        }
+        let thread = gm.chats.iter().find(|(_, c)| c.conv == conv).map(|(t, _)| *t);
+        match thread.map(|t| self.index.primary_for(t)) {
+            Some(p) if self.active == Some(p) => vec![Effect::MoreHistory(p)],
+            _ => Vec::new(),
+        }
+    }
+
+    /// Does the phone have messages older than those here for `primary`?
+    pub fn gm_more_history(&self, primary: i64) -> bool {
+        let Some(gm) = &self.gm else { return false };
+        self.conversation_threads(primary)
+            .iter()
+            .filter_map(|t| gm.chats.get(t))
+            .any(|c| matches!(gm.cursors.get(&c.conv), Some(Some(_))))
+    }
+
+    /// Is an older page of `primary` on its way?
+    pub fn gm_loading_older(&self, primary: i64) -> bool {
+        let Some(gm) = &self.gm else { return false };
+        self.conversation_threads(primary)
+            .iter()
+            .filter_map(|t| gm.chats.get(t))
+            .any(|c| gm.loading_older.contains(&c.conv))
+    }
+
+    /// Fetch the next older page of each of `primary`'s Google chats.
+    pub fn gm_older(&mut self, primary: i64) -> Vec<Effect> {
+        let threads = self.conversation_threads(primary);
+        let Some(gm) = self.gm.as_mut() else {
+            return Vec::new();
+        };
+        let mut out = Vec::new();
+        for c in threads.iter().filter_map(|t| gm.chats.get(t)) {
+            if let Some(Some(cursor)) = gm.cursors.get(&c.conv)
+                && !gm.loading_older.contains(&c.conv)
+            {
+                out.push(Effect::GmFetchOlder { thread_id: primary, conv: c.conv.clone(), cursor: cursor.clone() });
+            }
+        }
+        for e in &out {
+            if let Effect::GmFetchOlder { conv, .. } = e {
+                gm.loading_older.insert(conv.clone());
+            }
+        }
+        out
+    }
+
+    // ── Google Messages: archive, pin, mute, block ─────────────────
+
+    /// Each shown chat's pin, mute and archive state (empty unless Google
+    /// Messages is the source).
+    pub fn chat_flags(&self) -> HashMap<i64, ChatFlags> {
+        let Some(gm) = &self.gm else {
+            return HashMap::new();
+        };
+        self.index
+            .conversations
+            .values()
+            .map(|c| {
+                let threads = self.conversation_threads(c.thread_id);
+                let any = |set: &HashSet<i64>| threads.iter().any(|t| set.contains(t));
+                let pinned = gm.pins.get(&c.thread_id).copied().unwrap_or_else(|| any(&gm.pinned_phone));
+                let flags = ChatFlags {
+                    pinned,
+                    muted: gm.muted.contains(&c.thread_id),
+                    archived: gm.archived.contains(&c.thread_id),
+                    gm: c.thread_id >= 0 && threads.iter().any(|t| gm.chats.contains_key(t)),
+                };
+                (c.thread_id, flags)
+            })
+            .collect()
+    }
+
+    /// Show the archive (true) or the other chats.
+    pub fn set_show_archived(&mut self, on: bool) -> Vec<Effect> {
+        let Some(gm) = self.gm.as_mut() else {
+            return Vec::new();
+        };
+        if gm.show_archived == on {
+            return Vec::new();
+        }
+        gm.show_archived = on;
+        let mut out = vec![Effect::RefreshList];
+        if self.active.is_some_and(|a| gm.archived.contains(&a) != on) {
+            self.active = None;
+            out.push(Effect::ShowEmpty);
+        }
+        out
+    }
+
+    pub fn showing_archived(&self) -> bool {
+        self.gm.as_ref().is_some_and(|gm| gm.show_archived)
+    }
+
+    /// How many chats are archived (shown on the archive button).
+    pub fn archived_count(&self) -> usize {
+        let Some(gm) = &self.gm else { return 0 };
+        gm.archived.iter().filter(|t| self.index.conversations.contains_key(t)).count()
+    }
+
+    fn save_flags(&self, store: &MessageStore) {
+        let Some(gm) = &self.gm else { return };
+        store.set_meta("gm_archived", &ids_to_meta(gm.archived.iter().copied()));
+        store.set_meta("gm_muted", &ids_to_meta(gm.muted.iter().copied()));
+        store.set_meta("gm_pins_on", &ids_to_meta(gm.pins.iter().filter(|(_, on)| **on).map(|(t, _)| *t)));
+        store.set_meta("gm_pins_off", &ids_to_meta(gm.pins.iter().filter(|(_, on)| !**on).map(|(t, _)| *t)));
+    }
+
+    /// The user chose `action` for chat `primary` from its menu. Pins stay
+    /// on this computer (the phone takes none from the web); the rest go
+    /// to the phone and show at once, undone if the phone refuses.
+    pub fn chat_action(&mut self, primary: i64, action: ChatAction, store: &MessageStore) -> Vec<Effect> {
+        let threads = self.conversation_threads(primary);
+        let Some(gm) = self.gm.as_mut() else {
+            return Vec::new();
+        };
+        let convs: Vec<String> = threads.iter().filter_map(|t| gm.chats.get(t)).map(|c| c.conv.clone()).collect();
+        let change = match action {
+            ChatAction::Pin | ChatAction::Unpin => {
+                gm.pins.insert(primary, action == ChatAction::Pin);
+                self.save_flags(store);
+                return vec![Effect::RefreshList];
+            }
+            ChatAction::Mute => {
+                gm.muted.insert(primary);
+                ChatChange::Mute
+            }
+            ChatAction::Unmute => {
+                gm.muted.remove(&primary);
+                ChatChange::Unmute
+            }
+            ChatAction::Archive => {
+                gm.archived.extend(threads.iter().copied());
+                ChatChange::Archive
+            }
+            ChatAction::Unarchive => {
+                for t in &threads {
+                    gm.archived.remove(t);
+                }
+                ChatChange::Unarchive
+            }
+            ChatAction::Block => ChatChange::Block,
+            ChatAction::Spam => ChatChange::Spam,
+        };
+        let moved = matches!(action, ChatAction::Archive | ChatAction::Unarchive) && self.active == Some(primary);
+        self.save_flags(store);
+        let mut out: Vec<Effect> =
+            convs.into_iter().map(|conv| Effect::GmUpdateChat { thread_id: primary, conv, change }).collect();
+        out.push(Effect::RefreshList);
+        if moved {
+            // It left the list being shown.
+            self.active = None;
+            out.push(Effect::ShowEmpty);
+        }
+        out
+    }
+
+    /// The phone answered a [`Effect::GmUpdateChat`]. Refused: undo what
+    /// showed at once. Blocked: the chat leaves the list.
+    pub fn gm_chat_changed(
+        &mut self,
+        thread_id: i64,
+        change: ChatChange,
+        ok: bool,
+        store: &MessageStore,
+    ) -> Vec<Effect> {
+        let primary = self.index.primary_for(thread_id);
+        let threads = self.conversation_threads(primary);
+        let Some(gm) = self.gm.as_mut() else {
+            return Vec::new();
+        };
+        if ok {
+            return match change {
+                ChatChange::Block | ChatChange::Spam => {
+                    for t in &threads {
+                        gm.chats.remove(t);
+                    }
+                    self.remove_conversation(primary, store)
+                }
+                _ => Vec::new(),
+            };
+        }
+        match change {
+            ChatChange::Mute => {
+                gm.muted.remove(&primary);
+            }
+            ChatChange::Unmute => {
+                gm.muted.insert(primary);
+            }
+            ChatChange::Archive => {
+                for t in &threads {
+                    gm.archived.remove(t);
+                }
+            }
+            ChatChange::Unarchive => gm.archived.extend(threads.iter().copied()),
+            _ => {}
+        }
+        self.save_flags(store);
+        vec![Effect::Toast(TOAST_GM_CHAT_CHANGE_FAILED), Effect::RefreshList]
     }
 
     // ── catch-up plumbing ──────────────────────────────────────────
@@ -1798,7 +2493,11 @@ mod tests {
     fn read_on_the_phone_clears_the_dot_unless_this_side_has_newer() {
         let mut p = Panel::new();
         let unread = |uid, tid, a: &str, date| RawMessage { read: 0, ..tup(uid, tid, &[a], date) };
-        p.apply(&[unread(1, 10, "+13165551111", 1_000_000), unread(2, 20, "shop_agent@rbm.goog", 2_000_000), unread(3, 30, "+13165553333", 9_000_000)]);
+        p.apply(&[
+            unread(1, 10, "+13165551111", 1_000_000),
+            unread(2, 20, "shop_agent@rbm.goog", 2_000_000),
+            unread(3, 30, "+13165553333", 9_000_000),
+        ]);
         assert_eq!(p.m.gm_chat_key(20).as_deref(), Some("shop_agent@rbm.goog"));
         let read = HashMap::from([
             ("3165551111".to_string(), 1_000_500),
@@ -1974,7 +2673,11 @@ mod tests {
         let effects = p.m.send(10, "Yes, leaving now");
         assert_eq!(
             effects,
-            vec![Effect::ReplyViaNotification { thread_id: 10, reply_id: "reply-n1".into(), text: "Yes, leaving now".into() }]
+            vec![Effect::ReplyViaNotification {
+                thread_id: 10,
+                reply_id: "reply-n1".into(),
+                text: "Yes, leaving now".into()
+            }]
         );
         p.merge(sent_echo(2, 10, "3165551111", "Yes, leaving now", 200));
         assert_eq!(p.m.route_of(2), Some(SendRoute::Notification));
@@ -2019,7 +2722,10 @@ mod tests {
             internal_id: "0|com.google.android.gm|3|null|10100".into(),
             ..notif("n3", "Alex", "Running ten minutes late")
         });
-        p.m.note_notification(ReplyableNotification { reply_id: String::new(), ..notif("n4", "Alex", "Running ten minutes late") });
+        p.m.note_notification(ReplyableNotification {
+            reply_id: String::new(),
+            ..notif("n4", "Alex", "Running ten minutes late")
+        });
         // Any app can call itself "Messages": the package decides.
         p.m.note_notification(ReplyableNotification {
             internal_id: "0|com.evil.app|7|null|10999".into(),
@@ -2156,7 +2862,8 @@ mod tests {
         let date_ms = (t0 * 1000.0) as i64;
         p.apply(&[incoming(1, 10, "3165551111", "This one did arrive fine", date_ms)]);
         // A notification whose text arrived: no warning.
-        let (schedule, _) = p.m.notification_seen(&messages_notification("Alex", "This one did arrive fine"), t0, &p.store, true);
+        let (schedule, _) =
+            p.m.notification_seen(&messages_notification("Alex", "This one did arrive fine"), t0, &p.store, true);
         assert!(schedule);
         // Two that never arrive.
         p.m.notification_seen(&messages_notification("Sam", "Where are you right now?"), t0 + 10.0, &p.store, true);
@@ -2169,8 +2876,12 @@ mod tests {
     fn a_notification_teaches_and_saves_a_contact_name() {
         let mut p = Panel::new();
         p.apply(&[incoming(1, 10, "3165551111", "See you at the game tonight", 100)]);
-        let (_, effects) =
-            p.m.notification_seen(&messages_notification("Alex Smith", "See you at the game tonight"), 0.0, &p.store, false);
+        let (_, effects) = p.m.notification_seen(
+            &messages_notification("Alex Smith", "See you at the game tonight"),
+            0.0,
+            &p.store,
+            false,
+        );
         assert_eq!(effects, vec![Effect::RefreshList]);
         assert_eq!(p.m.index.get(10).unwrap().display_name, "Alex Smith");
         assert_eq!(p.store.load_contacts().get("3165551111").map(String::as_str), Some("Alex Smith"));
@@ -2212,7 +2923,11 @@ mod tests {
         p.apply(&[tup(1, 10, &["111"], 100)]);
         p.m.select(10, &p.store, 0.0);
         let effects = p.m.delete(10, true, &p.store, &mut p.hidden, 1_000);
-        assert!(effects.iter().any(|e| matches!(e, Effect::DeleteOnPhone { thread_id: 10, addresses } if !addresses.is_empty())));
+        assert!(
+            effects
+                .iter()
+                .any(|e| matches!(e, Effect::DeleteOnPhone { thread_id: 10, addresses } if !addresses.is_empty()))
+        );
         assert!(effects.contains(&Effect::ShowEmpty));
         assert!(p.visible().is_empty());
         assert!(p.store.load_conversations("dev1").is_empty());
@@ -2280,7 +2995,10 @@ mod tests {
         let mut acts = p.m.on_conversation_loaded(77, 1.0);
         acts.extend(p.m.on_conversation_loaded(10, 1.0));
         acts.extend(p.m.on_conversation_loaded(10, 1.0));
-        assert_eq!(acts, vec![Effect::Sync(Action::ReplayFromDaemon { thread_id: 10, start: 0, end: GAP_FILL_MESSAGES })]);
+        assert_eq!(
+            acts,
+            vec![Effect::Sync(Action::ReplayFromDaemon { thread_id: 10, start: 0, end: GAP_FILL_MESSAGES })]
+        );
     }
 
     #[test]
@@ -2587,7 +3305,10 @@ mod tests {
             let (_, uid, shown) = send_now(&mut p, tid, "on my way");
             assert!(shown.contains(&Effect::ShowThread(tid)), "{shown:?}");
             let conv = p.m.index.get(tid).unwrap();
-            assert_eq!(conv.messages.last().map(|m| (m.uid, m.body.as_str(), m.is_sent())), Some((uid, "on my way", true)));
+            assert_eq!(
+                conv.messages.last().map(|m| (m.uid, m.body.as_str(), m.is_sent())),
+                Some((uid, "on my way", true))
+            );
             assert_eq!(p.m.route_of(uid).map(SendRoute::label), Some("RCS · Sending"));
             // Two of the same text: each echo takes its own bubble.
             let (_, uid2, _) = send_now(&mut p, tid, "on my way");
@@ -2621,7 +3342,8 @@ mod tests {
             let tid = p.store.gm_local_id("conv", "a");
             let mut q = gmsg("a", "1", false, 1000);
             q.text = "dinner?".into();
-            q.reactions = vec![GmReaction { emoji: "👍".into(), count: 1, mine: false, by: vec!["+13165551111".into()] }];
+            q.reactions =
+                vec![GmReaction { emoji: "👍".into(), count: 1, mine: false, by: vec!["+13165551111".into()] }];
             p.msg(&q);
             let mut r = gmsg("a", "2", true, 1500);
             r.text = "yes".into();
@@ -2630,7 +3352,10 @@ mod tests {
             p.m.select(tid, &p.store, 0.0);
             let (u1, u2) = (p.store.gm_local_id("msg", "1"), p.store.gm_local_id("msg", "2"));
             let ex = p.m.gm_extras(tid, &p.store);
-            assert_eq!(ex[&u1].reactions.iter().map(|c| (c.emoji.as_str(), c.count, c.mine)).collect::<Vec<_>>(), [("👍", 1, false)]);
+            assert_eq!(
+                ex[&u1].reactions.iter().map(|c| (c.emoji.as_str(), c.count, c.mine)).collect::<Vec<_>>(),
+                [("👍", 1, false)]
+            );
             let quote = ex[&u2].quote.clone().unwrap();
             assert_eq!((quote.text.as_str(), quote.uid), ("dinner?", Some(u1)));
             assert!(ex[&u2].reactions.is_empty());
@@ -2639,7 +3364,13 @@ mod tests {
             assert_eq!(
                 fx,
                 vec![
-                    Effect::GmReact { thread_id: tid, conv: "a".into(), msg: "1".into(), emoji: "😂".into(), action: "add" },
+                    Effect::GmReact {
+                        thread_id: tid,
+                        conv: "a".into(),
+                        msg: "1".into(),
+                        emoji: "😂".into(),
+                        action: "add"
+                    },
                     Effect::Redraw(tid)
                 ]
             );
@@ -2655,7 +3386,190 @@ mod tests {
             let e = p.m.send(tid, "and dessert");
             assert!(matches!(&e[..], [Effect::GmSend { reply_to: None, .. }]), "{e:?}");
             // A refusal says so and fetches the phone's truth.
-            assert_eq!(p.m.gm_react_failed(tid), vec![Effect::Toast(TOAST_GM_REACT_FAILED), Effect::GmFetch { thread_id: tid }]);
+            assert_eq!(
+                p.m.gm_react_failed(tid),
+                vec![Effect::Toast(TOAST_GM_REACT_FAILED), Effect::GmFetch { thread_id: tid }]
+            );
+        }
+
+        #[test]
+        fn typing_shows_for_a_while_and_stops_with_their_text() {
+            let mut p = panel();
+            p.chat(&chat("a", &["+13165551111", "+13165552222"], false, 2000));
+            let tid = p.store.gm_local_id("conv", "a");
+            p.m.contact_map.insert(normalize_phone("+13165551111"), "Sam Ortiz".into());
+            p.m.select(tid, &p.store, 0.0);
+            assert_eq!(p.m.gm_typing(tid, "+13165551111", true, 100.0), vec![Effect::Typing(tid)]);
+            assert_eq!(p.m.typing_label(tid, 101.0), Some(("Sam is typing…".to_string(), 100.0 + TYPING_SHOWN_SECS)));
+            p.m.gm_typing(tid, "+13165552222", true, 102.0);
+            assert_eq!(p.m.typing_label(tid, 103.0).unwrap().0, "Sam and +13165552222 are typing…");
+            // Runs out without news.
+            assert_eq!(p.m.typing_label(tid, 200.0), None);
+            // Their text ends it.
+            p.m.gm_typing(tid, "+13165551111", true, 300.0);
+            let mut m = gmsg("a", "1", false, 3000);
+            m.from = "+13165551111".into();
+            assert!(p.msg(&m).contains(&Effect::Typing(tid)));
+            assert_eq!(p.m.typing_label(tid, 301.0), None);
+            // Mine goes to the phone, at most every few seconds.
+            assert_eq!(p.m.gm_typing_out(tid, 10.0), vec![Effect::GmTyping { conv: "a".into() }]);
+            assert!(p.m.gm_typing_out(tid, 12.0).is_empty());
+            assert_eq!(p.m.gm_typing_out(tid, 16.0).len(), 1);
+            // Not in an SMS chat.
+            let mut sms = chat("b", &["+13165553333"], false, 2000);
+            sms.rcs = false;
+            p.chat(&sms);
+            assert!(p.m.gm_typing_out(p.store.gm_local_id("conv", "b"), 100.0).is_empty());
+        }
+
+        #[test]
+        fn older_pages_come_while_the_phone_has_more() {
+            let mut p = panel();
+            p.chat(&chat("a", &["+13165551111"], false, 2000));
+            let tid = p.store.gm_local_id("conv", "a");
+            p.m.select(tid, &p.store, 0.0);
+            assert!(!p.m.gm_more_history(tid));
+            let c1 = Cursor { id: "m50".into(), ts_ms: 50 };
+            assert_eq!(p.m.gm_page("a", Some(c1.clone()), false, 50), vec![Effect::MoreHistory(tid)]);
+            assert!(p.m.gm_more_history(tid));
+            assert_eq!(p.m.gm_older(tid), vec![Effect::GmFetchOlder { thread_id: tid, conv: "a".into(), cursor: c1 }]);
+            assert!(p.m.gm_loading_older(tid));
+            assert!(p.m.gm_older(tid).is_empty(), "one page at a time");
+            // A newest page again doesn't undo the older one.
+            let c2 = Cursor { id: "m100".into(), ts_ms: 10 };
+            p.m.gm_page("a", Some(c2.clone()), true, 50);
+            p.m.gm_page("a", Some(Cursor { id: "m50".into(), ts_ms: 50 }), false, 50);
+            assert_eq!(p.m.gm_older(tid), vec![Effect::GmFetchOlder { thread_id: tid, conv: "a".into(), cursor: c2 }]);
+            // An empty page: no more.
+            p.m.gm_page("a", Some(Cursor { id: "x".into(), ts_ms: 1 }), true, 0);
+            assert!(!p.m.gm_more_history(tid) && !p.m.gm_loading_older(tid));
+        }
+
+        #[test]
+        fn archive_pin_mute_and_block() {
+            let mut p = panel();
+            p.chat(&chat("a", &["+13165551111"], false, 3000));
+            p.chat(&chat("b", &["+13165552222"], false, 2000));
+            let mut arch = chat("c", &["+13165553333"], false, 1000);
+            arch.archived = true;
+            p.chat(&arch);
+            let (a, b, c) =
+                (p.store.gm_local_id("conv", "a"), p.store.gm_local_id("conv", "b"), p.store.gm_local_id("conv", "c"));
+            let shown = |p: &Panel| p.m.visible(&p.hidden).iter().map(|c| c.thread_id).collect::<Vec<_>>();
+            assert_eq!(shown(&p), [a, b]);
+            assert_eq!(p.m.archived_count(), 1);
+            p.m.set_show_archived(true);
+            assert_eq!(shown(&p), [c]);
+            p.m.set_show_archived(false);
+            // Archiving shows at once and goes to the phone.
+            let fx = p.m.chat_action(a, ChatAction::Archive, &p.store);
+            assert_eq!(fx[0], Effect::GmUpdateChat { thread_id: a, conv: "a".into(), change: ChatChange::Archive });
+            assert_eq!(shown(&p), [b]);
+            // Refused: back it comes, with a word.
+            assert_eq!(
+                p.m.gm_chat_changed(a, ChatChange::Archive, false, &p.store)[0],
+                Effect::Toast(TOAST_GM_CHAT_CHANGE_FAILED)
+            );
+            assert_eq!(shown(&p), [a, b]);
+            // Pins are kept here (and survive a restart); mute goes to the phone too.
+            assert_eq!(p.m.chat_action(b, ChatAction::Pin, &p.store), vec![Effect::RefreshList]);
+            assert!(matches!(
+                p.m.chat_action(b, ChatAction::Mute, &p.store)[0],
+                Effect::GmUpdateChat { change: ChatChange::Mute, .. }
+            ));
+            let f = p.m.chat_flags();
+            assert!(f[&b].pinned && f[&b].muted && f[&b].gm && !f[&a].pinned);
+            p.m.reset_for_device(Some("gm:3165550000"), true);
+            p.m.load_cached(&p.store);
+            let f = p.m.chat_flags();
+            assert!(f[&b].pinned && f[&b].muted && f[&c].archived);
+            // The phone's own pin shows too.
+            let mut pinned = chat("a", &["+13165551111"], false, 3000);
+            pinned.pinned = true;
+            p.chat(&pinned);
+            assert!(p.m.chat_flags()[&a].pinned);
+            // Blocked: it leaves the list once the phone took it.
+            p.m.chat_action(a, ChatAction::Block, &p.store);
+            assert!(shown(&p).contains(&a));
+            p.m.gm_chat_changed(a, ChatChange::Block, true, &p.store);
+            assert!(!shown(&p).contains(&a));
+            // Moved to spam on the phone: same.
+            let mut spam = chat("b", &["+13165552222"], false, 2000);
+            spam.blocked = true;
+            p.chat(&spam);
+            assert!(!shown(&p).contains(&b));
+        }
+
+        #[test]
+        fn groups_start_from_several_people_and_send_pictures_first() {
+            let mut p = panel();
+            p.chat(&chat("g", &["+13165551111", "+13165552222"], false, 2000));
+            let g = p.store.gm_local_id("conv", "g");
+            // The same people: the group that is there.
+            let e = p.m.open_group(&["+1 316 555 2222".into(), "+13165551111".into()], "");
+            assert!(e.contains(&Effect::ShowThread(g)), "{e:?}");
+            // New people: a draft, made on the phone with its first text and pictures.
+            let e = p.m.open_group(&["+13165551111".into(), "+13165553333".into()], "");
+            let Some(Effect::ShowThread(draft)) = e.last().cloned() else { panic!("{e:?}") };
+            assert!(draft < 0);
+            let e = p.m.send_with(draft, "hi all", vec!["/tmp/a.jpg".into(), "/tmp/b.pdf".into()]);
+            assert_eq!(
+                e[0],
+                Effect::GmSendNew {
+                    addresses: vec!["+13165551111".into(), "+13165553333".into()],
+                    text: "hi all".into(),
+                    attachments: vec!["/tmp/a.jpg".into(), "/tmp/b.pdf".into()]
+                }
+            );
+            p.chat(&chat("n", &["+13165551111", "+13165553333"], false, 3000));
+            let tid = p.store.gm_local_id("conv", "n");
+            let sends: Vec<(String, Option<String>)> =
+                p.m.gm_opened(tid, "n", "hi all", vec!["/tmp/a.jpg".into(), "/tmp/b.pdf".into()])
+                    .into_iter()
+                    .filter_map(|e| match e {
+                        Effect::GmSend { text, file, .. } => Some((text, file)),
+                        _ => None,
+                    })
+                    .collect();
+            assert_eq!(
+                sends,
+                [("hi all".into(), Some("/tmp/a.jpg".into())), (String::new(), Some("/tmp/b.pdf".into()))]
+            );
+        }
+
+        #[test]
+        fn a_preview_picture_gives_way_to_the_full_one() {
+            let mut p = panel();
+            p.chat(&chat("a", &["+13165551111"], false, 2000));
+            let tid = p.store.gm_local_id("conv", "a");
+            p.m.select(tid, &p.store, 0.0);
+            let att = |id: &str, thumb: bool| crate::core::gm::GmAttachment {
+                id: id.into(),
+                mime: "image/jpeg".into(),
+                key: "a2V5".into(),
+                thumb,
+                part: "p1".into(),
+                ..Default::default()
+            };
+            let mut m = gmsg("a", "1", false, 1000);
+            m.attachments = vec![att("thumb", true)];
+            p.msg(&m);
+            m.attachments = vec![att("full", false)];
+            assert_eq!(p.msg(&m), vec![Effect::Redraw(tid)]);
+            let uid = p.store.gm_local_id("msg", "1");
+            let row = p.m.index.get(tid).unwrap().messages.iter().find(|x| x.uid == uid).unwrap();
+            assert_eq!(row.attachments[0].unique_identifier, "gm:full");
+            // Kept that way on disk.
+            let saved = p.store.load_conversations("gm:3165550000");
+            assert!(
+                saved
+                    .values()
+                    .flat_map(|c| &c.messages)
+                    .any(|x| { x.attachments.iter().any(|a| a.unique_identifier == "gm:full") })
+            );
+            // A late copy of the preview doesn't take its place again.
+            m.attachments = vec![att("thumb", true)];
+            assert!(p.msg(&m).is_empty());
         }
 
         #[test]
@@ -2664,7 +3578,12 @@ mod tests {
             p.chat(&chat("a", &["+13165551111"], false, 2000));
             let tid = p.store.gm_local_id("conv", "a");
             let mut pic = gmsg("a", "1", false, 1000);
-            pic.attachments = vec![crate::core::gm::GmAttachment { id: "m1".into(), mime: "image/jpeg".into(), key: "a2V5".into(), ..Default::default() }];
+            pic.attachments = vec![crate::core::gm::GmAttachment {
+                id: "m1".into(),
+                mime: "image/jpeg".into(),
+                key: "a2V5".into(),
+                ..Default::default()
+            }];
             p.msg(&pic);
             let uid = p.store.gm_local_id("msg", "1");
             let dir = tempfile::tempdir().unwrap();
@@ -2683,7 +3602,8 @@ mod tests {
             assert_eq!(attachments::existing_full_in(&cache, att), Some(dest));
             // A row saved without its key takes it when the phone sends it again.
             let mut old = gmsg("a", "2", false, 1100);
-            old.attachments = vec![crate::core::gm::GmAttachment { id: "m2".into(), mime: "image/png".into(), ..Default::default() }];
+            old.attachments =
+                vec![crate::core::gm::GmAttachment { id: "m2".into(), mime: "image/png".into(), ..Default::default() }];
             p.msg(&old);
             let uid2 = p.store.gm_local_id("msg", "2");
             assert!(p.m.take_gm_downloads(tid, &[uid2].into(), &cache).is_empty(), "no key yet");
@@ -2720,11 +3640,14 @@ mod tests {
             p.m.open_or_create("+13165559999", "");
             let draft = p.m.active_thread().unwrap();
             let e = p.m.send(draft, "hi me");
-            assert_eq!(e[0], Effect::GmSendNew { addresses: vec!["+13165559999".into()], text: "hi me".into() });
+            assert_eq!(
+                e[0],
+                Effect::GmSendNew { addresses: vec!["+13165559999".into()], text: "hi me".into(), attachments: vec![] }
+            );
             // The phone answers with the chat; its conversation event lands first.
             p.chat(&chat("new", &["+13165559999"], false, 0));
             let tid = p.store.gm_local_id("conv", "new");
-            let e = p.m.gm_opened(tid, "new", "hi me");
+            let e = p.m.gm_opened(tid, "new", "hi me", vec![]);
             assert!(matches!(&e[0], Effect::GmSend { conv, text, .. } if conv == "new" && text == "hi me"));
             assert!(e.contains(&Effect::ShowThread(tid)));
             assert_eq!(p.m.active_thread(), Some(tid));

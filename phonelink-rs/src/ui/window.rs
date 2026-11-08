@@ -254,6 +254,7 @@ impl Window {
                         p.refilter();
                     }
                 }),
+                messages.gm_controls(),
             )
         };
         body.add_named(&settings_page.widget, Some("settings"));
@@ -315,6 +316,7 @@ impl Window {
         settings_btn.connect_clicked(move |_| {
             if let Some(this) = weak.upgrade() {
                 this.settings_page.refresh_google_status();
+                this.settings_page.refresh_gm_status();
                 this.body.set_visible_child_name("settings");
             }
         });
@@ -378,7 +380,9 @@ impl Window {
         // Safety net in case a signal is ever missed; events do the real work.
         let weak = Rc::downgrade(&this);
         glib::timeout_add_seconds_local(shell::WATCHDOG_SECONDS, move || {
-            let Some(this) = weak.upgrade() else { return glib::ControlFlow::Break };
+            let Some(this) = weak.upgrade() else {
+                return glib::ControlFlow::Break;
+            };
             if this.client.borrow().is_none() {
                 this.start();
             } else if this.daemon_up.get() {
@@ -390,7 +394,9 @@ impl Window {
         // Close hides to the tray; without a tray (or from the tray's Quit) it quits.
         let weak = Rc::downgrade(&this);
         this.window.connect_close_request(move |w| {
-            let Some(this) = weak.upgrade() else { return glib::Propagation::Proceed };
+            let Some(this) = weak.upgrade() else {
+                return glib::Propagation::Proceed;
+            };
             if this.tray_shown.get() && !this.quitting.get() {
                 w.set_visible(false);
                 return glib::Propagation::Stop;
@@ -402,7 +408,9 @@ impl Window {
     }
 
     fn start_tray(self: &Rc<Self>, app: &adw::Application) {
-        let Some(conn) = app.dbus_connection() else { return };
+        let Some(conn) = app.dbus_connection() else {
+            return;
+        };
         let weak = Rc::downgrade(self);
         let toggle: Rc<dyn Fn()> = Rc::new(move || {
             let Some(this) = weak.upgrade() else { return };
@@ -438,7 +446,9 @@ impl Window {
     }
 
     fn show_status(&self, icon: &str, title: &str, description: &str) {
-        let Some(page) = self.body.child_by_name("status").and_downcast::<adw::StatusPage>() else { return };
+        let Some(page) = self.body.child_by_name("status").and_downcast::<adw::StatusPage>() else {
+            return;
+        };
         page.set_icon_name(Some(&icons::resolve(icon)));
         page.set_title(title);
         page.set_description(Some(description));
@@ -640,7 +650,9 @@ impl Window {
             return;
         }
         let target = self.devices.borrow().iter().find(|d| d.id == id).cloned();
-        let Some(client) = self.client.borrow().clone() else { return };
+        let Some(client) = self.client.borrow().clone() else {
+            return;
+        };
         if let Some(target) = target {
             self.set_device(&client, Some(target));
             self.update_switcher();
@@ -681,7 +693,9 @@ impl Window {
             let weak = Rc::downgrade(self);
             let share = format!("{base}/share");
             subs.push(signals::subscribe(client.bus(), &share, IFACE_SHARE, "shareReceived", move |p| {
-                let (Some(this), Some((url,))) = (weak.upgrade(), p.get::<(String,)>()) else { return };
+                let (Some(this), Some((url,))) = (weak.upgrade(), p.get::<(String,)>()) else {
+                    return;
+                };
                 this.files.share_received(&url);
                 if !(url.starts_with("http://") || url.starts_with("https://")) {
                     return;
@@ -723,13 +737,17 @@ impl Window {
         let drop = gtk::DropTarget::new(gio::File::static_type(), gtk::gdk::DragAction::COPY);
         let weak = Rc::downgrade(self);
         drop.connect_drop(move |_, value, _, _| {
-            let Some(this) = weak.upgrade() else { return false };
+            let Some(this) = weak.upgrade() else {
+                return false;
+            };
             let dev = this.device.borrow().clone().filter(|d| d.reachable);
             let (Some(dev), Some(client)) = (dev, this.client.borrow().clone()) else {
                 this.toast("No connected device — cannot send file");
                 return false;
             };
-            let Some(path) = value.get::<gio::File>().ok().and_then(|f| f.path()) else { return false };
+            let Some(path) = value.get::<gio::File>().ok().and_then(|f| f.path()) else {
+                return false;
+            };
             let name = path.file_name().map(|n| n.to_string_lossy().into_owned()).unwrap_or_default();
             this.toast(&format!("Sending {name} to {}…", dev.name));
             let path = path.to_string_lossy().into_owned();
@@ -744,7 +762,9 @@ impl Window {
         let keys = gtk::EventControllerKey::new();
         let weak = Rc::downgrade(self);
         keys.connect_key_pressed(move |_, key, _, state| {
-            let Some(this) = weak.upgrade() else { return glib::Propagation::Proceed };
+            let Some(this) = weak.upgrade() else {
+                return glib::Propagation::Proceed;
+            };
             if state.contains(gtk::gdk::ModifierType::CONTROL_MASK) && key == gtk::gdk::Key::n {
                 this.notif_toggle.set_active(!this.notif_toggle.is_active());
                 return glib::Propagation::Stop;

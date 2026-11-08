@@ -5,6 +5,7 @@ pub mod clipboard_page;
 pub mod conversation_list;
 pub mod files_page;
 pub mod gm_link;
+pub mod gm_pair;
 pub mod google_sync;
 pub mod icons;
 pub mod messages_page;
@@ -41,7 +42,9 @@ fn check_versions() -> Result<(), String> {
 }
 
 fn python_app_running() -> bool {
-    let Ok(bus) = gio::bus_get_sync(gio::BusType::Session, gio::Cancellable::NONE) else { return false };
+    let Ok(bus) = gio::bus_get_sync(gio::BusType::Session, gio::Cancellable::NONE) else {
+        return false;
+    };
     bus.call_sync(
         Some("org.freedesktop.DBus"),
         "/org/freedesktop/DBus",
@@ -101,6 +104,9 @@ const EXTRA_CSS: &str = "
 .message-image { border-radius: 18px; background-color: alpha(currentColor, 0.06); }
 .message-file-chip { padding: 6px 4px; }
 .compose-thumb { border-radius: 12px; }
+.compose-file { border-radius: 12px; background-color: alpha(currentColor, 0.08); }
+.typing-label { font-style: italic; }
+.conversation-pin { opacity: 0.6; }
 /* Settings open: no tab looks selected, the gear looks pressed instead. */
 viewswitcher.in-settings button:checked { background: none; box-shadow: none; }
 viewswitcher.in-settings button:checked:hover { background-color: alpha(currentColor, 0.07); }

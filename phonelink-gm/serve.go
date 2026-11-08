@@ -20,6 +20,10 @@ package main
 //	{"id":10, "op":"react", "conv":ID, "msg":MSG, "emoji":"👍", "action":"add"|"remove"|"switch"}
 //	{"id":9, "op":"download", "media":ID, "key":KEY, "path":"/x/a.jpg"}
 //	                                                       -> ok once the decrypted file is at path (0600)
+//	{"id":11, "op":"typing", "conv":ID}                   "I'm typing" (the phone shows it for a few seconds)
+//	{"id":12, "op":"update_chat", "conv":ID, "change":"archive"|"unarchive"|"mute"|"unmute"|"block"|"spam"|"unblock"}
+//	                                                       -> ok when the phone took it; the chat's conversation
+//	                                                          event follows ("spam" blocks and reports it)
 //	{"id":6, "op":"set_active"}                            take the web session back from another browser
 //	{"id":7, "op":"open_conversation", "numbers":["+13165551234"]}
 //	                                                       -> "conv":ID of the chat with exactly them (made if new);
@@ -30,11 +34,13 @@ package main
 //	{"event":"ready", "me":["3165550000"]}   connected (my own number keys); every chat follows, then
 //	                                         any messages that arrived while connecting
 //	{"event":"conversation", "chat":KEY, "conv":ID, "name", "members":[{"number","name"}],
-//	 "group", "rcs", "read_only", "archived", "unread", "last_ts_ms", "preview"}
+//	 "group", "rcs", "read_only", "archived", "pinned", "blocked", "unread", "last_ts_ms", "preview"}
 //	{"event":"message", "conv":ID, "msg":ID, "tmp_id", "ts_ms", "from_me", "from", "name",
-//	 "text", "status", "rcs", "deleted", "old", "attachments":[{"id","mime","name","size","key"}],
+//	 "text", "status", "rcs", "deleted", "old", "attachments":[{"id","mime","name","size","key","thumb","part"}],
 //	 "reply_to":MSG, "reactions":[{"emoji","count","mine","by":[numbers]}]}
-//	                                         (a reaction changing sends the message again)
+//	                                         (a reaction changing sends the message again; so does a
+//	                                         picture whose full size ("thumb": only a preview) arrives)
+//	{"event":"typing", "conv":ID, "from":NUMBER, "typing":true}   someone else in the chat started (or stopped) typing
 //	{"event":"session", "state":"inactive"}  another browser took the web session
 //	{"event":"phone", "responding":false}
 //
@@ -89,6 +95,7 @@ type request struct {
 	ReplyTo    string   `json:"reply_to,omitempty"`
 	Emoji      string   `json:"emoji,omitempty"`
 	Action     string   `json:"action,omitempty"`
+	Change     string   `json:"change,omitempty"`
 }
 
 type cursor struct {
@@ -229,6 +236,28 @@ func newTmpID() string {
 func serve(l *link, timeout time.Duration) int {
 	out := &lines{enc: json.NewEncoder(os.Stdout)}
 	state := &chats{byID: map[string]*gmproto.Conversation{}, simsSeen: make(chan struct{})}
+	// askFullSize asks the phone, once per picture, for the full file of
+	// one only a preview of is on Google's side (as the mautrix bridge does).
+	var askedMu sync.Mutex
+	asked := map[string]bool{}
+	askFullSize := func(ev msgEvent) {
+		for _, part := range thumbParts(ev) {
+			askedMu.Lock()
+			seen := asked[ev.Msg+"/"+part]
+			asked[ev.Msg+"/"+part] = true
+			askedMu.Unlock()
+			if seen {
+				continue
+			}
+			go func() {
+				ctx, cancel := context.WithTimeout(context.Background(), 60*time.Second)
+				defer cancel()
+				if _, err := l.cli.GetFullSizeImage(ctx, ev.Msg, part); err != nil {
+					l.logger.Warn().Err(err).Msg("asking for a full-size picture")
+				}
+			}()
+		}
+	}
 	l.onEvent = func(evt any) {
 		switch e := evt.(type) {
 		case *gmproto.Conversation:
@@ -246,7 +275,14 @@ func serve(l *link, timeout time.Duration) int {
 			if ev, ok := messageEvent(e.Message, state.get(e.GetConversationID())); ok {
 				ev.Old = e.IsOld
 				out.event(ev)
+				askFullSize(ev)
 			}
+		case *gmproto.TypingData:
+			from := e.GetUser().GetNumber()
+			if from == "" || myKeys(state.all())[phoneKey(from)] {
+				return
+			}
+			out.event(map[string]any{"event": "typing", "conv": e.GetConversationID(), "from": from, "typing": e.GetType() == gmproto.TypingTypes_STARTED_TYPING})
 		case *gmproto.Settings:
 			state.setSIMs(e)
 		case *events.BrowserActive:
@@ -391,6 +427,7 @@ func serve(l *link, timeout time.Duration) int {
 				if ev, ok := messageEvent(m, conv); ok {
 					ev.Event = ""
 					r.Messages = append(r.Messages, ev)
+					askFullSize(ev)
 				}
 			}
 			if c := resp.GetCursor(); c != nil && c.GetLastItemID() != "" {
@@ -486,6 +523,51 @@ func serve(l *link, timeout time.Duration) int {
 			}
 			if !resp.GetSuccess() {
 				return failed(req.ID, "refused", "the phone refused the reaction")
+			}
+			return reply{ID: req.ID, OK: true}
+		case "typing":
+			conv := conversation(ctx, req.Conv)
+			if conv == nil {
+				return failed(req.ID, "not_found", "no chat %s", req.Conv)
+			}
+			if state.setInactive(false) {
+				if err := takeBack(ctx); err != nil {
+					state.setInactive(true)
+					return failed(req.ID, "inactive", "Google Messages is open in another browser: %v", err)
+				}
+			}
+			sim, _ := chatSIM(conv, state.getSIMs())
+			if err := l.cli.SetTyping(ctx, conv.GetConversationID(), sim.GetSIMData().GetSIMPayload()); err != nil {
+				return failed(req.ID, "failed", "%v", err)
+			}
+			return reply{ID: req.ID, OK: true}
+		case "update_chat":
+			change, ok := chatChange(req.Conv, req.Change)
+			if req.Conv == "" || !ok {
+				return failed(req.ID, "usage", "update_chat needs conv and a change")
+			}
+			if conversation(ctx, req.Conv) == nil {
+				return failed(req.ID, "not_found", "no chat %s", req.Conv)
+			}
+			if state.setInactive(false) {
+				if err := takeBack(ctx); err != nil {
+					state.setInactive(true)
+					return failed(req.ID, "inactive", "Google Messages is open in another browser: %v", err)
+				}
+			}
+			resp, err := l.cli.UpdateConversation(ctx, change)
+			if err != nil {
+				return failed(req.ID, "failed", "%v", err)
+			}
+			if !resp.GetSuccess() {
+				return failed(req.ID, "refused", "the phone refused that change")
+			}
+			// The phone usually sends the changed chat; send ours too.
+			if c, err := l.cli.GetConversation(ctx, req.Conv); err == nil && c != nil {
+				state.set(c)
+				if ev, ok := conversationEvent(c); ok {
+					out.put(ev)
+				}
 			}
 			return reply{ID: req.ID, OK: true}
 		case "open_conversation":

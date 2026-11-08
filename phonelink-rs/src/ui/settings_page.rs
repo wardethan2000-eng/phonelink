@@ -34,6 +34,25 @@ pub fn apply_color_scheme(scheme: &str) {
     adw::StyleManager::default().set_color_scheme(scheme);
 }
 
+/// What Settings needs from the Messages tab for Google Messages.
+pub struct GmControls {
+    /// Is Google Messages linked on this computer?
+    pub linked: Rc<dyn Fn() -> bool>,
+    /// Linking just finished: start the link.
+    pub linked_now: Rc<dyn Fn()>,
+    /// Unlink; the callback gets (ok, the phone was told).
+    pub unlink: Rc<dyn Fn(UnlinkDone)>,
+}
+
+/// Told when unlinking ends: (ok, the phone was told).
+pub type UnlinkDone = Box<dyn FnOnce(bool, bool)>;
+
+struct GmRows {
+    status: adw::ActionRow,
+    link: gtk::Button,
+    unlink: gtk::Button,
+}
+
 struct GoogleRows {
     account: adw::ActionRow,
     connect: gtk::Button,
@@ -47,6 +66,8 @@ pub struct SettingsPage {
     settings: Rc<RefCell<Settings>>,
     google: Rc<GoogleSync>,
     google_rows: GoogleRows,
+    gm: GmControls,
+    gm_rows: GmRows,
     ignored_group: adw::PreferencesGroup,
     ignored_rows: RefCell<Vec<adw::ActionRow>>,
     /// Notification settings changed (the sidebar re-filters).
@@ -81,6 +102,7 @@ impl SettingsPage {
         google: Rc<GoogleSync>,
         on_back: impl Fn() + 'static,
         on_notifications_changed: Rc<dyn Fn()>,
+        gm: GmControls,
     ) -> Rc<Self> {
         let widget = gtk::Box::new(gtk::Orientation::Horizontal, 0);
 
@@ -107,9 +129,10 @@ impl SettingsPage {
         categories.set_selection_mode(gtk::SelectionMode::Single);
         categories.add_css_class("navigation-sidebar");
         categories.set_vexpand(true);
-        let keys = ["general", "google", "appearance", "notifications"];
+        let keys = ["general", "messages", "google", "appearance", "notifications"];
         for (icon, label) in [
             ("emblem-system-symbolic", "General"),
+            ("mail-send-symbolic", "Google Messages"),
             ("avatar-default-symbolic", "Google Contacts"),
             ("display-brightness-symbolic", "Appearance"),
             ("xsi-notifications-symbolic", "Notifications"),
@@ -148,10 +171,50 @@ impl SettingsPage {
         );
         if !AUTOSTART_WIRED {
             open_on_login.set_sensitive(false);
-            open_on_login.set_subtitle("The old Python Phone Link opens at login. This moves to the new version when you switch over.");
+            open_on_login.set_subtitle(
+                "The old Python Phone Link opens at login. This moves to the new version when you switch over.",
+            );
         }
         startup.add(&open_on_login);
         content.add_named(&page_with(&[&startup]), Some("general"));
+
+        // Google Messages.
+        let gm_group = group("Google Messages");
+        gm_group.set_description(Some(
+            "Linked, PhoneRelay sends and receives your texts through Google Messages on your phone: RCS chats stay RCS, with reactions, replies, read receipts and typing. Not linked, texts go through KDE Connect (SMS and MMS only).",
+        ));
+        let gm_status = adw::ActionRow::new();
+        gm_status.set_title("Google Messages");
+        let gm_link = gtk::Button::with_label("Link");
+        gm_link.add_css_class("suggested-action");
+        gm_link.set_valign(gtk::Align::Center);
+        let gm_unlink = gtk::Button::with_label("Unlink");
+        gm_unlink.add_css_class("destructive-action");
+        gm_unlink.set_valign(gtk::Align::Center);
+        gm_status.add_suffix(&gm_link);
+        gm_status.add_suffix(&gm_unlink);
+        gm_group.add(&gm_status);
+        let gm_info = group("Good to Know");
+        for (t, sub) in [
+            (
+                "Signing in",
+                "Linking opens a separate browser window to sign in to Google. Your own browser and its sign-ins aren't touched. It needs Chrome, Chromium, Brave, Edge or Vivaldi.",
+            ),
+            (
+                "One computer at a time",
+                "Like Google Messages for web, only one browser or app can use the link at once. Opening messages.google.com elsewhere takes it over; PhoneRelay offers to take it back.",
+            ),
+            (
+                "Your phone stays in charge",
+                "Your phone must be online. After about two weeks without use, Google may ask you to link again.",
+            ),
+        ] {
+            let r = adw::ActionRow::new();
+            r.set_title(t);
+            r.set_subtitle(sub);
+            gm_info.add(&r);
+        }
+        content.add_named(&page_with(&[&gm_group, &gm_info]), Some("messages"));
 
         // Google Contacts.
         let account_group = group("Account");
@@ -226,10 +289,67 @@ impl SettingsPage {
             widget,
             settings: settings.clone(),
             google: google.clone(),
-            google_rows: GoogleRows { account, connect: connect.clone(), refresh: refresh.clone(), disconnect: disconnect.clone(), background: background.clone() },
+            google_rows: GoogleRows {
+                account,
+                connect: connect.clone(),
+                refresh: refresh.clone(),
+                disconnect: disconnect.clone(),
+                background: background.clone(),
+            },
+            gm,
+            gm_rows: GmRows { status: gm_status, link: gm_link.clone(), unlink: gm_unlink.clone() },
             ignored_group,
             ignored_rows: RefCell::default(),
             on_notifications_changed,
+        });
+        let weak = Rc::downgrade(&this);
+        gm_link.connect_clicked(move |b| {
+            let Some(this) = weak.upgrade() else { return };
+            let parent = b.root().and_downcast::<gtk::Window>();
+            let w = Rc::downgrade(&this);
+            super::gm_pair::link_dialog(parent.as_ref(), move || {
+                if let Some(this) = w.upgrade() {
+                    (this.gm.linked_now)();
+                    this.refresh_gm_status();
+                }
+            });
+        });
+        let weak = Rc::downgrade(&this);
+        gm_unlink.connect_clicked(move |b| {
+            let Some(this) = weak.upgrade() else { return };
+            let parent = b.root().and_downcast::<gtk::Window>();
+            let dialog = adw::MessageDialog::new(
+                parent.as_ref(),
+                Some("Unlink Google Messages?"),
+                Some("Texts go back to KDE Connect (SMS and MMS only), and this computer is removed from your phone's paired devices. You can link again any time."),
+            );
+            dialog.add_response("cancel", "Cancel");
+            dialog.add_response("unlink", "Unlink");
+            dialog.set_response_appearance("unlink", adw::ResponseAppearance::Destructive);
+            dialog.set_default_response(Some("cancel"));
+            dialog.set_close_response("cancel");
+            let w = Rc::downgrade(&this);
+            dialog.connect_response(None, move |_, response| {
+                if response != "unlink" {
+                    return;
+                }
+                let Some(this) = w.upgrade() else { return };
+                this.gm_rows.unlink.set_sensitive(false);
+                this.gm_rows.status.set_subtitle("Unlinking…");
+                let w2 = Rc::downgrade(&this);
+                (this.gm.unlink)(Box::new(move |ok, told| {
+                    let Some(this) = w2.upgrade() else { return };
+                    this.refresh_gm_status();
+                    if ok && !told {
+                        this.gm_rows.status.set_subtitle(
+                            "Unlinked here. Your phone couldn't be reached: remove this computer under Google Messages → Device pairing.",
+                        );
+                    } else if !ok {
+                        this.gm_rows.status.set_subtitle("Unlinking didn't finish. Try again.");
+                    }
+                }));
+            });
+            dialog.present();
         });
 
         categories.connect_row_selected(move |_, row| {
@@ -242,9 +362,7 @@ impl SettingsPage {
         }
         let s = settings.clone();
         open_on_login.connect_active_notify(move |r| {
-            if AUTOSTART_WIRED
-                && let Err(e) = s.borrow_mut().set_open_on_startup(r.is_active(), &autostart_exec())
-            {
+            if AUTOSTART_WIRED && let Err(e) = s.borrow_mut().set_open_on_startup(r.is_active(), &autostart_exec()) {
                 log::warn!("autostart: {e}");
             }
         });
@@ -293,7 +411,25 @@ impl SettingsPage {
         });
         this.rebuild_ignored();
         this.refresh_google_status();
+        this.refresh_gm_status();
         this
+    }
+
+    /// Linked or not, as the Google Messages row shows it.
+    pub fn refresh_gm_status(&self) {
+        let r = &self.gm_rows;
+        let installed = crate::core::phone_delete::helper_path().is_some();
+        let linked = (self.gm.linked)();
+        r.status.set_subtitle(if !installed {
+            "The Google Messages helper (phonelink-gm) isn't installed."
+        } else if linked {
+            "Linked. Texts go through Google Messages on your phone."
+        } else {
+            "Not linked. Texts go through KDE Connect (SMS only)."
+        });
+        r.link.set_visible(installed && !linked);
+        r.unlink.set_visible(linked);
+        r.unlink.set_sensitive(true);
     }
 
     /// Called each time the panel opens, as Python.

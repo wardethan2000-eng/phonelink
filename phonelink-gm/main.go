@@ -1,11 +1,15 @@
-// phonelink-gm deletes a conversation on the phone through the Google
-// Messages web link (libgm), using the session paired by gmcli.
+// phonelink-gm is PhoneRelay's Google Messages link (libgm): the lasting
+// `serve` connection (serve.go), linking (pair.go), and deleting chats.
+// The session lives at ~/.local/share/phonelink/gm/session.json; a
+// pairing gmcli made earlier is copied there once.
 //
 // KDE Connect can only read texts; only the default SMS app (Google
 // Messages) can delete them. PhoneRelay runs this helper when a chat is
 // deleted on the desktop.
 //
 //	phonelink-gm status
+//	phonelink-gm serve            (serve.go)
+//	phonelink-gm pair | unpair    (pair.go)
 //	phonelink-gm delete [--dry-run] CHAT...
 //	phonelink-gm members          (debugging: every chat's members, JSON lines)
 //
@@ -71,10 +75,39 @@ func fail(code, format string, a ...any) {
 	finish(result{Error: code, Message: fmt.Sprintf(format, a...)})
 }
 
+// defaultSession: PhoneRelay's own session file. A pairing gmcli made
+// before is copied in once (a marker remembers it, so unlinking stays
+// unlinked).
 func defaultSession() string {
 	if p := os.Getenv("PHONELINK_GM_SESSION"); p != "" {
 		return p
 	}
+	own := ownSession()
+	if _, err := os.Stat(own); err == nil {
+		return own
+	}
+	marker := filepath.Join(filepath.Dir(own), ".from-gmcli")
+	if _, err := os.Stat(marker); err == nil {
+		return own
+	}
+	if b, err := os.ReadFile(gmcliSession()); err == nil {
+		if os.MkdirAll(filepath.Dir(own), 0o700) == nil && writePrivate(own, b) == nil {
+			_ = os.WriteFile(marker, nil, 0o600)
+		}
+	}
+	return own
+}
+
+func ownSession() string {
+	data := os.Getenv("XDG_DATA_HOME")
+	if data == "" {
+		home, _ := os.UserHomeDir()
+		data = filepath.Join(home, ".local", "share")
+	}
+	return filepath.Join(data, "phonelink", "gm", "session.json")
+}
+
+func gmcliSession() string {
 	state := os.Getenv("XDG_STATE_HOME")
 	if state == "" {
 		home, _ := os.UserHomeDir()
@@ -387,17 +420,24 @@ func chatKeys(args []string) ([]string, error) {
 
 func main() {
 	if len(os.Args) < 2 {
-		fail("usage", "usage: phonelink-gm status | serve | members | delete [--dry-run] CHAT...")
+		fail("usage", "usage: phonelink-gm status | serve | pair | unpair | members | delete [--dry-run] CHAT...")
 	}
 	cmd := os.Args[1]
 	fs := flag.NewFlagSet(cmd, flag.ContinueOnError)
 	session := fs.String("session", defaultSession(), "gmcli session.json")
 	dryRun := fs.Bool("dry-run", false, "find the conversation but do not delete it")
 	timeout := fs.Duration("timeout", 60*time.Second, "give up after this long (serve: connecting only)")
+	browser := fs.String("browser", "", "pair: the Chromium-based browser to sign in with")
 	if err := fs.Parse(os.Args[2:]); err != nil {
 		fail("usage", "%v", err)
 	}
 
+	switch cmd {
+	case "pair":
+		os.Exit(pair(*session, *browser))
+	case "unpair":
+		os.Exit(unpair(*session))
+	}
 	auth, err := loadAuth(*session)
 	if cmd == "status" {
 		finish(result{OK: true, Paired: err == nil})

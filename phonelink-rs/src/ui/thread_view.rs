@@ -122,9 +122,8 @@ fn attachment_local_path(att: &Attachment) -> Option<PathBuf> {
     if payload.starts_with("file://") {
         return None;
     }
-    let dir = private_tmp::dir(Some("message_attachments"))
-        .inspect_err(|e| log::warn!("attachment folder: {e}"))
-        .ok()?;
+    let dir =
+        private_tmp::dir(Some("message_attachments")).inspect_err(|e| log::warn!("attachment folder: {e}")).ok()?;
     let uid = if att.unique_identifier.is_empty() {
         if att.part_id == 0 { "attachment".to_string() } else { att.part_id.to_string() }
     } else {
@@ -223,7 +222,9 @@ struct Decoded {
 }
 
 fn decode(path: &Path, can_fetch_full: bool) -> Decoded {
-    let Some((w, h)) = super::decodable_image(path) else { return Decoded { measured: None, pixels: None } };
+    let Some((w, h)) = super::decodable_image(path) else {
+        return Decoded { measured: None, pixels: None };
+    };
     let (dw, dh, _) = image_display(w, h, can_fetch_full);
     let pixels = Pixbuf::from_file_at_scale(path, dw * IMAGE_DECODE_SCALE, dh * IMAGE_DECODE_SCALE, true)
         .ok()
@@ -668,7 +669,13 @@ enum FileAction {
     Download,
 }
 
-fn run_action(action: FileAction, widget: &gtk::Widget, path: Option<&Path>, att: &Attachment, actions: &BubbleActions) {
+fn run_action(
+    action: FileAction,
+    widget: &gtk::Widget,
+    path: Option<&Path>,
+    att: &Attachment,
+    actions: &BubbleActions,
+) {
     let name = attachment_name(att);
     match (action, path) {
         (FileAction::Open, Some(p)) => open_file(p),
@@ -759,7 +766,13 @@ fn context_menu(
 /// underneath). Hover shows Copy / Save / Open; right-click has the same;
 /// click opens it. While only the phone's small preview is here, the full
 /// file has been asked for and the picture redraws when it arrives.
-fn image_widget(att: &Attachment, sent: bool, actions: &BubbleActions, extras: &SharedExtras, uid: i64) -> Option<gtk::Widget> {
+fn image_widget(
+    att: &Attachment,
+    sent: bool,
+    actions: &BubbleActions,
+    extras: &SharedExtras,
+    uid: i64,
+) -> Option<gtk::Widget> {
     if !is_image(att) {
         return None;
     }
@@ -870,7 +883,9 @@ fn image_widget(att: &Attachment, sent: bool, actions: &BubbleActions, extras: &
             let picture = picture.clone();
             glib::spawn_future_local(async move {
                 let p = path.clone();
-                let Ok(decoded) = gio::spawn_blocking(move || decode(&p, can_fetch_full)).await else { return };
+                let Ok(decoded) = gio::spawn_blocking(move || decode(&p, can_fetch_full)).await else {
+                    return;
+                };
                 IMAGES.with_borrow_mut(|c| c.sizes.insert(key.clone(), decoded.measured));
                 apply_size(decoded.measured);
                 if let Some((bytes, w, h, stride, alpha)) = decoded.pixels {
@@ -895,10 +910,15 @@ fn file_chip(att: &Attachment, actions: &BubbleActions) -> gtk::Widget {
     let row = gtk::Box::new(gtk::Orientation::Horizontal, 8);
     row.add_css_class("message-file-chip");
     row.set_cursor_from_name(Some("pointer"));
-    let icon = gtk::Image::from_icon_name(if is_image(att) { "image-x-generic-symbolic" } else { "mail-attachment-symbolic" });
+    let icon = gtk::Image::from_icon_name(&super::icons::resolve(file_icon(&att.mime_type)));
     icon.set_pixel_size(16);
     row.append(&icon);
-    let label = gtk::Label::new(Some(&attachment_name(att)));
+    let shown_name = match (att.file_name.is_empty(), att.mime_type.split('/').next()) {
+        (true, Some("audio")) => "Voice message".to_string(),
+        (true, Some("video")) => "Video".to_string(),
+        _ => attachment_name(att),
+    };
+    let label = gtk::Label::new(Some(&shown_name));
     label.set_ellipsize(pango::EllipsizeMode::Middle);
     label.set_max_width_chars(32);
     label.set_halign(gtk::Align::Start);
@@ -935,7 +955,26 @@ fn file_chip(att: &Attachment, actions: &BubbleActions) -> gtk::Widget {
         });
     }
     row.add_controller(right);
-    row.upcast()
+    // A voice message or video that is here plays in the chat.
+    match (path, att.mime_type.split('/').next()) {
+        (Some(p), Some(kind @ ("audio" | "video"))) => {
+            let column = gtk::Box::new(gtk::Orientation::Vertical, 4);
+            column.add_css_class("message-media");
+            if kind == "video" {
+                let video = gtk::Video::for_filename(Some(&p));
+                video.set_autoplay(false);
+                video.set_size_request(320, 200);
+                column.append(&video);
+            } else {
+                let controls = gtk::MediaControls::new(Some(&gtk::MediaFile::for_filename(&p)));
+                controls.set_size_request(260, -1);
+                column.append(&controls);
+            }
+            column.append(&row);
+            column.upcast()
+        }
+        _ => row.upcast(),
+    }
 }
 
 /// "Save as" with the attachment's name filled in.
@@ -946,7 +985,9 @@ fn save_as(widget: &gtk::Widget, path: &Path, file_name: &str) {
     let root = widget.root().and_downcast::<gtk::Window>();
     let path = path.to_path_buf();
     dialog.save(root.as_ref(), gio::Cancellable::NONE, move |res| {
-        let Some(target) = res.ok().and_then(|f| f.path()) else { return };
+        let Some(target) = res.ok().and_then(|f| f.path()) else {
+            return;
+        };
         if let Err(e) = std::fs::copy(&path, &target) {
             log::warn!("save attachment: {e}");
         }
@@ -1004,6 +1045,10 @@ struct State {
     extras: HashMap<i64, Extras>,
     /// The next send replies to this Google Messages id.
     replying: Option<String>,
+    /// The phone has older messages than these (Google Messages), and
+    /// whether a page of them is on its way.
+    more_on_phone: bool,
+    loading_older: bool,
 }
 
 pub struct ThreadView {
@@ -1014,15 +1059,21 @@ pub struct ThreadView {
     messages_box: gtk::Box,
     pub entry: gtk::Entry,
     pub send_button: gtk::Button,
-    preview_bar: gtk::Overlay,
-    preview_picture: gtk::Picture,
-    preview_clamps: (adw::Clamp, adw::Clamp),
+    /// The files waiting to go with the next send, as tiles.
+    preview_bar: gtk::ScrolledWindow,
+    pending_box: gtk::Box,
     reply_bar: gtk::Box,
     reply_label: gtk::Label,
-    pending_image: RefCell<Option<PathBuf>>,
-    /// `(thread_id, text, picture)` → whether it was taken (then the compose
-    /// bar clears).
+    /// "Sam is typing…".
+    typing_label: gtk::Label,
+    pending: RefCell<Vec<PathBuf>>,
+    /// `(thread_id, text, files, reply_to)` → whether it was taken (then the
+    /// compose bar clears).
     on_send: RefCell<Option<SendHandler>>,
+    /// Asked for the phone's older messages of a chat.
+    on_older: RefCell<Option<ThreadHandler>>,
+    /// The user typed in a chat (for "is typing" on the phone).
+    on_typing: RefCell<Option<ThreadHandler>>,
     /// Message-text zoom (pinch, Ctrl+scroll, Ctrl +/−/0).
     font_scale: Cell<f64>,
     zoom_base: Cell<f64>,
@@ -1113,34 +1164,30 @@ impl ThreadView {
 
         thread_box.append(&gtk::Separator::new(gtk::Orientation::Horizontal));
 
-        // A picture waiting to go with the next send: just the picture, in
-        // its own shape, with a remove button on its corner.
-        let preview_bar = gtk::Overlay::new();
+        // Files waiting to go with the next send: a row of tiles (a picture
+        // in its own shape, or a file's icon and name), each with a remove
+        // button on its corner.
+        let pending_box = gtk::Box::new(gtk::Orientation::Horizontal, 8);
+        let preview_bar = gtk::ScrolledWindow::new();
+        preview_bar.set_policy(gtk::PolicyType::Automatic, gtk::PolicyType::Never);
+        preview_bar.set_propagate_natural_height(true);
         preview_bar.set_margin_start(12);
         preview_bar.set_margin_end(12);
         preview_bar.set_margin_top(8);
-        preview_bar.set_halign(gtk::Align::Start);
+        preview_bar.set_child(Some(&pending_box));
         preview_bar.set_visible(false);
-        let preview_picture = gtk::Picture::new();
-        preview_picture.set_can_shrink(true);
-        preview_picture.set_content_fit(gtk::ContentFit::Cover);
-        preview_picture.set_overflow(gtk::Overflow::Hidden);
-        preview_picture.add_css_class("compose-thumb");
-        // A picture asks for its full pixel size; the clamps hold it to the
-        // size picked in `set_pending_image`.
-        let preview_clamp_w = adw::Clamp::builder().orientation(gtk::Orientation::Horizontal).child(&preview_picture).build();
-        let preview_clamp_h = adw::Clamp::builder().orientation(gtk::Orientation::Vertical).child(&preview_clamp_w).build();
-        preview_bar.set_child(Some(&preview_clamp_h));
-        let preview_remove = gtk::Button::from_icon_name("window-close-symbolic");
-        preview_remove.add_css_class("osd");
-        preview_remove.add_css_class("circular");
-        preview_remove.set_halign(gtk::Align::End);
-        preview_remove.set_valign(gtk::Align::Start);
-        preview_remove.set_margin_top(6);
-        preview_remove.set_margin_end(6);
-        preview_remove.set_tooltip_text(Some("Remove picture"));
-        preview_bar.add_overlay(&preview_remove);
         thread_box.append(&preview_bar);
+
+        // "Sam is typing…", just above the compose bar.
+        let typing_label = gtk::Label::new(None);
+        typing_label.set_xalign(0.0);
+        typing_label.set_margin_start(16);
+        typing_label.set_margin_top(4);
+        typing_label.add_css_class("dim-label");
+        typing_label.add_css_class("caption");
+        typing_label.add_css_class("typing-label");
+        typing_label.set_visible(false);
+        thread_box.append(&typing_label);
 
         // "Replying to …": the next send answers that message.
         let reply_bar = gtk::Box::new(gtk::Orientation::Horizontal, 8);
@@ -1170,7 +1217,7 @@ impl ThreadView {
         compose.set_margin_bottom(8);
         let attach_button = gtk::Button::from_icon_name("mail-attachment-symbolic");
         attach_button.add_css_class("flat");
-        attach_button.set_tooltip_text(Some("Add a picture"));
+        attach_button.set_tooltip_text(Some("Add pictures or files"));
         compose.append(&attach_button);
         let entry = gtk::Entry::new();
         entry.set_placeholder_text(Some("Type a message…  (Ctrl+V pastes a picture)"));
@@ -1192,12 +1239,14 @@ impl ThreadView {
             entry: entry.clone(),
             send_button: send_button.clone(),
             preview_bar,
-            preview_picture,
-            preview_clamps: (preview_clamp_w, preview_clamp_h),
+            pending_box,
             reply_bar,
             reply_label,
-            pending_image: RefCell::default(),
+            typing_label,
+            pending: RefCell::default(),
             on_send: RefCell::default(),
+            on_older: RefCell::default(),
+            on_typing: RefCell::default(),
             font_scale: Cell::new(1.0),
             zoom_base: Cell::new(1.0),
             font_provider: gtk::CssProvider::new(),
@@ -1213,16 +1262,23 @@ impl ThreadView {
         let weak = Rc::downgrade(&this);
         attach_button.connect_clicked(move |_| {
             if let Some(this) = weak.upgrade() {
-                this.pick_picture();
+                this.pick_files();
             }
         });
-        // A picture dragged from the file manager onto the chat.
-        let drop = gtk::DropTarget::new(gio::File::static_type(), gdk::DragAction::COPY);
+        // Files dragged from the file manager onto the chat.
+        let drop = gtk::DropTarget::new(gdk::FileList::static_type(), gdk::DragAction::COPY);
         let weak = Rc::downgrade(&this);
         drop.connect_drop(move |_, value, _, _| {
-            let (Some(this), Ok(file)) = (weak.upgrade(), value.get::<gio::File>()) else { return false };
-            let Some(path) = file.path().and_then(|p| image_path_from_uri_list(&p.to_string_lossy())) else { return false };
-            this.set_pending_image(path);
+            let (Some(this), Ok(list)) = (weak.upgrade(), value.get::<gdk::FileList>()) else {
+                return false;
+            };
+            let paths: Vec<PathBuf> = list.files().iter().filter_map(|f| f.path()).filter(|p| p.is_file()).collect();
+            if paths.is_empty() {
+                return false;
+            }
+            for p in paths {
+                this.add_pending(p);
+            }
             this.entry.grab_focus();
             true
         });
@@ -1306,10 +1362,14 @@ impl ThreadView {
                 this.entry.grab_focus();
             }
         });
+        // Typing tells the phone (RCS chats show "… is typing").
         let weak = Rc::downgrade(&this);
-        preview_remove.connect_clicked(move |_| {
-            if let Some(this) = weak.upgrade() {
-                this.clear_pending_image(true);
+        entry.connect_changed(move |e| {
+            let Some(this) = weak.upgrade() else { return };
+            let tid = this.state.borrow().thread_id;
+            let f = this.on_typing.borrow().clone();
+            if let (Some(tid), Some(f), false) = (tid, f, e.text().trim().is_empty()) {
+                f(tid);
             }
         });
         // Ctrl+V / Shift+Insert with a picture on the clipboard attaches it.
@@ -1362,7 +1422,9 @@ impl ThreadView {
         wheel.set_propagation_phase(gtk::PropagationPhase::Capture);
         let weak = Rc::downgrade(&this);
         wheel.connect_scroll(move |c, _, dy| {
-            let Some(this) = weak.upgrade() else { return glib::Propagation::Proceed };
+            let Some(this) = weak.upgrade() else {
+                return glib::Propagation::Proceed;
+            };
             if !c.current_event_state().contains(gdk::ModifierType::CONTROL_MASK) || dy == 0.0 {
                 return glib::Propagation::Proceed; // a normal scroll
             }
@@ -1381,7 +1443,9 @@ impl ThreadView {
         ] {
             let weak = Rc::downgrade(&this);
             let action = gtk::CallbackAction::new(move |_, _| {
-                let Some(this) = weak.upgrade() else { return glib::Propagation::Proceed };
+                let Some(this) = weak.upgrade() else {
+                    return glib::Propagation::Proceed;
+                };
                 let next = if step == 0.0 { 1.0 } else { this.font_scale.get() + step };
                 this.set_font_scale(next, true);
                 glib::Propagation::Stop
@@ -1390,7 +1454,9 @@ impl ThreadView {
         }
         let weak = Rc::downgrade(&this);
         let find = gtk::CallbackAction::new(move |_, _| {
-            let Some(this) = weak.upgrade() else { return glib::Propagation::Proceed };
+            let Some(this) = weak.upgrade() else {
+                return glib::Propagation::Proceed;
+            };
             if !this.widget.is_mapped() || this.widget.visible_child_name().as_deref() != Some("thread") {
                 return glib::Propagation::Proceed;
             }
@@ -1411,6 +1477,15 @@ impl ThreadView {
                 && let Ok(mut st) = this.state.try_borrow_mut()
             {
                 st.pinned = a.value() + a.page_size() >= a.upper() - 48.0;
+            }
+        });
+        // Scrolled to the very top: the phone's older messages come in.
+        let weak = Rc::downgrade(&this);
+        scroll.connect_edge_reached(move |_, pos| {
+            if pos == gtk::PositionType::Top
+                && let Some(this) = weak.upgrade()
+            {
+                this.load_older_from_phone();
             }
         });
         let weak = Rc::downgrade(&this);
@@ -1450,33 +1525,136 @@ impl ThreadView {
     }
 
     fn rendered(&self, uids: Vec<i64>) {
-        let (Some(tid), Some(f)) = (self.state.borrow().thread_id, self.on_rendered.borrow().clone()) else { return };
+        let (Some(tid), Some(f)) = (self.state.borrow().thread_id, self.on_rendered.borrow().clone()) else {
+            return;
+        };
         if !uids.is_empty() {
             glib::idle_add_local_once(move || f(tid, uids));
         }
     }
 
-    pub fn connect_send(&self, f: impl Fn(i64, &str, Option<&Path>, Option<&str>) -> bool + 'static) {
+    pub fn connect_send(&self, f: impl Fn(i64, &str, &[PathBuf], Option<&str>) -> bool + 'static) {
         *self.on_send.borrow_mut() = Some(Box::new(f));
     }
 
+    /// `f(thread)`: the user wants the phone's older messages of the chat.
+    pub fn connect_older(&self, f: impl Fn(i64) + 'static) {
+        *self.on_older.borrow_mut() = Some(Rc::new(f));
+    }
+
+    /// `f(thread)` as the user types a message.
+    pub fn connect_typing(&self, f: impl Fn(i64) + 'static) {
+        *self.on_typing.borrow_mut() = Some(Rc::new(f));
+    }
+
+    /// "Sam is typing…" (None hides it).
+    pub fn set_typing(&self, text: Option<&str>) {
+        self.typing_label.set_label(text.unwrap_or(""));
+        self.typing_label.set_visible(text.is_some());
+    }
+
+    /// Whether the phone has older messages of chat `tid` than those here,
+    /// and whether some are on their way: the top button follows.
+    pub fn set_more_history(self: &Rc<Self>, tid: i64, more: bool, loading: bool) {
+        let (changed, hidden) = {
+            let mut st = self.state.borrow_mut();
+            if st.thread_id != Some(tid) {
+                return;
+            }
+            let changed = st.more_on_phone != more;
+            st.more_on_phone = more;
+            st.loading_older = loading;
+            let first = st.window_first_date;
+            (changed, st.all.iter().filter(|m| m.date < first).count())
+        };
+        let button = self.state.borrow().earlier.clone();
+        match button {
+            Some(b) if hidden == 0 && !more => {
+                // Nothing older anywhere: the button goes.
+                self.messages_box.remove(&b);
+                self.state.borrow_mut().earlier = None;
+            }
+            Some(b) => {
+                b.set_label(&self.earlier_text(hidden));
+                b.set_sensitive(!(hidden == 0 && loading));
+            }
+            None if changed && more && self.widget.visible_child_name().as_deref() == Some("thread") => {
+                // The button can only go at the top; a rebuild places it.
+                self.hold_scroll_through(|this| this.set_messages(true));
+            }
+            None => {}
+        }
+    }
+
+    fn earlier_text(&self, hidden: usize) -> String {
+        let st = self.state.borrow();
+        match hidden {
+            0 if st.loading_older => "Loading earlier messages…".to_string(),
+            0 => "Load earlier messages from your phone".to_string(),
+            n => earlier_label(n),
+        }
+    }
+
+    /// Scrolled to the top, or the top button: show what is here, or ask
+    /// the phone for older messages once everything here is shown.
+    fn load_older_from_phone(self: &Rc<Self>) {
+        let (tid, ask) = {
+            let mut st = self.state.borrow_mut();
+            let first = st.window_first_date;
+            let hidden = st.all.iter().filter(|m| m.date < first).count();
+            let ask = hidden == 0 && st.more_on_phone && !st.loading_older && !st.revealing;
+            if ask {
+                st.loading_older = true;
+                // Room for the page about to arrive, so it shows as it lands.
+                st.window += THREAD_WINDOW_STEP;
+            }
+            (st.thread_id, ask)
+        };
+        let (Some(tid), true) = (tid, ask) else {
+            return;
+        };
+        if let Some(b) = self.state.borrow().earlier.clone() {
+            b.set_label("Loading earlier messages…");
+            b.set_sensitive(false);
+        }
+        let f = self.on_older.borrow().clone();
+        if let Some(f) = f {
+            f(tid);
+        }
+    }
+
+    /// Run `f` (a rebuild) keeping on screen what the user is looking at,
+    /// unless they are at the bottom.
+    fn hold_scroll_through(self: &Rc<Self>, f: impl FnOnce(&Rc<Self>)) {
+        let adj = self.scroll.vadjustment();
+        let pinned = self.state.borrow().pinned;
+        let from_bottom = adj.upper() - adj.value();
+        f(self);
+        if !pinned {
+            self.state.borrow_mut().pinned = false;
+            glib::idle_add_local_once(move || adj.set_value((adj.upper() - from_bottom).max(0.0)));
+        }
+    }
+
     fn send(&self) {
-        let Some(tid) = self.state.borrow().thread_id else { return };
+        let Some(tid) = self.state.borrow().thread_id else {
+            return;
+        };
         let text = self.entry.text().trim().to_string();
-        let image = self.pending_image.borrow().clone();
-        if text.is_empty() && image.is_none() {
+        let files = self.pending.borrow().clone();
+        if text.is_empty() && files.is_empty() {
             return;
         }
         let reply_to = self.state.borrow().replying.clone();
-        let taken = self.on_send.borrow().as_ref().is_some_and(|f| f(tid, &text, image.as_deref(), reply_to.as_deref()));
+        let taken = self.on_send.borrow().as_ref().is_some_and(|f| f(tid, &text, &files, reply_to.as_deref()));
         if taken {
             self.entry.set_text("");
             self.clear_reply();
-            if let Some(path) = image {
-                self.clear_pending_image(false);
+            self.clear_pending(false);
+            for path in files {
                 // A pasted picture we saved ourselves is removed once KDE
                 // Connect has had time to read it, as Python did. A file
-                // pasted from the user's own folders is theirs: never touched.
+                // from the user's own folders is theirs: never touched.
                 if private_tmp::contains(&path) {
                     glib::timeout_add_seconds_local_once(120, move || {
                         let _ = std::fs::remove_file(path);
@@ -1496,7 +1674,9 @@ impl ThreadView {
         let weak = Rc::downgrade(self);
         if has_texture {
             clipboard.read_texture_async(gio::Cancellable::NONE, move |res| {
-                let (Some(this), Ok(Some(tex))) = (weak.upgrade(), res) else { return };
+                let (Some(this), Ok(Some(tex))) = (weak.upgrade(), res) else {
+                    return;
+                };
                 let dir = match private_tmp::dir(None) {
                     Ok(d) => d,
                     Err(e) => {
@@ -1504,21 +1684,22 @@ impl ThreadView {
                         return;
                     }
                 };
-                let stamp = std::time::SystemTime::now()
-                    .duration_since(std::time::UNIX_EPOCH)
-                    .map_or(0, |d| d.as_millis());
+                let stamp =
+                    std::time::SystemTime::now().duration_since(std::time::UNIX_EPOCH).map_or(0, |d| d.as_millis());
                 let path = dir.join(format!("paste_{stamp}.png"));
                 if private_tmp::write_private(&path, &tex.save_to_png_bytes()).is_ok() {
-                    this.set_pending_image(path);
+                    this.add_pending(path);
                 }
             });
             return true;
         }
         if formats.contain_mime_type("text/uri-list") {
             clipboard.read_text_async(gio::Cancellable::NONE, move |res| {
-                let (Some(this), Ok(Some(text))) = (weak.upgrade(), res) else { return };
-                if let Some(path) = image_path_from_uri_list(&text) {
-                    this.set_pending_image(path);
+                let (Some(this), Ok(Some(text))) = (weak.upgrade(), res) else {
+                    return;
+                };
+                for path in files_from_uri_list(&text) {
+                    this.add_pending(path);
                 }
             });
             return true;
@@ -1526,56 +1707,136 @@ impl ThreadView {
         false
     }
 
-    /// The paperclip: choose a picture to go with the next message.
-    fn pick_picture(self: &Rc<Self>) {
-        let filter = gtk::FileFilter::new();
-        filter.set_name(Some("Pictures"));
+    /// The paperclip: choose pictures or other files to go with the next
+    /// message.
+    fn pick_files(self: &Rc<Self>) {
+        let pictures = gtk::FileFilter::new();
+        pictures.set_name(Some("Pictures"));
         for ext in IMAGE_FILE_EXTS {
-            filter.add_suffix(ext);
+            pictures.add_suffix(ext);
         }
+        let all = gtk::FileFilter::new();
+        all.set_name(Some("All files"));
+        all.add_pattern("*");
         let filters = gio::ListStore::new::<gtk::FileFilter>();
-        filters.append(&filter);
+        filters.append(&all);
+        filters.append(&pictures);
         let dialog = gtk::FileDialog::new();
-        dialog.set_title("Add a picture");
+        dialog.set_title("Add pictures or files");
         dialog.set_filters(Some(&filters));
-        dialog.set_default_filter(Some(&filter));
-        if let Some(pictures) = glib::user_special_dir(glib::UserDirectory::Pictures) {
-            dialog.set_initial_folder(Some(&gio::File::for_path(pictures)));
+        dialog.set_default_filter(Some(&all));
+        if let Some(dir) = glib::user_special_dir(glib::UserDirectory::Pictures) {
+            dialog.set_initial_folder(Some(&gio::File::for_path(dir)));
         }
         let window = self.entry.root().and_downcast::<gtk::Window>();
         let weak = Rc::downgrade(self);
-        dialog.open(window.as_ref(), gio::Cancellable::NONE, move |res| {
-            let (Some(this), Ok(file)) = (weak.upgrade(), res) else { return };
-            if let Some(path) = file.path().filter(|p| p.is_file()) {
-                this.set_pending_image(path);
-                this.entry.grab_focus();
+        dialog.open_multiple(window.as_ref(), gio::Cancellable::NONE, move |res| {
+            let (Some(this), Ok(files)) = (weak.upgrade(), res) else {
+                return;
+            };
+            for f in files.iter::<gio::File>().flatten() {
+                if let Some(path) = f.path().filter(|p| p.is_file()) {
+                    this.add_pending(path);
+                }
             }
+            this.entry.grab_focus();
         });
     }
 
-    pub fn set_pending_image(&self, path: PathBuf) {
-        self.clear_pending_image(true);
-        let (w, h) = gtk::gdk_pixbuf::Pixbuf::file_info(&path).map_or((4, 3), |(_, w, h)| (w.max(1), h.max(1)));
-        let (w, h) = preview_size(w, h);
-        self.preview_picture.set_size_request(w, h);
-        for (clamp, max) in [(&self.preview_clamps.0, w), (&self.preview_clamps.1, h)] {
-            clamp.set_maximum_size(max);
-            clamp.set_tightening_threshold(max);
+    /// Add a file to go with the next send (a picture shows as itself).
+    pub fn add_pending(self: &Rc<Self>, path: PathBuf) {
+        if self.pending.borrow().contains(&path) {
+            return;
         }
-        self.preview_picture.set_filename(Some(&path));
+        let tile = gtk::Overlay::new();
+        tile.set_valign(gtk::Align::Start);
+        let looks_like_picture = path
+            .extension()
+            .and_then(|e| e.to_str())
+            .is_some_and(|e| IMAGE_FILE_EXTS.contains(&e.to_ascii_lowercase().as_str()));
+        let info = looks_like_picture.then(|| gtk::gdk_pixbuf::Pixbuf::file_info(&path)).flatten();
+        match info {
+            Some((_, w, h)) => {
+                let (w, h) = preview_size(w.max(1), h.max(1));
+                let picture = gtk::Picture::for_filename(&path);
+                picture.set_can_shrink(true);
+                picture.set_content_fit(gtk::ContentFit::Cover);
+                picture.set_overflow(gtk::Overflow::Hidden);
+                picture.add_css_class("compose-thumb");
+                picture.set_size_request(w, h);
+                // A picture asks for its full pixel size; the clamps hold it.
+                let cw = adw::Clamp::builder()
+                    .orientation(gtk::Orientation::Horizontal)
+                    .maximum_size(w)
+                    .tightening_threshold(w)
+                    .child(&picture)
+                    .build();
+                let ch = adw::Clamp::builder()
+                    .orientation(gtk::Orientation::Vertical)
+                    .maximum_size(h)
+                    .tightening_threshold(h)
+                    .child(&cw)
+                    .build();
+                tile.set_child(Some(&ch));
+            }
+            None => {
+                let file = gtk::Box::new(gtk::Orientation::Vertical, 6);
+                file.add_css_class("compose-file");
+                file.set_size_request(120, 96);
+                let mime = crate::core::gm::guess_mime(&path.to_string_lossy());
+                let icon = gtk::Image::from_icon_name(&super::icons::resolve(file_icon(mime)));
+                icon.set_pixel_size(32);
+                icon.set_margin_top(14);
+                file.append(&icon);
+                let name = gtk::Label::new(path.file_name().and_then(|n| n.to_str()));
+                name.set_ellipsize(pango::EllipsizeMode::Middle);
+                name.set_max_width_chars(14);
+                name.add_css_class("caption");
+                name.set_margin_start(6);
+                name.set_margin_end(6);
+                file.append(&name);
+                tile.set_child(Some(&file));
+            }
+        }
+        let remove = gtk::Button::from_icon_name("window-close-symbolic");
+        remove.add_css_class("osd");
+        remove.add_css_class("circular");
+        remove.set_halign(gtk::Align::End);
+        remove.set_valign(gtk::Align::Start);
+        remove.set_margin_top(6);
+        remove.set_margin_end(6);
+        remove.set_tooltip_text(Some("Remove"));
+        tile.add_overlay(&remove);
+        let (weak, p, t) = (Rc::downgrade(self), path.clone(), tile.clone());
+        remove.connect_clicked(move |_| {
+            if let Some(this) = weak.upgrade() {
+                this.remove_pending(&p, &t);
+            }
+        });
+        self.pending_box.append(&tile);
+        self.pending.borrow_mut().push(path);
         self.preview_bar.set_visible(true);
-        *self.pending_image.borrow_mut() = Some(path);
     }
 
-    /// Drop the pending picture; `delete` removes a pasted temp file.
-    fn clear_pending_image(&self, delete: bool) {
-        if let Some(path) = self.pending_image.borrow_mut().take()
-            && delete
-            && private_tmp::contains(&path)
-        {
+    fn remove_pending(&self, path: &Path, tile: &gtk::Overlay) {
+        self.pending.borrow_mut().retain(|p| p != path);
+        self.pending_box.remove(tile);
+        if private_tmp::contains(path) {
             let _ = std::fs::remove_file(path);
         }
-        self.preview_picture.set_filename(None::<&Path>);
+        self.preview_bar.set_visible(!self.pending.borrow().is_empty());
+    }
+
+    /// Drop every pending file; `delete` removes pasted temp files.
+    fn clear_pending(&self, delete: bool) {
+        for path in self.pending.borrow_mut().drain(..) {
+            if delete && private_tmp::contains(&path) {
+                let _ = std::fs::remove_file(path);
+            }
+        }
+        while let Some(child) = self.pending_box.first_child() {
+            self.pending_box.remove(&child);
+        }
         self.preview_bar.set_visible(false);
     }
 
@@ -1586,7 +1847,9 @@ impl ThreadView {
     /// content stayed put until the next scroll (Ethan, 2026-11-06).
     fn queue_scroll_fix(self: &Rc<Self>) {
         {
-            let Ok(mut st) = self.state.try_borrow_mut() else { return };
+            let Ok(mut st) = self.state.try_borrow_mut() else {
+                return;
+            };
             if st.scroll_fix_queued || (st.anchor_from_bottom.is_none() && !st.pinned) {
                 return;
             }
@@ -1594,9 +1857,13 @@ impl ThreadView {
         }
         let weak = Rc::downgrade(self);
         self.scroll.add_tick_callback(move |widget, _| {
-            let Some(this) = weak.upgrade() else { return glib::ControlFlow::Break };
+            let Some(this) = weak.upgrade() else {
+                return glib::ControlFlow::Break;
+            };
             let target = {
-                let Ok(mut st) = this.state.try_borrow_mut() else { return glib::ControlFlow::Continue };
+                let Ok(mut st) = this.state.try_borrow_mut() else {
+                    return glib::ControlFlow::Continue;
+                };
                 st.scroll_fix_queued = false;
                 let a = widget.vadjustment();
                 match st.anchor_from_bottom {
@@ -1648,7 +1915,10 @@ impl ThreadView {
                 st.reveal = None;
                 st.extras.clear();
                 st.replying = None;
+                st.more_on_phone = false;
+                st.loading_older = false;
                 self.reply_bar.set_visible(false);
+                self.typing_label.set_visible(false);
             }
             st.routes = conv.messages.iter().filter_map(|m| route(m.uid).map(|r| (m.uid, r))).collect();
         }
@@ -1680,7 +1950,8 @@ impl ThreadView {
         };
         self.state.borrow_mut().all = timeline;
         if rebuild {
-            self.set_messages(true);
+            // Older messages arriving above keep the view where it was.
+            self.hold_scroll_through(|this| this.set_messages(true));
             self.refresh_find();
             return;
         }
@@ -1691,7 +1962,7 @@ impl ThreadView {
         };
         let has_button = self.state.borrow().earlier.clone();
         match has_button {
-            Some(btn) => btn.set_label(&earlier_label(hidden)),
+            Some(btn) => btn.set_label(&self.earlier_text(hidden)),
             None if hidden > 0 => {
                 // The button can only go at the top; a rebuild places it.
                 self.set_messages(true);
@@ -1723,8 +1994,13 @@ impl ThreadView {
             let shown: Vec<SmsMessage> = st.all[st.all.len().saturating_sub(st.window)..].to_vec();
             (shown.clone(), st.all.len() - shown.len(), st.routes.clone())
         };
-        if hidden > 0 {
-            let btn = gtk::Button::with_label(&earlier_label(hidden));
+        let (more, loading) = {
+            let st = self.state.borrow();
+            (st.more_on_phone, st.loading_older)
+        };
+        if hidden > 0 || more {
+            let btn = gtk::Button::with_label(&self.earlier_text(hidden));
+            btn.set_sensitive(!(hidden == 0 && loading));
             btn.add_css_class("flat");
             btn.set_halign(gtk::Align::Center);
             btn.set_margin_top(8);
@@ -1804,7 +2080,9 @@ impl ThreadView {
         let weak = Rc::downgrade(self);
         let remaining = Cell::new(upto);
         glib::idle_add_local(move || {
-            let Some(this) = weak.upgrade() else { return glib::ControlFlow::Break };
+            let Some(this) = weak.upgrade() else {
+                return glib::ControlFlow::Break;
+            };
             if this.state.borrow().generation != generation {
                 return glib::ControlFlow::Break;
             }
@@ -1878,7 +2156,10 @@ impl ThreadView {
                 .filter_map(|(i, b)| {
                     conv.messages
                         .iter()
-                        .find(|m| m.uid == b.message.uid && (m.attachments != b.message.attachments || route(m.uid) != b.route))
+                        .find(|m| {
+                            m.uid == b.message.uid
+                                && (m.attachments != b.message.attachments || route(m.uid) != b.route)
+                        })
                         .map(|m| (i, m.clone()))
                 })
                 .collect()
@@ -1899,6 +2180,15 @@ impl ThreadView {
     }
 
     fn show_earlier(self: &Rc<Self>) {
+        let hidden = {
+            let st = self.state.borrow();
+            let first = st.window_first_date;
+            st.all.iter().filter(|m| m.date < first).count()
+        };
+        if hidden == 0 {
+            self.load_older_from_phone();
+            return;
+        }
         let adj = self.scroll.vadjustment();
         let from_bottom = adj.upper() - adj.value();
         {
@@ -1982,7 +2272,9 @@ impl ThreadView {
         self.mark_highlight();
         let Some(widget) = widget else { return };
         #[allow(deprecated)] // compute_point is GTK 4.12; the app supports 4.10
-        let Some((_, y)) = widget.translate_coordinates(&self.messages_box, 0.0, 0.0) else { return };
+        let Some((_, y)) = widget.translate_coordinates(&self.messages_box, 0.0, 0.0) else {
+            return;
+        };
         let adj = self.scroll.vadjustment();
         let h = f64::from(widget.height());
         let top = (adj.upper() - adj.page_size()).max(adj.lower());
@@ -2243,20 +2535,36 @@ pub fn image_cache_stats() -> (usize, usize) {
     })
 }
 
-/// `(thread_id, text, picture, reply_to)` → whether it was taken.
-type SendHandler = Box<dyn Fn(i64, &str, Option<&Path>, Option<&str>) -> bool>;
+/// `(thread_id, text, files, reply_to)` → whether it was taken.
+type SendHandler = Box<dyn Fn(i64, &str, &[PathBuf], Option<&str>) -> bool>;
 type ZoomHandler = Box<dyn Fn(f64)>;
+type ThreadHandler = Rc<dyn Fn(i64)>;
 type RenderedHandler = Rc<dyn Fn(i64, Vec<i64>)>;
 
 const IMAGE_FILE_EXTS: &[&str] = &["png", "jpg", "jpeg", "webp", "gif", "bmp", "tiff", "tif", "heic", "heif"];
 
-/// The first existing image file in a pasted `text/uri-list` (or plain paths).
-pub fn image_path_from_uri_list(text: &str) -> Option<PathBuf> {
-    text.lines().map(str::trim).filter(|l| !l.is_empty()).find_map(|line| {
-        let path = if line.starts_with("file://") { gio::File::for_uri(line).path()? } else { PathBuf::from(line) };
-        let ext = path.extension()?.to_str()?.to_ascii_lowercase();
-        (path.is_file() && IMAGE_FILE_EXTS.contains(&ext.as_str())).then_some(path)
-    })
+/// Every existing file in a pasted `text/uri-list` (or plain paths).
+pub fn files_from_uri_list(text: &str) -> Vec<PathBuf> {
+    text.lines()
+        .map(str::trim)
+        .filter(|l| !l.is_empty() && !l.starts_with('#'))
+        .filter_map(|line| {
+            if line.starts_with("file://") { gio::File::for_uri(line).path() } else { Some(PathBuf::from(line)) }
+        })
+        .filter(|p| p.is_absolute() && p.is_file())
+        .collect()
+}
+
+/// An icon for a file by its type.
+fn file_icon(mime: &str) -> &'static str {
+    match mime.split('/').next().unwrap_or("") {
+        "image" => "image-x-generic-symbolic",
+        "video" => "video-x-generic-symbolic",
+        "audio" => "audio-x-generic-symbolic",
+        _ if mime == "application/pdf" => "x-office-document-symbolic",
+        _ if mime.starts_with("text/") => "text-x-generic-symbolic",
+        _ => "mail-attachment-symbolic",
+    }
 }
 
 /// The compose bar's picture fits in this box (px), keeping its shape.
@@ -2273,7 +2581,6 @@ fn preview_size(w: i32, h: i32) -> (i32, i32) {
 fn earlier_label(hidden: usize) -> String {
     format!("Show earlier messages ({hidden})")
 }
-
 
 #[cfg(test)]
 mod tests {

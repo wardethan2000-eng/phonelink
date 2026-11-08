@@ -1,7 +1,7 @@
 //! Runs `phonelink-gm serve` (the lasting Google Messages link) as a child
 //! process and talks to it in JSON lines (`core::gm`).
 //!
-//! Started only when the helper and gmcli's pairing exist. If it exits it
+//! Started only when the helper and a link (Settings → Google Messages) exist. If it exits it
 //! is restarted, waiting longer each time (1 s, doubling, at most 10 min);
 //! a signed-out account stops it until the app restarts. When the app
 //! exits, the helper's stdin closes and it quits.
@@ -57,6 +57,58 @@ impl GmLink {
         self.state.borrow().proc.is_some()
     }
 
+    /// Stop the helper for good (unlinking): it isn't restarted, and its
+    /// exit isn't reported. `done` runs once it has exited (it then no
+    /// longer holds the session).
+    pub fn stop(self: &Rc<Self>, done: impl FnOnce() + 'static) {
+        let (proc, stdin) = {
+            let mut s = self.state.borrow_mut();
+            s.stopped = true;
+            if let Some(id) = s.restart.take() {
+                id.remove();
+            }
+            (s.proc.clone(), s.stdin.take())
+        };
+        let Some(proc) = proc else {
+            done();
+            return;
+        };
+        // Closing stdin makes the helper disconnect and exit.
+        if let Some(stdin) = stdin {
+            let _ = stdin.close(gio::Cancellable::NONE);
+        }
+        // Still there after 10 s: kill it.
+        let killer: Rc<RefCell<Option<glib::SourceId>>> = Rc::default();
+        let id = glib::timeout_add_local_once(Duration::from_secs(10), {
+            let (proc, killer) = (proc.clone(), killer.clone());
+            move || {
+                killer.borrow_mut().take();
+                proc.force_exit();
+            }
+        });
+        *killer.borrow_mut() = Some(id);
+        glib::spawn_future_local(async move {
+            let _ = proc.wait_future().await;
+            if let Some(id) = killer.borrow_mut().take() {
+                id.remove();
+            }
+            done();
+        });
+    }
+
+    /// Start again after [`Self::stop`] (linked again).
+    pub fn resume(self: &Rc<Self>) {
+        {
+            let mut s = self.state.borrow_mut();
+            s.stopped = false;
+            s.failures = 0;
+            if s.proc.is_some() {
+                return;
+            }
+        }
+        self.spawn();
+    }
+
     /// Send a request built from its id. `done` gets the reply, or a
     /// failed one if the helper stops first. Returns false (and drops
     /// `done`) when the helper isn't running.
@@ -83,17 +135,22 @@ impl GmLink {
     }
 
     fn spawn(self: &Rc<Self>) {
-        let Some(helper) = phone_delete::helper_path() else { return };
-        let args: [&OsStr; 3] = [helper.as_os_str(), OsStr::new("serve"), OsStr::new("--timeout=90s")];
-        let proc = match gio::Subprocess::newv(&args, gio::SubprocessFlags::STDIN_PIPE | gio::SubprocessFlags::STDOUT_PIPE) {
-            Ok(p) => p,
-            Err(e) => {
-                log::warn!("Google Messages link: couldn't start the helper: {e}");
-                self.schedule_restart();
-                return;
-            }
+        let Some(helper) = phone_delete::helper_path() else {
+            return;
         };
-        let (Some(stdin), Some(stdout)) = (proc.stdin_pipe(), proc.stdout_pipe()) else { return };
+        let args: [&OsStr; 3] = [helper.as_os_str(), OsStr::new("serve"), OsStr::new("--timeout=90s")];
+        let proc =
+            match gio::Subprocess::newv(&args, gio::SubprocessFlags::STDIN_PIPE | gio::SubprocessFlags::STDOUT_PIPE) {
+                Ok(p) => p,
+                Err(e) => {
+                    log::warn!("Google Messages link: couldn't start the helper: {e}");
+                    self.schedule_restart();
+                    return;
+                }
+            };
+        let (Some(stdin), Some(stdout)) = (proc.stdin_pipe(), proc.stdout_pipe()) else {
+            return;
+        };
         {
             let mut s = self.state.borrow_mut();
             s.proc = Some(proc.clone());
@@ -151,6 +208,7 @@ impl GmLink {
     }
 
     fn exited(self: &Rc<Self>) {
+        let stopped = self.state.borrow().stopped;
         let pending = {
             let mut s = self.state.borrow_mut();
             s.proc = None;
@@ -165,7 +223,9 @@ impl GmLink {
         for (id, done) in pending {
             done(Reply { id, message: "the Google Messages link stopped".into(), ..Default::default() });
         }
-        (self.on_event)(Incoming::Fatal { kind: "exited".into(), message: "the helper stopped".into() });
+        if !stopped {
+            (self.on_event)(Incoming::Fatal { kind: "exited".into(), message: "the helper stopped".into() });
+        }
         self.schedule_restart();
     }
 

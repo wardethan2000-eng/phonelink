@@ -27,9 +27,12 @@ type convEvent struct {
 	RCS      bool     `json:"rcs"`
 	ReadOnly bool     `json:"read_only,omitempty"`
 	Archived bool     `json:"archived,omitempty"`
-	Unread   bool     `json:"unread"`
-	LastTSms int64    `json:"last_ts_ms"`
-	Preview  string   `json:"preview,omitempty"`
+	// Pinned on the phone; Blocked: moved to spam or blocked.
+	Pinned   bool   `json:"pinned,omitempty"`
+	Blocked  bool   `json:"blocked,omitempty"`
+	Unread   bool   `json:"unread"`
+	LastTSms int64  `json:"last_ts_ms"`
+	Preview  string `json:"preview,omitempty"`
 }
 
 type attachment struct {
@@ -39,6 +42,11 @@ type attachment struct {
 	Size int64  `json:"size,omitempty"`
 	// Key decrypts the file (base64 in JSON); the download op takes it back.
 	Key []byte `json:"key,omitempty"`
+	// Thumb: only a small preview is on Google's side so far; the phone
+	// sends the full file when asked, and the message comes again.
+	Thumb bool `json:"thumb,omitempty"`
+	// Part is the attachment's own id in its message (for the full size).
+	Part string `json:"part,omitempty"`
 }
 
 // msgEvent is one message. Status is one of sending, sent, delivered,
@@ -233,7 +241,9 @@ func conversationEvent(conv *gmproto.Conversation) (convEvent, bool) {
 		Group:    conv.GetIsGroupChat(),
 		RCS:      conv.GetType() == gmproto.ConversationType_RCS,
 		ReadOnly: conv.GetReadOnly(),
-		Archived: conv.GetStatus() == gmproto.ConversationStatus_ARCHIVED,
+		Archived: conv.GetStatus() == gmproto.ConversationStatus_ARCHIVED || conv.GetStatus() == gmproto.ConversationStatus_KEEP_ARCHIVED,
+		Pinned:   conv.GetPinned(),
+		Blocked:  conv.GetStatus() == gmproto.ConversationStatus_SPAM_FOLDER || conv.GetStatus() == gmproto.ConversationStatus_BLOCKED_FOLDER,
 		Unread:   conv.GetUnread(),
 		// Google's timestamps are microseconds.
 		LastTSms: conv.GetLastMessageTimestamp() / 1000,
@@ -332,7 +342,14 @@ func messageEvent(m *gmproto.Message, conv *gmproto.Conversation) (msgEvent, boo
 			text = append(text, c.GetContent())
 		}
 		if mc := info.GetMediaContent(); mc != nil {
-			ev.Attachments = append(ev.Attachments, attachment{ID: mc.GetMediaID(), Mime: mc.GetMimeType(), Name: mc.GetMediaName(), Size: mc.GetSize(), Key: mc.GetDecryptionKey()})
+			a := attachment{ID: mc.GetMediaID(), Mime: mc.GetMimeType(), Name: mc.GetMediaName(), Size: mc.GetSize(), Key: mc.GetDecryptionKey(), Part: info.GetActionMessageID()}
+			if a.ID == "" && mc.GetThumbnailMediaID() != "" {
+				a.ID, a.Key, a.Thumb = mc.GetThumbnailMediaID(), mc.GetThumbnailDecryptionKey(), true
+			}
+			if a.ID == "" {
+				continue // not on Google's side yet (still uploading)
+			}
+			ev.Attachments = append(ev.Attachments, a)
 		}
 	}
 	if s := m.GetSubject(); s != "" {
@@ -410,4 +427,56 @@ func buildSend(conv *gmproto.Conversation, sims []*gmproto.SIMCard, text string,
 			MessageInfo:    infos,
 		},
 	}
+}
+
+// thumbParts: the parts of a message that are only previews so far.
+func thumbParts(ev msgEvent) []string {
+	var out []string
+	for _, a := range ev.Attachments {
+		if a.Thumb && a.Part != "" {
+			out = append(out, a.Part)
+		}
+	}
+	return out
+}
+
+// chatChange: the update_chat request for one change ("archive", "unarchive",
+// "mute", "unmute", "block", "spam" (block and report), "unblock").
+func chatChange(conv, change string) (*gmproto.UpdateConversationRequest, bool) {
+	status := func(s gmproto.ConversationStatus) *gmproto.UpdateConversationRequest {
+		return &gmproto.UpdateConversationRequest{
+			ConversationID: conv,
+			Data: &gmproto.UpdateConversationRequest_UpdateData{UpdateData: &gmproto.UpdateConversationData{
+				ConversationID: conv, Data: &gmproto.UpdateConversationData_Status{Status: s},
+			}},
+		}
+	}
+	mute := func(m gmproto.ConversationMuteStatus) *gmproto.UpdateConversationRequest {
+		return &gmproto.UpdateConversationRequest{
+			ConversationID: conv,
+			Data: &gmproto.UpdateConversationRequest_UpdateData{UpdateData: &gmproto.UpdateConversationData{
+				ConversationID: conv, Data: &gmproto.UpdateConversationData_Mute{Mute: m},
+			}},
+		}
+	}
+	action := func(a gmproto.ConversationActionStatus) *gmproto.UpdateConversationRequest {
+		return &gmproto.UpdateConversationRequest{Action: a, ConversationID: conv}
+	}
+	switch change {
+	case "archive":
+		return status(gmproto.ConversationStatus_ARCHIVED), true
+	case "unarchive":
+		return status(gmproto.ConversationStatus_ACTIVE), true
+	case "mute":
+		return mute(gmproto.ConversationMuteStatus_MUTE), true
+	case "unmute":
+		return mute(gmproto.ConversationMuteStatus_UNMUTE), true
+	case "block":
+		return action(gmproto.ConversationActionStatus_BLOCK), true
+	case "spam":
+		return action(gmproto.ConversationActionStatus_BLOCK_AND_REPORT), true
+	case "unblock":
+		return action(gmproto.ConversationActionStatus_UNBLOCK), true
+	}
+	return nil, false
 }
