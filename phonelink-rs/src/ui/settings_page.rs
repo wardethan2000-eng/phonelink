@@ -144,7 +144,7 @@ impl SettingsPage {
             b.set_margin_top(9);
             b.set_margin_bottom(9);
             let img = gtk::Image::from_icon_name(&icons::resolve(icon));
-            img.set_pixel_size(super::scale::px(16));
+            // 16 px: the stylesheet sizes it (Settings > Size).
             b.append(&img);
             let l = gtk::Label::new(Some(label));
             l.set_xalign(0.0);

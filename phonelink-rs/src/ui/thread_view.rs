@@ -913,7 +913,7 @@ fn file_chip(att: &Attachment, actions: &BubbleActions) -> gtk::Widget {
     row.add_css_class("message-file-chip");
     row.set_cursor_from_name(Some("pointer"));
     let icon = gtk::Image::from_icon_name(&super::icons::resolve(file_icon(&att.mime_type)));
-    icon.set_pixel_size(super::scale::px(16));
+    // 16 px: the stylesheet sizes it (Settings > Size).
     row.append(&icon);
     let shown_name = match (att.file_name.is_empty(), att.mime_type.split('/').next()) {
         (true, Some("audio")) => "Voice message".to_string(),
@@ -1110,7 +1110,7 @@ impl ThreadView {
         empty.set_valign(gtk::Align::Center);
         empty.set_halign(gtk::Align::Center);
         let icon = gtk::Image::from_icon_name("mail-unread-symbolic");
-        icon.set_pixel_size(super::scale::px(48));
+        super::scale::icon(&icon, 48);
         icon.set_opacity(0.2);
         empty.append(&icon);
         let hint = gtk::Label::new(Some("Select a conversation"));
@@ -1805,7 +1805,7 @@ impl ThreadView {
                 file.set_size_request(120, 96);
                 let mime = crate::core::gm::guess_mime(&path.to_string_lossy());
                 let icon = gtk::Image::from_icon_name(&super::icons::resolve(file_icon(mime)));
-                icon.set_pixel_size(super::scale::px(32));
+                super::scale::icon(&icon, 32);
                 icon.set_margin_top(14);
                 file.append(&icon);
                 let name = gtk::Label::new(path.file_name().and_then(|n| n.to_str()));

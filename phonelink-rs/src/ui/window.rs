@@ -132,7 +132,7 @@ impl Window {
         device_btn.add_css_class("flat");
         let device_box = gtk::Box::new(gtk::Orientation::Horizontal, 10);
         let device_icon = gtk::Image::new();
-        device_icon.set_pixel_size(super::scale::px(icons::device_icon_size(24)));
+        super::scale::icon(&device_icon, icons::device_icon_size(24));
         device_box.append(&device_icon);
         let text = gtk::Box::new(gtk::Orientation::Vertical, 0);
         text.set_valign(gtk::Align::Center);
@@ -151,7 +151,7 @@ impl Window {
         text.append(&status_row);
         device_box.append(&text);
         let device_arrow = gtk::Image::from_icon_name("pan-down-symbolic");
-        device_arrow.set_pixel_size(super::scale::px(12));
+        super::scale::icon(&device_arrow, 12);
         device_arrow.set_visible(false);
         device_box.append(&device_arrow);
         device_btn.set_child(Some(&device_box));
@@ -174,7 +174,7 @@ impl Window {
         // Right, from the edge in: battery, Find Phone, notifications, settings.
         let right = gtk::Box::new(gtk::Orientation::Horizontal, 6);
         let battery_icon = gtk::Image::new();
-        battery_icon.set_pixel_size(super::scale::px(16));
+        // 16 px: the stylesheet sizes it (Settings > Size).
         right.append(&battery_icon);
         let battery_label = gtk::Label::new(None);
         battery_label.add_css_class("caption");
@@ -615,7 +615,7 @@ impl Window {
             b.set_margin_top(6);
             b.set_margin_bottom(6);
             let icon = gtk::Image::from_icon_name(dev.type_icon_name());
-            icon.set_pixel_size(super::scale::px(icons::device_icon_size(20)));
+            super::scale::icon(&icon, icons::device_icon_size(20));
             b.append(&icon);
             let names = gtk::Box::new(gtk::Orientation::Vertical, 2);
             names.set_hexpand(true);
@@ -631,7 +631,7 @@ impl Window {
             b.append(&names);
             if active.as_deref() == Some(dev.id.as_str()) {
                 let check = gtk::Image::from_icon_name("object-select-symbolic");
-                check.set_pixel_size(super::scale::px(16));
+                // 16 px: the stylesheet sizes it (Settings > Size).
                 b.append(&check);
             }
             row.set_child(Some(&b));

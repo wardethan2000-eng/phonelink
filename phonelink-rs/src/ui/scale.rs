@@ -7,6 +7,8 @@
 
 use std::cell::{Cell, RefCell};
 
+use gtk::glib;
+
 /// The choices in Settings, as (label, factor); 0 = automatic.
 pub const CHOICES: &[(&str, f64)] =
     &[("Automatic", 0.0), ("100%", 1.0), ("110%", 1.1), ("125%", 1.25), ("150%", 1.5), ("175%", 1.75)];
@@ -16,6 +18,18 @@ thread_local! {
     /// The desktop's font name, before scaling.
     static BASE_FONT: RefCell<Option<String>> = const { RefCell::new(None) };
     static PROVIDER: RefCell<Option<gtk::CssProvider>> = const { RefCell::new(None) };
+    /// Icons with their own size, resized when the setting changes.
+    static SIZED: RefCell<Vec<(glib::WeakRef<gtk::Image>, i32)>> = const { RefCell::new(Vec::new()) };
+}
+
+/// Give `image` its own size (`n` px at 100%), kept in step with the setting.
+pub fn icon(image: &gtk::Image, n: i32) {
+    use gtk::prelude::*;
+    image.set_pixel_size(px(n));
+    SIZED.with_borrow_mut(|v| {
+        v.retain(|(w, _)| w.upgrade().is_some());
+        v.push((image.downgrade(), n));
+    });
 }
 
 /// The factor in use.
@@ -86,12 +100,27 @@ pub fn scale_css(css: &str, f: f64) -> String {
     out
 }
 
-/// Icon sizes at `f` (the theme's are 16 px, 32 px for large icons;
-/// GtkImage tags itself `.normal-icons` or `.large-icons`).
+/// Icon sizes at `f`. Every icon is sized here (16 px is only GTK's
+/// starting value, which a rule on the window does not pass down), so
+/// libadwaita's own larger icons are restated after it.
 fn icon_css(f: f64) -> String {
-    let n = (16.0 * f).round();
-    let l = (32.0 * f).round();
-    format!(".normal-icons {{ -gtk-icon-size: {n}px; }}\n.large-icons {{ -gtk-icon-size: {l}px; }}\n")
+    let at = |n: f64| (n * f).round();
+    let sp = "statuspage > scrolledwindow > viewport > box > clamp > box > .icon";
+    format!(
+        "image {{ -gtk-icon-size: {}px; }}\n\
+         image.large-icons {{ -gtk-icon-size: {}px; }}\n\
+         check, radio {{ -gtk-icon-size: {}px; }}\n\
+         {sp} {{ -gtk-icon-size: {}px; }}\n\
+         statuspage.compact > scrolledwindow > viewport > box > clamp > box > .icon {{ -gtk-icon-size: {}px; }}\n\
+         statuspage.spinner > scrolledwindow > viewport > box > clamp > box > .icon {{ -gtk-icon-size: {}px; }}\n\
+         window.aboutdialog image.large-icons {{ -gtk-icon-size: 128px; }}\n",
+        at(16.0),
+        at(32.0),
+        at(14.0),
+        at(128.0),
+        at(96.0),
+        at(64.0),
+    )
 }
 
 /// Load `css` (the app's stylesheet) at `setting`, replacing an earlier load.
@@ -106,6 +135,9 @@ pub fn apply(setting: f64, css: &str) {
         let scaled = ((size * f) * 10.0).round() / 10.0;
         settings.set_gtk_font_name(Some(&format!("{family} {scaled}")));
     }
+    SIZED.with_borrow_mut(|v| {
+        v.retain(|(w, n)| w.upgrade().map(|i| i.set_pixel_size(px(*n))).is_some());
+    });
     let Some(display) = gtk::gdk::Display::default() else { return };
     let provider = gtk::CssProvider::new();
     provider.load_from_data(&format!("{}\n{}", scale_css(css, f), icon_css(f)));

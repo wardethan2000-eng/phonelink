@@ -648,7 +648,7 @@ impl FilesPage {
             b.set_margin_top(4);
             b.set_margin_bottom(4);
             let img = gtk::Image::from_icon_name(icon);
-            img.set_pixel_size(super::scale::px(16));
+            // 16 px: the stylesheet sizes it (Settings > Size).
             b.append(&img);
             let l = gtk::Label::new(Some(&label));
             l.set_xalign(0.0);
@@ -785,7 +785,7 @@ impl FilesPage {
         stack.add_css_class("photo-tile");
         overlay.set_child(Some(&stack));
         let placeholder = gtk::Image::from_icon_name(&icons::resolve("image-x-generic-symbolic"));
-        placeholder.set_pixel_size(super::scale::px(32));
+        super::scale::icon(&placeholder, 32);
         placeholder.set_opacity(0.4);
         stack.add_named(&placeholder, Some("placeholder"));
         // A square crop drawn at exactly the tile size (a Picture would grow
@@ -795,7 +795,7 @@ impl FilesPage {
         stack.add_named(&picture, Some("image"));
         stack.set_visible_child_name("placeholder");
         let check = gtk::Image::from_icon_name("object-select-symbolic");
-        check.set_pixel_size(super::scale::px(24));
+        super::scale::icon(&check, 24);
         check.set_halign(gtk::Align::End);
         check.set_valign(gtk::Align::Start);
         check.set_margin_top(6);
@@ -1061,7 +1061,7 @@ impl FilesPage {
             b.set_margin_start(8);
             b.set_margin_end(8);
             let icon = gtk::Image::from_icon_name(&icons::resolve(files::file_icon_name(&e.name, e.is_dir)));
-            icon.set_pixel_size(super::scale::px(24));
+            super::scale::icon(&icon, 24);
             b.append(&icon);
             let name = gtk::Label::new(Some(&e.name));
             name.set_xalign(0.0);

@@ -244,7 +244,7 @@ impl NotificationsPanel {
         summary.set_margin_bottom(8);
         outer.append(&summary);
         let icon = gtk::Image::new();
-        icon.set_pixel_size(super::scale::px(32));
+        super::scale::icon(&icon, 32);
         load_icon(&icon, n);
         summary.append(&icon);
 
@@ -268,7 +268,7 @@ impl NotificationsPanel {
         }
         summary.append(&text);
         let chevron = gtk::Image::from_icon_name("go-down-symbolic");
-        chevron.set_pixel_size(super::scale::px(12));
+        super::scale::icon(&chevron, 12);
         chevron.set_opacity(0.5);
         summary.append(&chevron);
 
