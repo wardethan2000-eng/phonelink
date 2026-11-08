@@ -2165,12 +2165,24 @@ impl ThreadView {
                 .collect()
         };
         let pinned = self.state.borrow().pinned;
+        // Pictures that changed (filled in, or a new copy) are new to fetch.
+        let new_files: Vec<i64> = {
+            let st = self.state.borrow();
+            changed
+                .iter()
+                .filter(|(i, m)| m.attachments != st.bubbles[*i].message.attachments)
+                .map(|(_, m)| m.uid)
+                .collect()
+        };
         for (i, m) in changed {
             let old = self.state.borrow().bubbles[i].clone();
             let fresh = self.make_bubble(&m, old.revealer.reveals_child(), route(m.uid));
             self.messages_box.insert_child_after(&fresh.widget, Some(&old.widget));
             self.messages_box.remove(&old.widget);
             self.state.borrow_mut().bubbles[i] = fresh;
+        }
+        if !new_files.is_empty() {
+            self.rendered(new_files);
         }
         if pinned {
             let adj = self.scroll.vadjustment();
