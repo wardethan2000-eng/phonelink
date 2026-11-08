@@ -490,8 +490,8 @@ func chatChange(conv, change string) (*gmproto.UpdateConversationRequest, bool) 
 
 // blockTries: the shapes of a block, block-and-report or unblock request to
 // try in turn. The phone refused the bare action (no number, 2026-11-08);
-// delete, the closest request the web client is known to send, carries the
-// other person's number, so the number goes first.
+// the phone took the number plus action5 (2026-11-08, block), so that goes
+// first; the other shapes stay as fallbacks.
 func blockTries(conv, phone string, a gmproto.ConversationActionStatus) []*gmproto.UpdateConversationRequest {
 	bare := &gmproto.UpdateConversationRequest{Action: a, ConversationID: conv}
 	if phone == "" {
@@ -510,7 +510,7 @@ func blockTries(conv, phone string, a gmproto.ConversationActionStatus) []*gmpro
 		}
 		return r
 	}
-	return []*gmproto.UpdateConversationRequest{withPhone(false), withPhone(true), bare}
+	return []*gmproto.UpdateConversationRequest{withPhone(true), withPhone(false), bare}
 }
 
 // otherNumber: the other person's number in a one-to-one chat ("" otherwise).

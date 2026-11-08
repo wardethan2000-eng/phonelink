@@ -279,10 +279,10 @@ func TestBlockSendsTheOtherNumber(t *testing.T) {
 	}
 	first := tries[0]
 	if first.GetAction() != gmproto.ConversationActionStatus_BLOCK || first.GetDeleteData().GetPhone() != n ||
-		first.GetDeleteData().GetConversationID() != "7" || first.GetAction5() != nil {
+		first.GetDeleteData().GetConversationID() != "7" || !first.GetAction5().GetField2() {
 		t.Fatalf("first try = %v", first)
 	}
-	if !tries[1].GetAction5().GetField2() || tries[2].GetDeleteData() != nil {
+	if tries[1].GetAction5() != nil || tries[1].GetDeleteData() == nil || tries[2].GetDeleteData() != nil {
 		t.Fatalf("later tries = %v %v", tries[1], tries[2])
 	}
 	if got := blockTries("7", "", gmproto.ConversationActionStatus_UNBLOCK); len(got) != 1 || got[0].GetDeleteData() != nil {
