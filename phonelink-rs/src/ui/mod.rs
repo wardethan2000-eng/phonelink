@@ -105,6 +105,12 @@ const EXTRA_CSS: &str = "
 viewswitcher.in-settings button:checked { background: none; box-shadow: none; }
 viewswitcher.in-settings button:checked:hover { background-color: alpha(currentColor, 0.07); }
 button.settings-open { background-color: alpha(currentColor, 0.1); }
+.message-quote { padding: 3px 10px; margin-bottom: 2px; border-left: 3px solid alpha(currentColor, 0.3); border-radius: 4px; background-color: alpha(currentColor, 0.05); }
+.reaction-chip { min-height: 22px; padding: 0 8px; margin-top: -4px; border-radius: 11px; background-color: @view_bg_color; box-shadow: 0 0 0 1px alpha(currentColor, 0.15); }
+.reaction-chip.reaction-mine { background-color: mix(@view_bg_color, @accent_bg_color, 0.25); box-shadow: 0 0 0 1px @accent_color; }
+.reaction-pick { font-size: 1.35em; padding: 2px 6px; min-width: 0; }
+.reaction-pick.reaction-mine { background-color: alpha(@accent_bg_color, 0.25); }
+.compose-reply-bar { padding: 6px 4px 6px 10px; border-left: 3px solid @accent_color; border-radius: 4px; background-color: alpha(currentColor, 0.05); }
 ";
 
 fn load_css() {

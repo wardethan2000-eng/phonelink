@@ -106,6 +106,20 @@ pub struct GmMessage {
     /// Replayed by the phone on connect, not new.
     pub old: bool,
     pub attachments: Vec<GmAttachment>,
+    /// The `msg` this one replies to.
+    pub reply_to: String,
+    pub reactions: Vec<GmReaction>,
+}
+
+/// One emoji on a message, with who put it there.
+#[derive(Debug, Clone, PartialEq, Default, Deserialize)]
+#[serde(default)]
+pub struct GmReaction {
+    pub emoji: String,
+    pub count: u32,
+    pub mine: bool,
+    /// The other members who reacted (their numbers).
+    pub by: Vec<String>,
 }
 
 /// Where a message I sent got to.
@@ -230,14 +244,27 @@ pub fn fetch_request(id: u64, conv: &str, count: u32, before: Option<&Cursor>) -
     v.to_string()
 }
 
-pub fn send_text_request(id: u64, conv: &str, text: &str, tmp_id: &str) -> String {
-    json!({ "id": id, "op": "send_text", "conv": conv, "text": text, "tmp_id": tmp_id }).to_string()
+/// `reply_to`: the `msg` it answers (an RCS reply).
+pub fn send_text_request(id: u64, conv: &str, text: &str, tmp_id: &str, reply_to: Option<&str>) -> String {
+    let mut v = json!({ "id": id, "op": "send_text", "conv": conv, "text": text, "tmp_id": tmp_id });
+    if let Some(r) = reply_to {
+        v["reply_to"] = json!(r);
+    }
+    v.to_string()
 }
 
 /// A text with a file (a picture...), as `send_text` otherwise.
-pub fn send_media_request(id: u64, conv: &str, path: &str, mime: &str, text: &str, tmp_id: &str) -> String {
-    json!({ "id": id, "op": "send_media", "conv": conv, "path": path, "mime": mime, "text": text, "tmp_id": tmp_id })
-        .to_string()
+pub fn send_media_request(id: u64, conv: &str, path: &str, mime: &str, text: &str, tmp_id: &str, reply_to: Option<&str>) -> String {
+    let mut v = json!({ "id": id, "op": "send_media", "conv": conv, "path": path, "mime": mime, "text": text, "tmp_id": tmp_id });
+    if let Some(r) = reply_to {
+        v["reply_to"] = json!(r);
+    }
+    v.to_string()
+}
+
+/// `action`: "add", "remove" or "switch" (see `rcs::toggle`).
+pub fn react_request(id: u64, conv: &str, msg: &str, emoji: &str, action: &str) -> String {
+    json!({ "id": id, "op": "react", "conv": conv, "msg": msg, "emoji": emoji, "action": action }).to_string()
 }
 
 /// Save one attachment, decrypted, at `path`.
@@ -416,10 +443,21 @@ mod tests {
         assert_eq!((v["op"].as_str(), v["conv"].as_str(), v["count"].as_u64(), v["before_id"].as_str(), v["before_ts_ms"].as_i64()), (Some("fetch"), Some("12"), Some(50), Some("1"), Some(9)));
         let v: Value = serde_json::from_str(&fetch_request(3, "12", 50, None)).unwrap();
         assert!(v.get("before_id").is_none());
-        let line = send_text_request(4, "12", "line one\nline \"two\"", "tmp_x");
+        let line = send_text_request(4, "12", "line one\nline \"two\"", "tmp_x", None);
         assert!(!line.contains('\n'));
         let v: Value = serde_json::from_str(&line).unwrap();
         assert_eq!(v["text"].as_str(), Some("line one\nline \"two\""));
+        assert!(v.get("reply_to").is_none());
+        let v: Value = serde_json::from_str(&send_media_request(4, "12", "/p.jpg", "image/jpeg", "", "t", Some("m1"))).unwrap();
+        assert_eq!(v["reply_to"].as_str(), Some("m1"));
+        let v: Value = serde_json::from_str(&react_request(6, "12", "m2", "👍", "switch")).unwrap();
+        assert_eq!((v["op"].as_str(), v["msg"].as_str(), v["emoji"].as_str(), v["action"].as_str()), (Some("react"), Some("m2"), Some("👍"), Some("switch")));
+        let Some(Incoming::Message(m)) = parse_line(
+            r#"{"event":"message","conv":"12","msg":"m2","text":"hi","status":"received","reply_to":"m1","reactions":[{"emoji":"👍","count":2,"mine":true,"by":["+13165551111"]}]}"#,
+        ) else {
+            panic!()
+        };
+        assert_eq!((m.reply_to.as_str(), m.reactions.len(), m.reactions[0].count, m.reactions[0].mine), ("m1", 1, 2, true));
         let v: Value = serde_json::from_str(&open_conversation_request(5, &["+13165551111".into()])).unwrap();
         assert_eq!((v["op"].as_str(), v["numbers"][0].as_str()), (Some("open_conversation"), Some("+13165551111")));
         let Some(Incoming::Reply(r)) = parse_line(r#"{"id":5,"ok":true,"conv":"44"}"#) else { panic!() };

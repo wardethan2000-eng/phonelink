@@ -139,7 +139,17 @@ fn png(width: u32, height: u32) -> Vec<u8> {
 
 fn message(c: &Chat, i: usize, ts: i64, from: Option<usize>, text: &str, status: &str) -> Value {
     let pic = c.conv == "2" && i + 1 == c.texts.len();
+    // The group chat shows a reply and reactions.
+    let group = c.conv == "2";
+    let reply_to = if group && i == 1 { "2-0" } else { "" };
+    let reactions = if group && i == 0 {
+        json!([{"emoji": "👍", "count": 2, "mine": true, "by": [c.members[1].0]}, {"emoji": "😂", "count": 1, "by": [c.members[0].0]}])
+    } else {
+        json!([])
+    };
     json!({
+        "reply_to": reply_to,
+        "reactions": reactions,
         "attachments": if pic { json!([{"id": "pic-1", "mime": "image/png", "name": "album.png", "size": 1, "key": "a2V5"}]) } else { json!([]) },
         "conv": c.conv,
         "msg": format!("{}-{i}", c.conv),
@@ -221,6 +231,8 @@ fn main() {
                     None => json!([]),
                 };
                 let tmp = req["tmp_id"].as_str().unwrap_or_default().to_string();
+                let reply_to = req["reply_to"].as_str().unwrap_or_default().to_string();
+                let them = c.members[0].0;
                 put(&out, &json!({"id": id, "ok": true, "tmp_id": tmp}));
                 sent += 1;
                 let (out, rcs, conv, n) = (out.clone(), c.rcs, c.conv, sent);
@@ -229,12 +241,22 @@ fn main() {
                     let steps: &[&str] = if text.contains("fail") { &["sending", "failed"] } else { &["sending", "delivered", "read"] };
                     for status in steps {
                         put(&out, &json!({"event": "message", "conv": conv, "msg": format!("sent-{n}"), "tmp_id": tmp,
-                            "ts_ms": ts, "from_me": true, "text": text, "status": status, "rcs": rcs, "attachments": atts.clone()}));
+                            "ts_ms": ts, "from_me": true, "text": text, "status": status, "rcs": rcs, "attachments": atts.clone(),
+                            "reply_to": reply_to}));
                         std::thread::sleep(Duration::from_millis(1500));
+                    }
+                    // They like it.
+                    if rcs && !text.contains("fail") {
+                        put(&out, &json!({"event": "message", "conv": conv, "msg": format!("sent-{n}"), "ts_ms": ts, "from_me": true,
+                            "text": text, "status": "read", "rcs": rcs, "attachments": atts, "reply_to": reply_to,
+                            "reactions": [{"emoji": "😍", "count": 1, "by": [them]}]}));
                     }
                 });
             }
-            "mark_read" | "set_active" | "list" => put(&out, &json!({"id": id, "ok": true})),
+            "react" if req["msg"].as_str().is_some_and(|m| m.contains("fail")) => {
+                put(&out, &json!({"id": id, "ok": false, "error": "refused", "message": "the phone refused the reaction"}))
+            }
+            "mark_read" | "set_active" | "list" | "react" => put(&out, &json!({"id": id, "ok": true})),
             "delete" => put(&out, &json!({"id": id, "ok": true, "results": [{"chat": "x", "ok": true}]})),
             op => put(&out, &json!({"id": id, "ok": false, "error": "usage", "message": format!("unknown op {op}")})),
         }

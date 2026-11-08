@@ -100,25 +100,77 @@ func TestSendRequestUsesTheChatsSIM(t *testing.T) {
 		RCSChats:       &gmproto.RCSChats{Enabled: true},
 	}
 	c := &gmproto.Conversation{ConversationID: "7", DefaultOutgoingID: "9", Type: gmproto.ConversationType_RCS, SendMode: gmproto.ConversationSendMode_SEND_MODE_AUTO}
-	req := sendRequest(c, []*gmproto.SIMCard{sim}, "hi", nil, "tmp_1")
+	req := sendRequest(c, []*gmproto.SIMCard{sim}, "hi", nil, "tmp_1", "")
 	if !req.ForceRCS || req.SIMPayload.GetSIMNumber() != 1 || req.MessagePayload.ParticipantID != "9" ||
 		req.MessagePayload.MessageInfo[0].GetMessageContent().GetContent() != "hi" || req.TmpID != "tmp_1" {
 		t.Fatalf("send = %+v", req)
 	}
 	// No SIMs known: the legacy form, which the phone accepts too.
-	req = sendRequest(c, nil, "hi", nil, "tmp_2")
+	req = sendRequest(c, nil, "hi", nil, "tmp_2", "")
 	if req.SIMPayload != nil || req.MessagePayload.MessagePayloadContent.GetMessageContent().GetContent() != "hi" {
 		t.Fatalf("legacy send = %+v", req)
 	}
 	// A picture goes first, then its caption.
 	pic := &gmproto.MediaContent{MediaID: "m1", MimeType: "image/jpeg"}
-	req = sendRequest(c, []*gmproto.SIMCard{sim}, "look", pic, "tmp_3")
+	req = sendRequest(c, []*gmproto.SIMCard{sim}, "look", pic, "tmp_3", "")
 	infos := req.MessagePayload.MessageInfo
 	if len(infos) != 2 || infos[0].GetMediaContent().GetMediaID() != "m1" || infos[1].GetMessageContent().GetContent() != "look" {
 		t.Fatalf("media send = %+v", infos)
 	}
 	// Without a caption, only the picture.
-	if infos := sendRequest(c, nil, "", pic, "tmp_4").MessagePayload.MessageInfo; len(infos) != 1 {
+	if infos := sendRequest(c, nil, "", pic, "tmp_4", "").MessagePayload.MessageInfo; len(infos) != 1 {
 		t.Fatalf("bare picture = %+v", infos)
+	}
+}
+
+func person(number, pid string, me bool) *gmproto.Participant {
+	return &gmproto.Participant{ID: &gmproto.SmallInfo{Number: number, ParticipantID: pid}, IsMe: me}
+}
+
+func TestMessagesCarryReactionsAndReplies(t *testing.T) {
+	c := conv("7", person("+13165550000", "5", true), person("+13165551111", "8", false), person("+13165552222", "9", false))
+	c.DefaultOutgoingID = "5"
+	m := msg("m2", gmproto.MessageStatusType_INCOMING_COMPLETE, "8", text("see you"))
+	m.ReplyMessage = &gmproto.ReplyMessage{MessageID: "m1"}
+	m.Reactions = []*gmproto.ReactionEntry{
+		{Data: &gmproto.ReactionData{Type: gmproto.EmojiType_LIKE}, ParticipantIDs: []string{"5", "9"}},
+		{Data: &gmproto.ReactionData{Type: gmproto.EmojiType_CUSTOM, Unicode: "🎉"}, ParticipantIDs: []string{"9"}},
+		{Data: &gmproto.ReactionData{Type: gmproto.EmojiType_EMOTIFY}, ParticipantIDs: []string{"9"}},
+	}
+	got, ok := messageEvent(m, c)
+	if !ok || got.ReplyTo != "m1" || len(got.Reactions) != 2 {
+		t.Fatalf("message = %+v", got)
+	}
+	if like := got.Reactions[0]; like.Emoji != "👍" || like.Count != 2 || !like.Mine || len(like.By) != 1 || like.By[0] != "+13165552222" {
+		t.Fatalf("like = %+v", like)
+	}
+	if party := got.Reactions[1]; party.Emoji != "🎉" || party.Count != 1 || party.Mine {
+		t.Fatalf("custom = %+v", party)
+	}
+	// No chat known: nothing is mine but participant 1.
+	if got, _ := messageEvent(m, nil); got.Reactions[0].Mine {
+		t.Fatalf("mine without the chat: %+v", got.Reactions)
+	}
+}
+
+func TestRepliesAndReactionsAsTheBridgeSendsThem(t *testing.T) {
+	c := conv("7", person("+13165550000", "5", true), person("+13165551111", "8", false))
+	c.DefaultOutgoingID = "5"
+	sim := &gmproto.SIMCard{SIMParticipant: &gmproto.SIMParticipant{ID: "5"}, SIMData: &gmproto.SIMData{SIMPayload: &gmproto.SIMPayload{SIMNumber: 1}}}
+	if r := sendRequest(c, []*gmproto.SIMCard{sim}, "on my way", nil, "tmp_9", "m1").GetReply().GetMessageID(); r != "m1" {
+		t.Fatalf("reply = %q", r)
+	}
+	if sendRequest(c, nil, "hi", nil, "tmp_9", "").GetReply() != nil {
+		t.Fatal("a plain text carried a reply")
+	}
+	add := reactionRequest(c, []*gmproto.SIMCard{sim}, "m1", "😂", gmproto.SendReactionRequest_ADD)
+	if add.GetMessageID() != "m1" || add.GetReactionData().GetType() != gmproto.EmojiType_LAUGH || add.GetSIMPayload().GetSIMNumber() != 1 {
+		t.Fatalf("add = %v", add)
+	}
+	if rm := reactionRequest(c, []*gmproto.SIMCard{sim}, "m1", "😂", gmproto.SendReactionRequest_REMOVE); rm.GetSIMPayload() != nil {
+		t.Fatalf("remove carried a SIM: %v", rm)
+	}
+	if _, ok := reactionAction("explode"); ok {
+		t.Fatal("unknown reaction action accepted")
 	}
 }

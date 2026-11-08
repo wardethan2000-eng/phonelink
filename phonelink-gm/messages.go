@@ -59,6 +59,112 @@ type msgEvent struct {
 	Deleted     bool         `json:"deleted,omitempty"`
 	Old         bool         `json:"old,omitempty"`
 	Attachments []attachment `json:"attachments,omitempty"`
+	// ReplyTo is the msg this one answers (RCS replies).
+	ReplyTo   string     `json:"reply_to,omitempty"`
+	Reactions []reaction `json:"reactions,omitempty"`
+}
+
+// reaction is one emoji on a message: how many, whether I am one of them,
+// and the numbers of the others.
+type reaction struct {
+	Emoji string   `json:"emoji"`
+	Count int      `json:"count"`
+	Mine  bool     `json:"mine,omitempty"`
+	By    []string `json:"by,omitempty"`
+}
+
+// selfIDs: my participant ids in a chat. "1" is always me (as mautrix
+// has it); so is anyone with one of my numbers.
+func selfIDs(conv *gmproto.Conversation) map[string]bool {
+	ids := map[string]bool{"1": true}
+	if d := conv.GetDefaultOutgoingID(); d != "" {
+		ids[d] = true
+	}
+	mine := map[string]bool{}
+	for _, p := range conv.GetParticipants() {
+		if p.GetIsMe() {
+			if k := phoneKey(participantNumber(p)); k != "" {
+				mine[k] = true
+			}
+		}
+	}
+	for _, p := range conv.GetParticipants() {
+		id := p.GetID().GetParticipantID()
+		if id != "" && (p.GetIsMe() || mine[phoneKey(participantNumber(p))]) {
+			ids[id] = true
+		}
+	}
+	return ids
+}
+
+// reactionEmoji: what to show for a reaction, as mautrix does ("" = skip).
+func reactionEmoji(d *gmproto.ReactionData) string {
+	switch d.GetType() {
+	case gmproto.EmojiType_EMOTIFY:
+		return ""
+	case gmproto.EmojiType_CUSTOM:
+		return d.GetUnicode()
+	}
+	if e := d.GetType().Unicode(); e != "" {
+		return e
+	}
+	return d.GetUnicode()
+}
+
+// reactions groups a message's reactions by emoji.
+func reactions(m *gmproto.Message, conv *gmproto.Conversation) []reaction {
+	self := selfIDs(conv)
+	numberOf := map[string]string{}
+	for _, p := range conv.GetParticipants() {
+		numberOf[p.GetID().GetParticipantID()] = participantNumber(p)
+	}
+	var out []reaction
+	for _, r := range m.GetReactions() {
+		emoji := reactionEmoji(r.GetData())
+		if emoji == "" || len(r.GetParticipantIDs()) == 0 {
+			continue
+		}
+		i := 0
+		for i < len(out) && out[i].Emoji != emoji {
+			i++
+		}
+		if i == len(out) {
+			out = append(out, reaction{Emoji: emoji})
+		}
+		for _, id := range r.GetParticipantIDs() {
+			out[i].Count++
+			if self[id] {
+				out[i].Mine = true
+			} else if n := numberOf[id]; n != "" {
+				out[i].By = append(out[i].By, n)
+			}
+		}
+	}
+	return out
+}
+
+// reactionAction: the app's "add" / "remove" / "switch".
+func reactionAction(s string) (gmproto.SendReactionRequest_Action, bool) {
+	switch s {
+	case "add":
+		return gmproto.SendReactionRequest_ADD, true
+	case "remove":
+		return gmproto.SendReactionRequest_REMOVE, true
+	case "switch":
+		return gmproto.SendReactionRequest_SWITCH, true
+	}
+	return 0, false
+}
+
+// reactionRequest, as the mautrix bridge sends one: the chat's SIM with
+// add and switch, none with remove.
+func reactionRequest(conv *gmproto.Conversation, sims []*gmproto.SIMCard, msg, emoji string, act gmproto.SendReactionRequest_Action) *gmproto.SendReactionRequest {
+	req := &gmproto.SendReactionRequest{MessageID: msg, ReactionData: gmproto.MakeReactionData(emoji), Action: act}
+	if act != gmproto.SendReactionRequest_REMOVE {
+		sim, _ := chatSIM(conv, sims)
+		req.SIMPayload = sim.GetSIMData().GetSIMPayload()
+	}
+	return req
 }
 
 func participantNumber(p *gmproto.Participant) string {
@@ -233,6 +339,8 @@ func messageEvent(m *gmproto.Message, conv *gmproto.Conversation) (msgEvent, boo
 		text = append([]string{s}, text...)
 	}
 	ev.Text = strings.Join(text, "\n")
+	ev.ReplyTo = m.GetReplyMessage().GetMessageID()
+	ev.Reactions = reactions(m, conv)
 	return ev, true
 }
 
@@ -240,15 +348,17 @@ func messageEvent(m *gmproto.Message, conv *gmproto.Conversation) (msgEvent, boo
 // from the chat's own SIM when the phone told us its SIMs, else the
 // legacy form (no SIM, the phone picks).
 // media, if set, is an uploaded file sent with (or without) the text.
-func sendRequest(conv *gmproto.Conversation, sims []*gmproto.SIMCard, text string, media *gmproto.MediaContent, tmpID string) *gmproto.SendMessageRequest {
-	var infos []*gmproto.MessageInfo
-	if media != nil {
-		infos = append(infos, &gmproto.MessageInfo{Data: &gmproto.MessageInfo_MediaContent{MediaContent: media}})
+// replyTo, if set, makes it an RCS reply to that message.
+func sendRequest(conv *gmproto.Conversation, sims []*gmproto.SIMCard, text string, media *gmproto.MediaContent, tmpID, replyTo string) *gmproto.SendMessageRequest {
+	req := buildSend(conv, sims, text, media, tmpID)
+	if replyTo != "" {
+		req.Reply = &gmproto.ReplyPayload{MessageID: replyTo}
 	}
-	if text != "" {
-		infos = append(infos, &gmproto.MessageInfo{Data: &gmproto.MessageInfo_MessageContent{MessageContent: &gmproto.MessageContent{Content: text}}})
-	}
-	id := conv.GetConversationID()
+	return req
+}
+
+// chatSIM: the SIM a chat sends from, and its participant id.
+func chatSIM(conv *gmproto.Conversation, sims []*gmproto.SIMCard) (*gmproto.SIMCard, string) {
 	var sim *gmproto.SIMCard
 	outgoing := conv.GetDefaultOutgoingID()
 	for _, s := range sims {
@@ -259,6 +369,19 @@ func sendRequest(conv *gmproto.Conversation, sims []*gmproto.SIMCard, text strin
 	if outgoing == "" && len(sims) == 1 {
 		sim, outgoing = sims[0], sims[0].GetSIMParticipant().GetID()
 	}
+	return sim, outgoing
+}
+
+func buildSend(conv *gmproto.Conversation, sims []*gmproto.SIMCard, text string, media *gmproto.MediaContent, tmpID string) *gmproto.SendMessageRequest {
+	var infos []*gmproto.MessageInfo
+	if media != nil {
+		infos = append(infos, &gmproto.MessageInfo{Data: &gmproto.MessageInfo_MediaContent{MediaContent: media}})
+	}
+	if text != "" {
+		infos = append(infos, &gmproto.MessageInfo{Data: &gmproto.MessageInfo_MessageContent{MessageContent: &gmproto.MessageContent{Content: text}}})
+	}
+	id := conv.GetConversationID()
+	sim, outgoing := chatSIM(conv, sims)
 	if sim == nil && media == nil {
 		return &gmproto.SendMessageRequest{
 			ConversationID: id,

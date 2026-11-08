@@ -18,7 +18,7 @@
 //!   chat appears centred on the match instead of at the bottom.
 
 use std::cell::{Cell, RefCell};
-use std::collections::{HashSet, VecDeque};
+use std::collections::{HashMap, HashSet, VecDeque};
 use std::path::{Path, PathBuf};
 use std::rc::Rc;
 use std::sync::LazyLock;
@@ -32,6 +32,7 @@ use crate::core::attachments::{existing_full_in, full_cache_dir, image_ext, is_i
 use crate::core::messages::SendRoute;
 use crate::core::models::{Attachment, Conversation, SmsMessage};
 use crate::core::private_tmp;
+use crate::core::rcs::{self, Extras};
 use crate::core::search;
 
 pub const THREAD_WINDOW: usize = 60;
@@ -283,6 +284,11 @@ pub struct BubbleActions {
     pub download: Rc<dyn Fn(i64, String, String)>,
     /// "Text back" on a missed call: focus the compose box.
     pub text_back: Rc<dyn Fn()>,
+    /// `(uid, emoji)`: react to a message (the same emoji again takes it
+    /// back). Only bubbles Google Messages matched offer it.
+    pub react: Rc<dyn Fn(i64, String)>,
+    /// Reply to the message `uid` (through Google Messages).
+    pub reply: Rc<dyn Fn(i64)>,
 }
 
 struct Bubble {
@@ -295,7 +301,16 @@ struct Bubble {
     message: SmsMessage,
     /// The route it was drawn with (a delivery change redraws it).
     route: Option<SendRoute>,
+    /// "Replying to …" above the bubble.
+    quote_slot: gtk::Box,
+    /// Reaction chips under it.
+    reactions_slot: gtk::Box,
+    /// What Google Messages says about it (None: not matched).
+    extras: SharedExtras,
 }
+
+/// A bubble's Google Messages share, also read by its pictures' menus.
+type SharedExtras = Rc<RefCell<Option<Extras>>>;
 
 impl Bubble {
     fn new(msg: &SmsMessage, show_time: bool, route: Option<SendRoute>, actions: &BubbleActions) -> Rc<Self> {
@@ -309,7 +324,15 @@ impl Bubble {
         widget.set_margin_bottom(1);
         widget.set_margin_start(if sent { 48 } else { 12 });
         widget.set_margin_end(if sent { 12 } else { 48 });
+        let side = if sent { gtk::Align::End } else { gtk::Align::Start };
+        let quote_slot = gtk::Box::new(gtk::Orientation::Horizontal, 0);
+        quote_slot.set_halign(side);
+        quote_slot.set_margin_start(12);
+        quote_slot.set_margin_end(12);
+        quote_slot.set_visible(false);
+        widget.append(&quote_slot);
 
+        let extras = SharedExtras::default();
         let frame = gtk::Box::new(gtk::Orientation::Vertical, 3);
         frame.set_margin_top(2);
         frame.set_margin_bottom(2);
@@ -337,7 +360,7 @@ impl Bubble {
         // Pictures show as themselves, above the text; other files are a
         // chip inside the bubble.
         for att in &msg.attachments {
-            match image_widget(att, sent, actions) {
+            match image_widget(att, sent, actions, &extras, msg.uid) {
                 Some(w) => widget.append(&w),
                 None => frame.append(&file_chip(att, actions)),
             }
@@ -345,6 +368,12 @@ impl Bubble {
         if frame.first_child().is_some() {
             widget.append(&frame);
         }
+        let reactions_slot = gtk::Box::new(gtk::Orientation::Horizontal, 4);
+        reactions_slot.set_halign(side);
+        reactions_slot.set_margin_start(16);
+        reactions_slot.set_margin_end(16);
+        reactions_slot.set_visible(false);
+        widget.append(&reactions_slot);
 
         let revealer = gtk::Revealer::new();
         revealer.set_transition_type(gtk::RevealerTransitionType::SlideDown);
@@ -378,8 +407,44 @@ impl Bubble {
         });
 
         let body = (!has_links && !msg.body.is_empty()).then_some(body);
-        let bubble = Rc::new(Self { widget, body, revealer, route_tag, message: msg.clone(), route });
+        let bubble = Rc::new(Self {
+            widget,
+            body,
+            revealer,
+            route_tag,
+            message: msg.clone(),
+            route,
+            quote_slot,
+            reactions_slot,
+            extras,
+        });
         bubble.set_timestamp_visible(show_time);
+        // Right-click (or long-press) a text: react, reply, copy. Capture
+        // phase, so the selectable label's own menu doesn't take it.
+        let menu_click = gtk::GestureClick::new();
+        menu_click.set_button(gdk::BUTTON_SECONDARY);
+        menu_click.set_propagation_phase(gtk::PropagationPhase::Capture);
+        let (weak, acts, at) = (Rc::downgrade(&bubble), actions.clone(), frame.clone());
+        menu_click.connect_pressed(move |g, _, x, y| {
+            if let Some(b) = weak.upgrade()
+                && !on_file_chip(&at, x, y)
+            {
+                g.set_state(gtk::EventSequenceState::Claimed);
+                b.menu(at.upcast_ref(), x, y, &acts);
+            }
+        });
+        frame.add_controller(menu_click);
+        let hold = gtk::GestureLongPress::new();
+        let (weak, acts, at) = (Rc::downgrade(&bubble), actions.clone(), frame.clone());
+        hold.connect_pressed(move |g, x, y| {
+            if let Some(b) = weak.upgrade()
+                && !on_file_chip(&at, x, y)
+            {
+                g.set_state(gtk::EventSequenceState::Claimed);
+                b.menu(at.upcast_ref(), x, y, &acts);
+            }
+        });
+        frame.add_controller(hold);
         if !has_links {
             // Tap a bubble to show or hide its time.
             let click = gtk::GestureClick::new();
@@ -422,7 +487,115 @@ impl Bubble {
         }
         widget.append(&line);
         let revealer = gtk::Revealer::new();
-        Rc::new(Self { widget, body: None, revealer, route_tag: None, message: msg.clone(), route: None })
+        Rc::new(Self {
+            widget,
+            body: None,
+            revealer,
+            route_tag: None,
+            message: msg.clone(),
+            route: None,
+            quote_slot: gtk::Box::new(gtk::Orientation::Horizontal, 0),
+            reactions_slot: gtk::Box::new(gtk::Orientation::Horizontal, 0),
+            extras: SharedExtras::default(),
+        })
+    }
+
+    /// Show Google Messages' reactions and quote (None: no longer matched).
+    fn set_extras(&self, extras: Option<&Extras>, actions: &BubbleActions, jump: &Rc<dyn Fn(i64)>) {
+        if self.message.is_call() || self.extras.borrow().as_ref() == extras {
+            return;
+        }
+        *self.extras.borrow_mut() = extras.cloned();
+        clear_box(&self.quote_slot);
+        clear_box(&self.reactions_slot);
+        let Some(e) = extras else {
+            self.quote_slot.set_visible(false);
+            self.reactions_slot.set_visible(false);
+            return;
+        };
+        if let Some(q) = &e.quote {
+            let quote = gtk::Box::new(gtk::Orientation::Horizontal, 6);
+            quote.add_css_class("message-quote");
+            let icon = gtk::Image::from_icon_name("mail-reply-sender-symbolic");
+            icon.add_css_class("dim-label");
+            quote.append(&icon);
+            if !q.author.is_empty() {
+                let who = gtk::Label::new(Some(&q.author));
+                who.add_css_class("caption-heading");
+                quote.append(&who);
+            }
+            let text = gtk::Label::new(Some(if q.text.is_empty() { "an earlier message" } else { &q.text }));
+            text.add_css_class("caption");
+            text.add_css_class("dim-label");
+            text.set_ellipsize(pango::EllipsizeMode::End);
+            text.set_max_width_chars(40);
+            text.set_single_line_mode(true);
+            quote.append(&text);
+            if let Some(uid) = q.uid {
+                quote.set_tooltip_text(Some("Show the message this replies to"));
+                quote.set_cursor_from_name(Some("pointer"));
+                let click = gtk::GestureClick::new();
+                let jump = jump.clone();
+                click.connect_released(move |_, _, _, _| jump(uid));
+                quote.add_controller(click);
+            }
+            self.quote_slot.append(&quote);
+        }
+        self.quote_slot.set_visible(e.quote.is_some());
+        for chip in &e.reactions {
+            let label = if chip.count > 1 { format!("{} {}", chip.emoji, chip.count) } else { chip.emoji.clone() };
+            let b = gtk::Button::with_label(&label);
+            b.add_css_class("reaction-chip");
+            if chip.mine {
+                b.add_css_class("reaction-mine");
+            }
+            if !chip.who.is_empty() {
+                b.set_tooltip_text(Some(&chip.who));
+            }
+            let (react, uid, emoji) = (actions.react.clone(), self.message.uid, chip.emoji.clone());
+            b.connect_clicked(move |_| react(uid, emoji.clone()));
+            self.reactions_slot.append(&b);
+        }
+        self.reactions_slot.set_visible(!e.reactions.is_empty());
+    }
+
+    /// The right-click menu: reactions and Reply when Google Messages knows
+    /// the message, Copy always.
+    fn menu(&self, anchor: &gtk::Widget, x: f64, y: f64, actions: &BubbleActions) {
+        let popover = gtk::Popover::new();
+        popover.set_has_arrow(false);
+        popover.set_parent(anchor);
+        popover.set_pointing_to(Some(&gdk::Rectangle::new(x as i32, y as i32, 1, 1)));
+        let menu = gtk::Box::new(gtk::Orientation::Vertical, 2);
+        let uid = self.message.uid;
+        if let Some(e) = self.extras.borrow().as_ref().filter(|e| !e.msg_id.is_empty()) {
+            react_items(&menu, &popover, e, uid, actions);
+        }
+        if !self.message.body.is_empty() {
+            let copy = gtk::Button::with_label("Copy text");
+            copy.add_css_class("flat");
+            let (text, pop) = (self.message.body.clone(), popover.clone());
+            copy.connect_clicked(move |b| {
+                b.clipboard().set_text(&text);
+                pop.popdown();
+            });
+            menu.append(&copy);
+        }
+        for b in std::iter::successors(menu.first_child(), |w| w.next_sibling()) {
+            if let Some(l) = b.downcast_ref::<gtk::Button>().and_then(|b| b.child()).and_downcast::<gtk::Label>() {
+                l.set_xalign(0.0);
+            }
+        }
+        if menu.first_child().is_none() {
+            popover.unparent();
+            return;
+        }
+        popover.set_child(Some(&menu));
+        popover.connect_closed(|p| {
+            let p = p.clone();
+            glib::idle_add_local_once(move || p.unparent());
+        });
+        popover.popup();
     }
 
     /// Outline the bubble and bold `needle` in its text (None clears).
@@ -454,6 +627,27 @@ impl Bubble {
         } else {
             self.widget.remove_css_class("message-bubble-timestamp-visible");
         }
+    }
+}
+
+/// A file chip has its own right-click menu.
+fn on_file_chip(frame: &gtk::Box, x: f64, y: f64) -> bool {
+    let mut w = frame.pick(x, y, gtk::PickFlags::DEFAULT);
+    while let Some(widget) = w {
+        if widget.has_css_class("message-file-chip") {
+            return true;
+        }
+        if widget == *frame.upcast_ref::<gtk::Widget>() {
+            return false;
+        }
+        w = widget.parent();
+    }
+    false
+}
+
+fn clear_box(b: &gtk::Box) {
+    while let Some(child) = b.first_child() {
+        b.remove(&child);
     }
 }
 
@@ -489,12 +683,56 @@ fn run_action(action: FileAction, widget: &gtk::Widget, path: Option<&Path>, att
 }
 
 /// A right-click menu at the pointer.
-fn context_menu(anchor: &gtk::Widget, x: f64, y: f64, items: &[(&'static str, FileAction)], run: Rc<dyn Fn(FileAction)>) {
+/// The reactions row and Reply, at the top of a message's menu.
+fn react_items(menu: &gtk::Box, popover: &gtk::Popover, e: &Extras, uid: i64, actions: &BubbleActions) {
+    let row = gtk::Box::new(gtk::Orientation::Horizontal, 0);
+    for emoji in rcs::QUICK_REACTIONS {
+        let b = gtk::Button::with_label(emoji);
+        b.add_css_class("flat");
+        b.add_css_class("reaction-pick");
+        if e.reactions.iter().any(|r| r.mine && r.emoji == emoji) {
+            b.add_css_class("reaction-mine");
+            b.set_tooltip_text(Some("Take back"));
+        }
+        let (react, pop) = (actions.react.clone(), popover.clone());
+        b.connect_clicked(move |_| {
+            pop.popdown();
+            react(uid, emoji.to_string());
+        });
+        row.append(&b);
+    }
+    menu.append(&row);
+    let reply = gtk::Button::with_label("Reply");
+    reply.add_css_class("flat");
+    if let Some(l) = reply.child().and_downcast::<gtk::Label>() {
+        l.set_xalign(0.0);
+    }
+    let (act, pop) = (actions.reply.clone(), popover.clone());
+    reply.connect_clicked(move |_| {
+        pop.popdown();
+        act(uid);
+    });
+    menu.append(&reply);
+}
+
+/// `react`: the message's Google Messages share and uid, to put reactions
+/// and Reply above the file actions.
+fn context_menu(
+    anchor: &gtk::Widget,
+    x: f64,
+    y: f64,
+    items: &[(&'static str, FileAction)],
+    run: Rc<dyn Fn(FileAction)>,
+    react: Option<(&Extras, i64, &BubbleActions)>,
+) {
     let popover = gtk::Popover::new();
     popover.set_has_arrow(false);
     popover.set_parent(anchor);
     popover.set_pointing_to(Some(&gdk::Rectangle::new(x as i32, y as i32, 1, 1)));
     let menu = gtk::Box::new(gtk::Orientation::Vertical, 2);
+    if let Some((e, uid, actions)) = react {
+        react_items(&menu, &popover, e, uid, actions);
+    }
     for &(label, action) in items {
         let b = gtk::Button::with_label(label);
         b.add_css_class("flat");
@@ -521,7 +759,7 @@ fn context_menu(anchor: &gtk::Widget, x: f64, y: f64, items: &[(&'static str, Fi
 /// underneath). Hover shows Copy / Save / Open; right-click has the same;
 /// click opens it. While only the phone's small preview is here, the full
 /// file has been asked for and the picture redraws when it arrives.
-fn image_widget(att: &Attachment, sent: bool, actions: &BubbleActions) -> Option<gtk::Widget> {
+fn image_widget(att: &Attachment, sent: bool, actions: &BubbleActions, extras: &SharedExtras, uid: i64) -> Option<gtk::Widget> {
     if !is_image(att) {
         return None;
     }
@@ -589,14 +827,17 @@ fn image_widget(att: &Attachment, sent: bool, actions: &BubbleActions) -> Option
     right.set_button(gdk::BUTTON_SECONDARY);
     {
         let (run, anchor) = (run.clone(), overlay.clone().upcast::<gtk::Widget>());
+        let (extras, acts) = (extras.clone(), actions.clone());
         right.connect_pressed(move |g, _, x, y| {
             g.set_state(gtk::EventSequenceState::Claimed);
+            let e = extras.borrow().clone();
             context_menu(
                 &anchor,
                 x,
                 y,
                 &[("Open", FileAction::Open), ("Copy image", FileAction::CopyImage), ("Save image…", FileAction::Save)],
                 run.clone(),
+                e.as_ref().filter(|e| !e.msg_id.is_empty()).map(|e| (e, uid, &acts)),
             );
         });
     }
@@ -690,7 +931,7 @@ fn file_chip(att: &Attachment, actions: &BubbleActions) -> gtk::Widget {
             } else {
                 &[("Download from phone", FileAction::Download)]
             };
-            context_menu(&anchor, x, y, items, run.clone());
+            context_menu(&anchor, x, y, items, run.clone(), None);
         });
     }
     row.add_controller(right);
@@ -759,6 +1000,10 @@ struct State {
     reveal: Option<i64>,
     /// A chat about to open from a search match: (thread, text, uid).
     pending_find: Option<(i64, String, i64)>,
+    /// Google Messages' reactions and quotes, by uid.
+    extras: HashMap<i64, Extras>,
+    /// The next send replies to this Google Messages id.
+    replying: Option<String>,
 }
 
 pub struct ThreadView {
@@ -772,6 +1017,8 @@ pub struct ThreadView {
     preview_bar: gtk::Overlay,
     preview_picture: gtk::Picture,
     preview_clamps: (adw::Clamp, adw::Clamp),
+    reply_bar: gtk::Box,
+    reply_label: gtk::Label,
     pending_image: RefCell<Option<PathBuf>>,
     /// `(thread_id, text, picture)` → whether it was taken (then the compose
     /// bar clears).
@@ -895,6 +1142,27 @@ impl ThreadView {
         preview_bar.add_overlay(&preview_remove);
         thread_box.append(&preview_bar);
 
+        // "Replying to …": the next send answers that message.
+        let reply_bar = gtk::Box::new(gtk::Orientation::Horizontal, 8);
+        reply_bar.set_margin_start(12);
+        reply_bar.set_margin_end(12);
+        reply_bar.set_margin_top(8);
+        reply_bar.add_css_class("compose-reply-bar");
+        reply_bar.set_visible(false);
+        let reply_icon = gtk::Image::from_icon_name("mail-reply-sender-symbolic");
+        reply_bar.append(&reply_icon);
+        let reply_label = gtk::Label::new(None);
+        reply_label.set_hexpand(true);
+        reply_label.set_xalign(0.0);
+        reply_label.set_ellipsize(pango::EllipsizeMode::End);
+        reply_label.set_single_line_mode(true);
+        reply_bar.append(&reply_label);
+        let reply_cancel = gtk::Button::from_icon_name("window-close-symbolic");
+        reply_cancel.add_css_class("flat");
+        reply_cancel.set_tooltip_text(Some("Don't reply (Esc)"));
+        reply_bar.append(&reply_cancel);
+        thread_box.append(&reply_bar);
+
         let compose = gtk::Box::new(gtk::Orientation::Horizontal, 8);
         compose.set_margin_start(12);
         compose.set_margin_end(12);
@@ -926,6 +1194,8 @@ impl ThreadView {
             preview_bar,
             preview_picture,
             preview_clamps: (preview_clamp_w, preview_clamp_h),
+            reply_bar,
+            reply_label,
             pending_image: RefCell::default(),
             on_send: RefCell::default(),
             font_scale: Cell::new(1.0),
@@ -1030,6 +1300,13 @@ impl ThreadView {
             }
         });
         let weak = Rc::downgrade(&this);
+        reply_cancel.connect_clicked(move |_| {
+            if let Some(this) = weak.upgrade() {
+                this.clear_reply();
+                this.entry.grab_focus();
+            }
+        });
+        let weak = Rc::downgrade(&this);
         preview_remove.connect_clicked(move |_| {
             if let Some(this) = weak.upgrade() {
                 this.clear_pending_image(true);
@@ -1044,6 +1321,10 @@ impl ThreadView {
                 || (state.contains(gdk::ModifierType::SHIFT_MASK) && key == gdk::Key::Insert);
             match (paste, weak.upgrade()) {
                 (true, Some(this)) if this.paste_picture() => glib::Propagation::Stop,
+                (false, Some(this)) if key == gdk::Key::Escape && this.state.borrow().replying.is_some() => {
+                    this.clear_reply();
+                    glib::Propagation::Stop
+                }
                 _ => glib::Propagation::Proceed,
             }
         });
@@ -1175,7 +1456,7 @@ impl ThreadView {
         }
     }
 
-    pub fn connect_send(&self, f: impl Fn(i64, &str, Option<&Path>) -> bool + 'static) {
+    pub fn connect_send(&self, f: impl Fn(i64, &str, Option<&Path>, Option<&str>) -> bool + 'static) {
         *self.on_send.borrow_mut() = Some(Box::new(f));
     }
 
@@ -1186,9 +1467,11 @@ impl ThreadView {
         if text.is_empty() && image.is_none() {
             return;
         }
-        let taken = self.on_send.borrow().as_ref().is_some_and(|f| f(tid, &text, image.as_deref()));
+        let reply_to = self.state.borrow().replying.clone();
+        let taken = self.on_send.borrow().as_ref().is_some_and(|f| f(tid, &text, image.as_deref(), reply_to.as_deref()));
         if taken {
             self.entry.set_text("");
+            self.clear_reply();
             if let Some(path) = image {
                 self.clear_pending_image(false);
                 // A pasted picture we saved ourselves is removed once KDE
@@ -1270,7 +1553,7 @@ impl ThreadView {
         });
     }
 
-    fn set_pending_image(&self, path: PathBuf) {
+    pub fn set_pending_image(&self, path: PathBuf) {
         self.clear_pending_image(true);
         let (w, h) = gtk::gdk_pixbuf::Pixbuf::file_info(&path).map_or((4, 3), |(_, w, h)| (w.max(1), h.max(1)));
         let (w, h) = preview_size(w, h);
@@ -1363,6 +1646,9 @@ impl ThreadView {
                 st.window = THREAD_WINDOW;
                 st.thread_id = Some(conv.thread_id);
                 st.reveal = None;
+                st.extras.clear();
+                st.replying = None;
+                self.reply_bar.set_visible(false);
             }
             st.routes = conv.messages.iter().filter_map(|m| route(m.uid).map(|r| (m.uid, r))).collect();
         }
@@ -1464,7 +1750,7 @@ impl ThreadView {
                 self.messages_box.append(&date_separator(&line));
             }
             let newest = i + 1 == shown.len();
-            let b = Bubble::new(m, newest, routes.get(&m.uid).copied(), &self.actions);
+            let b = self.make_bubble(m, newest, routes.get(&m.uid).copied());
             self.messages_box.append(&b.widget);
             bubbles.push(b);
         }
@@ -1545,7 +1831,7 @@ impl ThreadView {
                 if let Some(line) = time_line(i.checked_sub(1).map(|x| &shown[x]), m, today) {
                     put(date_separator(&line).upcast_ref());
                 }
-                let b = Bubble::new(m, false, routes.get(&m.uid).copied(), &this.actions);
+                let b = this.make_bubble(m, false, routes.get(&m.uid).copied());
                 put(b.widget.upcast_ref());
                 batch.push(b);
             }
@@ -1600,7 +1886,7 @@ impl ThreadView {
         let pinned = self.state.borrow().pinned;
         for (i, m) in changed {
             let old = self.state.borrow().bubbles[i].clone();
-            let fresh = Bubble::new(&m, old.revealer.reveals_child(), route(m.uid), &self.actions);
+            let fresh = self.make_bubble(&m, old.revealer.reveals_child(), route(m.uid));
             self.messages_box.insert_child_after(&fresh.widget, Some(&old.widget));
             self.messages_box.remove(&old.widget);
             self.state.borrow_mut().bubbles[i] = fresh;
@@ -1868,7 +2154,7 @@ impl ThreadView {
         if let Some(line) = time_line(prev.as_ref().map(|b| &b.message), m, today()) {
             self.messages_box.append(&date_separator(&line));
         }
-        let b = Bubble::new(m, true, route, &self.actions);
+        let b = self.make_bubble(m, true, route);
         self.messages_box.append(&b.widget);
         self.rendered(vec![m.uid]);
         let mut st = self.state.borrow_mut();
@@ -1880,6 +2166,63 @@ impl ThreadView {
         st.pinned = true;
         let adj = self.scroll.vadjustment();
         glib::idle_add_local_once(move || adj.set_value(adj.upper()));
+    }
+
+    fn make_bubble(self: &Rc<Self>, m: &SmsMessage, show_time: bool, route: Option<SendRoute>) -> Rc<Bubble> {
+        let b = Bubble::new(m, show_time, route, &self.actions);
+        let extras = self.state.borrow().extras.get(&m.uid).cloned();
+        if extras.is_some() {
+            b.set_extras(extras.as_ref(), &self.actions, &self.jumper());
+        }
+        b
+    }
+
+    fn jumper(self: &Rc<Self>) -> Rc<dyn Fn(i64)> {
+        let weak = Rc::downgrade(self);
+        Rc::new(move |uid| {
+            if let Some(this) = weak.upgrade() {
+                this.reveal(uid);
+            }
+        })
+    }
+
+    /// Google Messages' reactions and quotes for the open chat (by uid);
+    /// bubbles whose share changed update in place.
+    pub fn set_extras(self: &Rc<Self>, extras: HashMap<i64, Extras>) {
+        let bubbles = {
+            let mut st = self.state.borrow_mut();
+            st.extras = extras;
+            st.bubbles.clone()
+        };
+        let jump = self.jumper();
+        let pinned = self.state.borrow().pinned;
+        for b in bubbles {
+            let e = self.state.borrow().extras.get(&b.message.uid).cloned();
+            b.set_extras(e.as_ref(), &self.actions, &jump);
+        }
+        if pinned {
+            let adj = self.scroll.vadjustment();
+            glib::idle_add_local_once(move || adj.set_value(adj.upper() - adj.page_size()));
+        }
+    }
+
+    /// The next send replies to Google Messages' `msg_id` (shown as
+    /// "Replying to `author`: `text`").
+    pub fn start_reply(&self, msg_id: &str, author: &str, text: &str) {
+        self.state.borrow_mut().replying = Some(msg_id.to_string());
+        let text = text.split_whitespace().collect::<Vec<_>>().join(" ");
+        self.reply_label.set_markup(&format!(
+            "Replying to <b>{}</b>: {}",
+            glib::markup_escape_text(author),
+            glib::markup_escape_text(&text)
+        ));
+        self.reply_bar.set_visible(true);
+        self.entry.grab_focus();
+    }
+
+    fn clear_reply(&self) {
+        self.state.borrow_mut().replying = None;
+        self.reply_bar.set_visible(false);
     }
 
     fn clear(&self) {
@@ -1900,7 +2243,8 @@ pub fn image_cache_stats() -> (usize, usize) {
     })
 }
 
-type SendHandler = Box<dyn Fn(i64, &str, Option<&Path>) -> bool>;
+/// `(thread_id, text, picture, reply_to)` → whether it was taken.
+type SendHandler = Box<dyn Fn(i64, &str, Option<&Path>, Option<&str>) -> bool>;
 type ZoomHandler = Box<dyn Fn(f64)>;
 type RenderedHandler = Rc<dyn Fn(i64, Vec<i64>)>;
 

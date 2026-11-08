@@ -16,6 +16,8 @@ package main
 //	                                                          arrives as a message event with this tmp_id
 //	{"id":8, "op":"send_media", "conv":ID, "path":"/tmp/a.jpg", "mime", "name", "text", "tmp_id"}
 //	                                                       -> as send_text, with the file (text optional)
+//	                                                       send_text and send_media take "reply_to":MSG (an RCS reply)
+//	{"id":10, "op":"react", "conv":ID, "msg":MSG, "emoji":"👍", "action":"add"|"remove"|"switch"}
 //	{"id":9, "op":"download", "media":ID, "key":KEY, "path":"/x/a.jpg"}
 //	                                                       -> ok once the decrypted file is at path (0600)
 //	{"id":6, "op":"set_active"}                            take the web session back from another browser
@@ -30,7 +32,9 @@ package main
 //	{"event":"conversation", "chat":KEY, "conv":ID, "name", "members":[{"number","name"}],
 //	 "group", "rcs", "read_only", "archived", "unread", "last_ts_ms", "preview"}
 //	{"event":"message", "conv":ID, "msg":ID, "tmp_id", "ts_ms", "from_me", "from", "name",
-//	 "text", "status", "rcs", "deleted", "old", "attachments":[{"id","mime","name","size","key"}]}
+//	 "text", "status", "rcs", "deleted", "old", "attachments":[{"id","mime","name","size","key"}],
+//	 "reply_to":MSG, "reactions":[{"emoji","count","mine","by":[numbers]}]}
+//	                                         (a reaction changing sends the message again)
 //	{"event":"session", "state":"inactive"}  another browser took the web session
 //	{"event":"phone", "responding":false}
 //
@@ -82,6 +86,9 @@ type request struct {
 	Path       string   `json:"path,omitempty"`
 	Mime       string   `json:"mime,omitempty"`
 	Name       string   `json:"name,omitempty"`
+	ReplyTo    string   `json:"reply_to,omitempty"`
+	Emoji      string   `json:"emoji,omitempty"`
+	Action     string   `json:"action,omitempty"`
 }
 
 type cursor struct {
@@ -450,7 +457,7 @@ func serve(l *link, timeout time.Duration) int {
 					return failed(req.ID, "failed", "upload: %v", err)
 				}
 			}
-			resp, err := l.cli.SendMessage(ctx, sendRequest(conv, state.getSIMs(), req.Text, media, tmp))
+			resp, err := l.cli.SendMessage(ctx, sendRequest(conv, state.getSIMs(), req.Text, media, tmp, req.ReplyTo))
 			if err != nil {
 				return failed(req.ID, "failed", "%v", err)
 			}
@@ -458,6 +465,29 @@ func serve(l *link, timeout time.Duration) int {
 				return failed(req.ID, "failed", "the phone answered %s", resp.GetStatus())
 			}
 			return reply{ID: req.ID, OK: true, TmpID: tmp}
+		case "react":
+			act, ok := reactionAction(req.Action)
+			if req.Conv == "" || req.Msg == "" || req.Emoji == "" || !ok {
+				return failed(req.ID, "usage", "react needs conv, msg, emoji and add/remove/switch")
+			}
+			conv := conversation(ctx, req.Conv)
+			if conv == nil {
+				return failed(req.ID, "not_found", "no chat %s", req.Conv)
+			}
+			if state.setInactive(false) {
+				if err := takeBack(ctx); err != nil {
+					state.setInactive(true)
+					return failed(req.ID, "inactive", "Google Messages is open in another browser: %v", err)
+				}
+			}
+			resp, err := l.cli.SendReaction(ctx, reactionRequest(conv, state.getSIMs(), req.Msg, req.Emoji, act))
+			if err != nil {
+				return failed(req.ID, "failed", "%v", err)
+			}
+			if !resp.GetSuccess() {
+				return failed(req.ID, "refused", "the phone refused the reaction")
+			}
+			return reply{ID: req.ID, OK: true}
 		case "open_conversation":
 			if len(req.Numbers) == 0 {
 				return failed(req.ID, "usage", "open_conversation needs numbers")

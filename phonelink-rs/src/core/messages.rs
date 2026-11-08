@@ -73,7 +73,10 @@ pub enum Effect {
     DeleteOnPhone { thread_id: i64, addresses: Vec<String> },
     /// Send through Google Messages (`send_text`, or `send_media` with a
     /// file): RCS where the chat is.
-    GmSend { thread_id: i64, conv: String, text: String, file: Option<String>, tmp_id: String },
+    /// `reply_to`: the Google id of the message it answers.
+    GmSend { thread_id: i64, conv: String, text: String, file: Option<String>, tmp_id: String, reply_to: Option<String> },
+    /// Add, take back or switch my reaction on a message.
+    GmReact { thread_id: i64, conv: String, msg: String, emoji: String, action: &'static str },
     /// A text to a chat that isn't in the list yet: find or make it on the
     /// phone (`open_conversation`), then [`Messages::gm_opened`].
     GmSendNew { addresses: Vec<String>, text: String },
@@ -89,6 +92,7 @@ pub enum Effect {
 }
 
 pub const TOAST_NOT_CONNECTED: &str = "Can't send — your phone isn't connected right now";
+pub const TOAST_GM_REACT_FAILED: &str = "The phone didn't take that reaction";
 pub const TOAST_GM_NO_PICTURES: &str = "Send a text first to start the chat, then the pictures";
 pub const TOAST_GM_READ_ONLY: &str = "This chat can't be replied to";
 pub const TOAST_GM_NOT_SENT: &str = "Couldn't send through Google Messages. Check the phone is online and try again.";
@@ -191,6 +195,20 @@ pub struct GmMode {
     /// has none; kept so a contacts reload doesn't lose them.
     names: HashMap<String, String>,
     sends: u64,
+    /// Reactions and reply links, by uid (this session; a fetch on open
+    /// fills them in).
+    rich: HashMap<i64, Rich>,
+    /// The next send replies to this Google message id.
+    reply_next: Option<String>,
+}
+
+/// What Google Messages says about one message beyond its text.
+#[derive(Debug, Clone, Default, PartialEq)]
+struct Rich {
+    conv: String,
+    msg: String,
+    reply_to: String,
+    reactions: Vec<super::gm::GmReaction>,
 }
 
 /// A live texting-app notification the phone lets us answer.
@@ -1357,6 +1375,16 @@ impl Messages {
             let route = SendRoute::Google { rcs: m.rcs, delivery };
             changed = gm.delivery.insert(uid, route).is_some_and(|old| old != route);
         }
+        if !m.deleted && !m.msg.is_empty() {
+            let rich = Rich { conv: m.conv.clone(), msg: m.msg.clone(), reply_to: m.reply_to.clone(), reactions: m.reactions.clone() };
+            // A bubble shown at send time carries its reply link until the echo.
+            let had = gm.rich.get(&uid).cloned();
+            let rich = Rich { reply_to: if rich.reply_to.is_empty() { had.as_ref().map(|h| h.reply_to.clone()).unwrap_or_default() } else { rich.reply_to }, ..rich };
+            if had.as_ref() != Some(&rich) {
+                changed |= had.is_some_and(|h| h.reactions != rich.reactions || h.reply_to != rich.reply_to);
+                gm.rich.insert(uid, rich);
+            }
+        }
         let primary = self.index.primary_for(thread_id);
         if m.from_me {
             // Its bubble (shown at send time under `uid`), or a send with
@@ -1438,7 +1466,13 @@ impl Messages {
             .filter(|c| !c.read_only)
             .max_by_key(|c| c.last_ts)
             .map(|c| c.conv.clone());
-        let Some(conv) = chat else { return vec![Effect::Toast(TOAST_GM_READ_ONLY)] };
+        let Some(mut conv) = chat else { return vec![Effect::Toast(TOAST_GM_READ_ONLY)] };
+        // A reply goes to the chat the message is in (merged chats have several).
+        let reply_to = gm.reply_next.take();
+        if let Some(r) = reply_to.as_ref().and_then(|id| gm.rich.values().find(|x| &x.msg == id)) {
+            conv = r.conv.clone();
+        }
+        let mut reply_to = reply_to;
         let now_ms = chrono::Utc::now().timestamp_millis();
         let files: Vec<Option<String>> = if attachments.is_empty() { vec![None] } else { attachments.into_iter().map(Some).collect() };
         let mut out = Vec::new();
@@ -1447,9 +1481,73 @@ impl Messages {
             gm.sends += 1;
             let tmp_id = super::gm::new_tmp_id(now_ms, gm.sends % 1000);
             gm.sent_here.insert(tmp_id.clone(), (primary, normalize_text(&text), 0));
-            out.push(Effect::GmSend { thread_id: primary, conv: conv.clone(), text, file, tmp_id });
+            // Words and a picture go as one reply: the first part carries it.
+            out.push(Effect::GmSend { thread_id: primary, conv: conv.clone(), text, file, tmp_id, reply_to: reply_to.take() });
         }
         out
+    }
+
+    /// The next text sent replies to Google's message `msg` (None: not a reply).
+    pub fn gm_reply_next(&mut self, msg: Option<String>) {
+        if let Some(gm) = self.gm.as_mut() {
+            gm.reply_next = msg;
+        }
+    }
+
+    /// A bubble shown at send time answers `reply_to`: show the quote at once.
+    pub fn gm_pending_reply(&mut self, uid: i64, conv: &str, reply_to: &str) {
+        if let Some(gm) = self.gm.as_mut() {
+            gm.rich.entry(uid).or_insert_with(|| Rich { conv: conv.into(), reply_to: reply_to.into(), ..Default::default() });
+        }
+    }
+
+    /// Reactions and quotes for the bubbles of thread `primary`, by uid.
+    pub fn gm_extras(&self, primary: i64, store: &MessageStore) -> HashMap<i64, super::rcs::Extras> {
+        let (Some(gm), Some(conv)) = (&self.gm, self.index.get(primary)) else { return HashMap::new() };
+        let name_of = |n: &str| resolve_name(&self.contact_map, n);
+        let mut out = HashMap::new();
+        for m in &conv.messages {
+            let Some(r) = gm.rich.get(&m.uid) else { continue };
+            let quote = (!r.reply_to.is_empty()).then(|| {
+                let uid = store.gm_known("msg", &r.reply_to);
+                match uid.and_then(|u| conv.messages.iter().find(|q| q.uid == u)) {
+                    Some(q) => super::rcs::Quote {
+                        author: if q.msg_type == super::models::MSG_TYPE_RECEIVED { name_of(&q.address) } else { "You".into() },
+                        text: if q.body.is_empty() && !q.attachments.is_empty() { "Picture".into() } else { q.body.clone() },
+                        uid: Some(q.uid),
+                    },
+                    None => super::rcs::Quote::default(),
+                }
+            });
+            let reactions: Vec<_> = r.reactions.iter().map(|x| super::rcs::chip(x, &name_of)).collect();
+            // Not yet on the phone (still sending): no reactions or Reply yet.
+            if r.msg.is_empty() && quote.is_none() {
+                continue;
+            }
+            out.insert(m.uid, super::rcs::Extras { msg_id: r.msg.clone(), reactions, quote });
+        }
+        out
+    }
+
+    /// The user picked `emoji` on bubble `uid`: show it at once and ask the phone.
+    pub fn gm_react(&mut self, uid: i64, emoji: &str) -> Vec<Effect> {
+        let Some(primary) = self.active else { return Vec::new() };
+        let Some(r) = self.gm.as_mut().and_then(|gm| gm.rich.get_mut(&uid)).filter(|r| !r.msg.is_empty()) else {
+            return Vec::new();
+        };
+        let action = super::rcs::toggle(&mut r.reactions, emoji);
+        vec![
+            Effect::GmReact { thread_id: primary, conv: r.conv.clone(), msg: r.msg.clone(), emoji: emoji.into(), action },
+            Effect::Redraw(primary),
+        ]
+    }
+
+    /// A reaction was refused: fetch the chat again for the phone's truth.
+    pub fn gm_react_failed(&mut self, thread_id: i64) -> Vec<Effect> {
+        let primary = self.index.primary_for(thread_id);
+        let Some(gm) = self.gm.as_mut() else { return Vec::new() };
+        gm.fetched.remove(&primary);
+        vec![Effect::Toast(TOAST_GM_REACT_FAILED), Effect::GmFetch { thread_id: primary }]
     }
 
     /// The phone found or made the chat for a [`Effect::GmSendNew`]
@@ -1464,7 +1562,7 @@ impl Messages {
         self.active = Some(primary);
         self.read_thread_ids.insert(primary);
         vec![
-            Effect::GmSend { thread_id: primary, conv: conv.to_string(), text: text.to_string(), file: None, tmp_id },
+            Effect::GmSend { thread_id: primary, conv: conv.to_string(), text: text.to_string(), file: None, tmp_id, reply_to: None },
             Effect::RefreshList,
             Effect::ShowThread(primary),
         ]
@@ -2513,6 +2611,51 @@ mod tests {
             let fx = p.m.gm_send_failed(&tmp, &p.store);
             assert!(fx.contains(&Effect::Redraw(tid)) && fx.contains(&Effect::Toast(TOAST_GM_NOT_SENT)));
             assert_eq!(p.m.route_of(uid3).map(SendRoute::label), Some("RCS · Not sent"));
+        }
+
+        #[test]
+        fn reactions_and_replies_show_and_go_to_the_phone() {
+            use crate::core::gm::GmReaction;
+            let mut p = panel();
+            p.chat(&chat("a", &["+13165551111"], false, 2000));
+            let tid = p.store.gm_local_id("conv", "a");
+            let mut q = gmsg("a", "1", false, 1000);
+            q.text = "dinner?".into();
+            q.reactions = vec![GmReaction { emoji: "👍".into(), count: 1, mine: false, by: vec!["+13165551111".into()] }];
+            p.msg(&q);
+            let mut r = gmsg("a", "2", true, 1500);
+            r.text = "yes".into();
+            r.reply_to = "1".into();
+            p.msg(&r);
+            p.m.select(tid, &p.store, 0.0);
+            let (u1, u2) = (p.store.gm_local_id("msg", "1"), p.store.gm_local_id("msg", "2"));
+            let ex = p.m.gm_extras(tid, &p.store);
+            assert_eq!(ex[&u1].reactions.iter().map(|c| (c.emoji.as_str(), c.count, c.mine)).collect::<Vec<_>>(), [("👍", 1, false)]);
+            let quote = ex[&u2].quote.clone().unwrap();
+            assert_eq!((quote.text.as_str(), quote.uid), ("dinner?", Some(u1)));
+            assert!(ex[&u2].reactions.is_empty());
+            // My reaction shows at once and goes to the phone.
+            let fx = p.m.gm_react(u1, "😂");
+            assert_eq!(
+                fx,
+                vec![
+                    Effect::GmReact { thread_id: tid, conv: "a".into(), msg: "1".into(), emoji: "😂".into(), action: "add" },
+                    Effect::Redraw(tid)
+                ]
+            );
+            assert!(p.m.gm_extras(tid, &p.store)[&u1].reactions.iter().any(|c| c.emoji == "😂" && c.mine));
+            // Their reaction arriving live redraws the chat.
+            let mut later = q.clone();
+            later.reactions.push(GmReaction { emoji: "😍".into(), count: 1, ..Default::default() });
+            assert_eq!(echo(&mut p, &later).1, vec![Effect::Redraw(tid)]);
+            // A reply carries the message it answers, once.
+            p.m.gm_reply_next(Some("1".into()));
+            let e = p.m.send(tid, "see you there");
+            assert!(matches!(&e[..], [Effect::GmSend { reply_to: Some(r), .. }] if r == "1"), "{e:?}");
+            let e = p.m.send(tid, "and dessert");
+            assert!(matches!(&e[..], [Effect::GmSend { reply_to: None, .. }]), "{e:?}");
+            // A refusal says so and fetches the phone's truth.
+            assert_eq!(p.m.gm_react_failed(tid), vec![Effect::Toast(TOAST_GM_REACT_FAILED), Effect::GmFetch { thread_id: tid }]);
         }
 
         #[test]

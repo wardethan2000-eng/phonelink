@@ -204,6 +204,23 @@ impl MessagesPage {
                     }
                 })
             },
+            react: {
+                let target = download_target.clone();
+                Rc::new(move |uid, emoji| {
+                    if let Some(page) = target.borrow().upgrade() {
+                        let effects = page.inner.borrow_mut().m.gm_react(uid, &emoji);
+                        page.run(effects);
+                    }
+                })
+            },
+            reply: {
+                let target = download_target.clone();
+                Rc::new(move |uid| {
+                    if let Some(page) = target.borrow().upgrade() {
+                        page.start_reply(uid);
+                    }
+                })
+            },
         });
         content.append(&thread.widget);
         stack.add_named(&content, Some("content"));
@@ -295,9 +312,9 @@ impl MessagesPage {
             }
         });
         let weak = Rc::downgrade(&this);
-        this.thread.connect_send(move |tid, text, picture| {
+        this.thread.connect_send(move |tid, text, picture, reply_to| {
             let Some(this) = weak.upgrade() else { return false };
-            this.send(tid, text, picture)
+            this.send(tid, text, picture, reply_to)
         });
         let weak = Rc::downgrade(&this);
         this.list.connect_selected(move |tid| {
@@ -593,7 +610,7 @@ impl MessagesPage {
                         })
                     }
                 }
-                Effect::GmSend { thread_id: _, conv, text, file, tmp_id } => {
+                Effect::GmSend { thread_id: _, conv, text, file, tmp_id, reply_to } => {
                     // Show it at once as "Sending"; the phone's copy takes
                     // over the same bubble.
                     let shown = {
@@ -601,18 +618,25 @@ impl MessagesPage {
                         let i = &mut *i;
                         let mut settings = i.settings.borrow_mut();
                         let uid = i.store.gm_local_id("msg", &format!("pending:{tmp_id}"));
+                        if let Some(r) = &reply_to {
+                            i.m.gm_pending_reply(uid, &conv, r);
+                        }
                         i.m.gm_add_pending((&tmp_id, &text, file.as_deref()), uid, &i.store, &mut *settings, now())
                     };
                     self.run(shown);
-                    self.gm_send(conv, text, file, tmp_id);
+                    self.gm_send(conv, text, file, tmp_id, reply_to);
                 }
+                Effect::GmReact { thread_id, conv, msg, emoji, action } => self.gm_react(thread_id, conv, msg, emoji, action),
                 Effect::GmFetch { thread_id } => self.gm_fetch(thread_id),
                 Effect::GmSendNew { addresses, text } => self.gm_send_new(addresses, text),
                 Effect::Redraw(tid) => {
-                    let i = self.inner.borrow();
-                    if let Some(conv) = i.m.index.get(tid) {
-                        self.thread.redraw(conv, &|uid| i.m.route_of(uid));
+                    {
+                        let i = self.inner.borrow();
+                        if let Some(conv) = i.m.index.get(tid) {
+                            self.thread.redraw(conv, &|uid| i.m.route_of(uid));
+                        }
                     }
+                    self.show_extras(tid);
                 }
                 Effect::ShowThread(tid) => self.show_thread(tid),
                 Effect::ShowEmpty => self.thread.show_empty(),
@@ -1006,15 +1030,23 @@ impl MessagesPage {
     }
 
     /// Send a text through Google Messages; its echo arrives as a message.
-    fn gm_send(self: &Rc<Self>, conv: String, text: String, file: Option<String>, tmp_id: String) {
+    fn gm_send(self: &Rc<Self>, conv: String, text: String, file: Option<String>, tmp_id: String, reply_to: Option<String>) {
         let gm = self.gm.borrow().clone();
         let weak = Rc::downgrade(self);
         let tmp = tmp_id.clone();
         let sent = gm.is_some_and(|gm| {
             gm.request(
                 |id| match &file {
-                    Some(f) => crate::core::gm::send_media_request(id, &conv, f, crate::core::gm::guess_mime(f), &text, &tmp_id),
-                    None => crate::core::gm::send_text_request(id, &conv, &text, &tmp_id),
+                    Some(f) => crate::core::gm::send_media_request(
+                        id,
+                        &conv,
+                        f,
+                        crate::core::gm::guess_mime(f),
+                        &text,
+                        &tmp_id,
+                        reply_to.as_deref(),
+                    ),
+                    None => crate::core::gm::send_text_request(id, &conv, &text, &tmp_id, reply_to.as_deref()),
                 },
                 move |r| {
                     let Some(this) = weak.upgrade() else { return };
@@ -1039,6 +1071,57 @@ impl MessagesPage {
             };
             self.run(effects);
         }
+    }
+
+    /// React (or take it back) on the phone; a refusal toasts and refetches.
+    fn gm_react(self: &Rc<Self>, thread_id: i64, conv: String, msg: String, emoji: String, action: &'static str) {
+        let gm = self.gm.borrow().clone();
+        let weak = Rc::downgrade(self);
+        let sent = gm.is_some_and(|gm| {
+            gm.request(
+                |id| crate::core::gm::react_request(id, &conv, &msg, &emoji, action),
+                move |r| {
+                    let Some(this) = weak.upgrade() else { return };
+                    if r.ok {
+                        return;
+                    }
+                    log::warn!("Google Messages reaction failed: {} {}", r.error, r.message);
+                    let effects = this.inner.borrow_mut().m.gm_react_failed(thread_id);
+                    this.run(effects);
+                },
+            )
+        });
+        if !sent {
+            let effects = self.inner.borrow_mut().m.gm_react_failed(thread_id);
+            self.run(effects);
+        }
+    }
+
+    /// Reply on bubble `uid`: the compose bar says what it answers.
+    fn start_reply(&self, uid: i64) {
+        let i = self.inner.borrow();
+        let Some(tid) = i.m.active_thread() else { return };
+        let Some(e) = i.m.gm_extras(tid, &i.store).remove(&uid).filter(|e| !e.msg_id.is_empty()) else { return };
+        let Some(m) = i.m.index.get(tid).and_then(|c| c.messages.iter().find(|m| m.uid == uid)) else { return };
+        let author = if m.msg_type == crate::core::models::MSG_TYPE_RECEIVED {
+            crate::core::contacts::resolve_name(&i.m.contact_map, &m.address)
+        } else {
+            "You".to_string()
+        };
+        let text = if m.body.is_empty() { "Picture".to_string() } else { m.body.clone() };
+        self.thread.start_reply(&e.msg_id, &author, &text);
+    }
+
+    /// Reactions and quotes for the open chat, when it is `tid`.
+    fn show_extras(&self, tid: i64) {
+        let extras = {
+            let i = self.inner.borrow();
+            if !i.m.is_gm() || i.m.active_thread() != Some(tid) {
+                return;
+            }
+            i.m.gm_extras(tid, &i.store)
+        };
+        self.thread.set_extras(extras);
     }
 
     /// A text to a new chat: have the phone find or make it, then send.
@@ -1524,10 +1607,11 @@ impl MessagesPage {
     }
 
     /// The compose bar's send. Returns whether it was taken.
-    fn send(self: &Rc<Self>, thread_id: i64, text: &str, picture: Option<&std::path::Path>) -> bool {
+    fn send(self: &Rc<Self>, thread_id: i64, text: &str, picture: Option<&std::path::Path>, reply_to: Option<&str>) -> bool {
         let attachments: Vec<String> = picture.map(|p| p.to_string_lossy().into_owned()).into_iter().collect();
         let (effects, taken) = {
             let mut i = self.inner.borrow_mut();
+            i.m.gm_reply_next(reply_to.map(str::to_string));
             let effects = i.m.send_with(thread_id, text, attachments);
             // Refused (phone away): keep the text so it can be sent later.
             let taken = !effects.iter().any(|e| matches!(e, Effect::Toast(_))) && !effects.is_empty();
@@ -1648,6 +1732,8 @@ impl MessagesPage {
         self.list.select_thread(conv.thread_id);
         let _t = super::perf::span("updating the open chat");
         self.thread.sync(conv, &|uid| i.m.route_of(uid));
+        drop(i);
+        self.show_extras(tid);
     }
 
     /// Messages just went on screen: ask the phone for their full pictures
