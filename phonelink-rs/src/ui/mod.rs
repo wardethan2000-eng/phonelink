@@ -122,6 +122,10 @@ button.settings-open { background-color: alpha(currentColor, 0.1); }
 .conversation-preview { font-size: 1em; }
 .conversation-avatar, .conversation-avatar-photo { min-width: 46px; min-height: 46px; }
 .conversation-avatar { font-size: 18px; }
+/* The message box: in em, so it grows with the message zoom. */
+.compose-entry { min-height: 2.3em; padding: 0 0.75em; border-radius: 1.15em; }
+.compose-button { min-width: 40px; min-height: 40px; padding: 0; border-radius: 20px; }
+.compose-button image { -gtk-icon-size: 20px; }
 /* Bubbles in em: they keep their shape when the text is zoomed. */
 .message-bubble-sent { padding: 0.45em 0.85em; border-radius: 1.15em 1.15em 0.3em 1.15em; }
 .message-bubble-received { padding: 0.45em 0.85em; border-radius: 1.15em 1.15em 1.15em 0.3em; }

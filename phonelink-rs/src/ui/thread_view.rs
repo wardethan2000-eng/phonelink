@@ -1234,14 +1234,18 @@ impl ThreadView {
         compose.set_margin_bottom(8);
         let attach_button = gtk::Button::from_icon_name("mail-attachment-symbolic");
         attach_button.add_css_class("flat");
+        attach_button.add_css_class("compose-button");
         attach_button.set_tooltip_text(Some("Add pictures or files"));
         compose.append(&attach_button);
         let entry = gtk::Entry::new();
+        // Its text follows the message zoom, like the bubbles.
+        entry.add_css_class("compose-entry");
         entry.set_placeholder_text(Some("Type a message…  (Ctrl+V pastes a picture)"));
         entry.set_hexpand(true);
         compose.append(&entry);
         let send_button = gtk::Button::from_icon_name(&super::icons::send_icon());
         send_button.add_css_class("suggested-action");
+        send_button.add_css_class("compose-button");
         send_button.set_tooltip_text(Some("Send"));
         compose.append(&send_button);
         thread_box.append(&compose);
@@ -1530,7 +1534,7 @@ impl ThreadView {
             let pct = (scale * 100.0).round() as i64;
             // The whole bubble, so its padding (in em) grows with the text.
             self.font_provider.load_from_data(&format!(
-                ".message-bubble-sent, .message-bubble-received {{ font-size: {pct}%; }}"
+                ".message-bubble-sent, .message-bubble-received, .compose-entry {{ font-size: {pct}%; }}"
             ));
         }
         if persist && let Some(f) = self.on_zoom.borrow().as_ref() {
