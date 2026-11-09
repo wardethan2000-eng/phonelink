@@ -158,6 +158,25 @@ pub fn group_by_day<T: PartialEq>(photos: &[Photo], day: impl Fn(i64) -> T) -> V
     out
 }
 
+/// A tile's place on screen: (x, y, width, height).
+pub type Rect = (f64, f64, f64, f64);
+
+/// The photo at point `p`, given the tiles' places in the order shown. Off a
+/// tile, the last one before the point in reading order (the first when the
+/// point is above them all). None without tiles.
+pub fn photo_at(tiles: &[Rect], p: (f64, f64)) -> Option<usize> {
+    if tiles.is_empty() {
+        return None;
+    }
+    let (px, py) = p;
+    if let Some(i) = tiles.iter().position(|&(x, y, w, h)| px >= x && px < x + w && py >= y && py < y + h) {
+        return Some(i);
+    }
+    // Before the point: a row that ends above it, or the same row, left of it.
+    let before = |&(x, y, _, h): &Rect| y + h <= py || (y <= py && x <= px);
+    Some(tiles.iter().rposition(before).unwrap_or(0))
+}
+
 /// The paths of `photos`.
 pub fn photo_paths(photos: &[Photo]) -> Vec<PathBuf> {
     photos.iter().map(|p| p.path.clone()).collect()
@@ -393,6 +412,26 @@ mod tests {
         // Days of 100 seconds.
         assert_eq!(group_by_day(&photos, |t| t / 100), vec![(2, vec![0]), (1, vec![1]), (0, vec![2, 3])]);
         assert!(group_by_day(&[], |t| t).is_empty());
+    }
+
+    #[test]
+    fn photo_under_the_pointer() {
+        // Two rows of three 10x10 tiles with 2 px gaps; a second section of one tile lower down.
+        let mut t: Vec<Rect> = Vec::new();
+        for row in 0..2 {
+            for col in 0..3 {
+                t.push((col as f64 * 12.0, row as f64 * 12.0, 10.0, 10.0));
+            }
+        }
+        t.push((0.0, 40.0, 10.0, 10.0));
+        assert_eq!(photo_at(&t, (5.0, 5.0)), Some(0));
+        assert_eq!(photo_at(&t, (17.0, 17.0)), Some(4));
+        assert_eq!(photo_at(&t, (11.0, 5.0)), Some(0), "the gap after a tile");
+        assert_eq!(photo_at(&t, (100.0, 17.0)), Some(5), "right of a row");
+        assert_eq!(photo_at(&t, (5.0, 30.0)), Some(5), "between sections");
+        assert_eq!(photo_at(&t, (5.0, -3.0)), Some(0), "above everything");
+        assert_eq!(photo_at(&t, (50.0, 90.0)), Some(6), "below everything");
+        assert_eq!(photo_at(&[], (0.0, 0.0)), None);
     }
 
     #[test]

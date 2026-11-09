@@ -101,7 +101,6 @@ pub struct FilesPage {
     photo_sections: gtk::Box,
     photo_area: gtk::Overlay,
     photo_scroll: gtk::ScrolledWindow,
-    rubber: gtk::Box,
     sort_btn: gtk::Button,
     settings: Rc<RefCell<Settings>>,
     photo_stack: gtk::Stack,
@@ -265,8 +264,7 @@ impl FilesPage {
         let photo_scroll = gtk::ScrolledWindow::new();
         photo_scroll.set_vexpand(true);
         photo_scroll.set_policy(gtk::PolicyType::Never, gtk::PolicyType::Automatic);
-        // Sections (one per day, or one), each a heading and a FlowBox; an
-        // overlay on top draws the drag-select box.
+        // Sections (one per day, or one), each a heading and a FlowBox.
         let photo_sections = gtk::Box::new(gtk::Orientation::Vertical, 0);
         photo_sections.set_valign(gtk::Align::Start);
         photo_sections.set_margin_start(8);
@@ -275,13 +273,6 @@ impl FilesPage {
         photo_sections.set_margin_bottom(8);
         let photo_area = gtk::Overlay::new();
         photo_area.set_child(Some(&photo_sections));
-        let rubber = gtk::Box::new(gtk::Orientation::Vertical, 0);
-        rubber.add_css_class("photo-rubberband");
-        rubber.set_halign(gtk::Align::Start);
-        rubber.set_valign(gtk::Align::Start);
-        rubber.set_can_target(false);
-        rubber.set_visible(false);
-        photo_area.add_overlay(&rubber);
         photo_scroll.set_child(Some(&photo_area));
         photo_page.append(&photo_scroll);
         let photo_status = caption("");
@@ -349,7 +340,6 @@ impl FilesPage {
             photo_sections,
             photo_area,
             photo_scroll: photo_scroll.clone(),
-            rubber,
             sort_btn,
             settings,
             photo_stack,
@@ -1165,7 +1155,6 @@ impl FilesPage {
             if start_now {
                 // Ours from here: the tile under the press doesn't toggle.
                 g.set_state(gtk::EventSequenceState::Claimed);
-                this.rubber.set_visible(true);
                 let weak = Rc::downgrade(&this);
                 let tick = glib::timeout_add_local(Duration::from_millis(40), move || {
                     let Some(this) = weak.upgrade() else { return glib::ControlFlow::Break };
@@ -1193,7 +1182,6 @@ impl FilesPage {
         {
             t.remove();
         }
-        self.rubber.set_visible(false);
     }
 
     /// The pointer's point in the photo area, allowing for scrolling since
@@ -1205,25 +1193,27 @@ impl FilesPage {
         Some((d.start, (d.start.0 + d.offset.0, d.start.1 + d.offset.1 + scrolled)))
     }
 
+    /// Select every photo from the one the drag started on to the one under
+    /// the pointer, in the order shown (no box: Ethan, 2026-11-08).
     fn update_drag(&self) {
         let Some((a, b)) = self.drag_point() else { return };
-        let (x0, x1) = (a.0.min(b.0).max(0.0), a.0.max(b.0));
-        let (y0, y1) = (a.1.min(b.1).max(0.0), a.1.max(b.1));
-        self.rubber.set_margin_start(x0 as i32);
-        self.rubber.set_margin_top(y0 as i32);
-        self.rubber.set_size_request(((x1 - x0) as i32).max(1), ((y1 - y0) as i32).max(1));
         {
             let mut s = self.state.borrow_mut();
             let s = &mut *s;
             let Some(d) = s.drag.as_ref() else { return };
-            for (i, t) in s.tiles.iter_mut().enumerate() {
-                let inside = t.child.compute_bounds(&self.photo_area).is_some_and(|r| {
-                    (r.x() as f64) < x1
-                        && (r.x() + r.width()) as f64 > x0
-                        && (r.y() as f64) < y1
-                        && (r.y() + r.height()) as f64 > y0
-                });
-                let on = d.before.get(i).copied().unwrap_or(false) || inside;
+            let rects: Vec<files::Rect> = s
+                .tiles
+                .iter()
+                .map(|t| {
+                    t.child.compute_bounds(&self.photo_area).map_or((0.0, 0.0, 0.0, 0.0), |r| {
+                        (r.x() as f64, r.y() as f64, r.width() as f64, r.height() as f64)
+                    })
+                })
+                .collect();
+            let (Some(i), Some(j)) = (files::photo_at(&rects, a), files::photo_at(&rects, b)) else { return };
+            let (lo, hi) = (i.min(j), i.max(j));
+            for (k, t) in s.tiles.iter_mut().enumerate() {
+                let on = d.before.get(k).copied().unwrap_or(false) || (lo..=hi).contains(&k);
                 if on != t.selected {
                     t.set_selected(on);
                 }

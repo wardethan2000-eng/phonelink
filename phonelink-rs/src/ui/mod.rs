@@ -107,7 +107,6 @@ const EXTRA_CSS: &str = "
 .compose-thumb { border-radius: 12px; }
 .compose-file { border-radius: 12px; background-color: alpha(currentColor, 0.08); }
 .typing-label { font-style: italic; }
-.photo-rubberband { border: 1px solid @accent_bg_color; background-color: alpha(@accent_bg_color, 0.18); border-radius: 3px; }
 flowboxchild.photo-row { border-radius: 8px; padding: 0; }
 flowboxchild.photo-row.photo-tile-selected { background-color: alpha(@accent_bg_color, 0.18); }
 .conversation-pin { opacity: 0.6; }
