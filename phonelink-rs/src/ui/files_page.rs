@@ -16,6 +16,7 @@ use super::icons;
 use crate::core::files::{self, Listing, Photo, RefreshLimit, THUMB_SIZE};
 use crate::core::models::Device;
 use crate::core::settings::Settings;
+use crate::core::thumbs;
 use crate::dbus::signals::{self, Subscription};
 use crate::dbus::{Client, IFACE_SFTP, device_path};
 
@@ -791,7 +792,14 @@ impl FilesPage {
         let generation = self.state.borrow().photo_generation;
         let weak = Rc::downgrade(self);
         glib::spawn_future_local(async move {
-            let Ok(found) = gio::spawn_blocking(move || files::recent_photos(&base)).await else { return };
+            let Ok(found) = gio::spawn_blocking(move || {
+                thumbs::prune(&thumbs::cache_dir(), 2000);
+                files::recent_photos(&base)
+            })
+            .await
+            else {
+                return;
+            };
             if let Some(this) = weak.upgrade() {
                 this.show_photos(generation, found);
             }
@@ -912,7 +920,7 @@ impl FilesPage {
                     tile.picture.set_paintable(Some(tex));
                     tile.stack.set_visible_child_name("image");
                 } else {
-                    missing.push(photo.path.clone());
+                    missing.push(photo.clone());
                 }
                 flow.append(&tile.child);
                 self.state.borrow_mut().tiles.push(tile);
@@ -1069,35 +1077,37 @@ impl FilesPage {
         Tile { path: photo.path.clone(), child, stack, picture, check, selected: false }
     }
 
-    /// Decode off the main thread at 2× tile size, several at once (one at a
-    /// time was visibly slow: each read is a full camera photo over sshfs).
-    /// The first screenful goes in one batch; tiles fill in batch order.
-    /// Stops as soon as a newer scan starts.
-    fn load_thumbnails(self: &Rc<Self>, generation: u64, paths: Vec<PathBuf>, total: usize) {
-        const FIRST_BATCH: usize = 12;
-        const BATCH: usize = 8;
+    /// Thumbnails off the main thread, many at once: each comes from the
+    /// disk cache, or the photo's built-in preview (the first ~60 KB), or
+    /// the whole photo, in that order (see `core::thumbs`). Tiles fill in
+    /// batch order. Stops as soon as a newer scan starts.
+    fn load_thumbnails(self: &Rc<Self>, generation: u64, photos: Vec<Photo>, total: usize) {
+        // Reading a preview is mostly waiting on Wi-Fi, so many go at once
+        // (16 previews: 3.7 s, against ~1.5 s per whole photo one by one).
+        const BATCH: usize = 16;
         let weak = Rc::downgrade(self);
+        let dir = thumbs::cache_dir();
         glib::spawn_future_local(async move {
-            let count = paths.len();
+            let count = photos.len();
             let alive = |w: &std::rc::Weak<Self>| w.upgrade().filter(|t| t.state.borrow().photo_generation == generation);
             let mut start = 0;
             while start < count {
                 if alive(&weak).is_none() {
                     return;
                 }
-                let end = (start + if start == 0 { FIRST_BATCH } else { BATCH }).min(count);
+                let end = (start + BATCH).min(count);
                 // All of the batch is decoding in the thread pool at once.
-                let jobs: Vec<_> = paths[start..end]
+                let jobs: Vec<_> = photos[start..end]
                     .iter()
                     .map(|p| {
-                        let p = p.clone();
-                        gio::spawn_blocking(move || decode_thumbnail(&p))
+                        let (p, dir) = (p.clone(), dir.clone());
+                        gio::spawn_blocking(move || decode_thumbnail(&p, &dir))
                     })
                     .collect();
                 for (offset, job) in jobs.into_iter().enumerate() {
                     let decoded = job.await.ok().flatten();
                     let Some(this) = alive(&weak) else { return };
-                    let path = &paths[start + offset];
+                    let path = &photos[start + offset].path;
                     if let Some((bytes, w, h, stride, alpha)) = decoded {
                         let format = if alpha { gdk::MemoryFormat::R8g8b8a8 } else { gdk::MemoryFormat::R8g8b8 };
                         let tex: gdk::Texture = gdk::MemoryTexture::new(w, h, format, &bytes, stride).upcast();
@@ -1555,17 +1565,86 @@ fn photo_time(t: i64, time_only: bool) -> String {
     d.format(fmt).map(|s| s.to_string()).unwrap_or_default()
 }
 
-/// A centered square at 2× tile size, upright, as raw pixels the main
-/// thread turns into a texture (the tile "covers", as Python's did).
-fn decode_thumbnail(path: &Path) -> Option<(glib::Bytes, i32, i32, usize, bool)> {
+type Raw = (glib::Bytes, i32, i32, usize, bool);
+
+fn raw(pb: &gtk::gdk_pixbuf::Pixbuf) -> Raw {
+    (pb.read_pixel_bytes(), pb.width(), pb.height(), pb.rowstride() as usize, pb.has_alpha())
+}
+
+/// A photo's thumbnail: a centered square at 2× tile size, upright, as raw
+/// pixels the main thread turns into a texture. From the disk cache when
+/// there; otherwise made (from the built-in preview when it's big enough,
+/// else the whole photo) and cached.
+fn decode_thumbnail(photo: &Photo, dir: &Path) -> Option<Raw> {
+    use gtk::gdk_pixbuf::Pixbuf;
     let s = THUMB_SIZE * 2;
+    let cached = thumbs::cache_file(dir, &photo.path, photo.size, photo.modified);
+    if let Ok(pb) = Pixbuf::from_file(&cached)
+        && pb.width() == s
+        && pb.height() == s
+    {
+        return Some(raw(&pb));
+    }
+    let pb = preview_pixbuf(&photo.path, s).or_else(|| whole_pixbuf(&photo.path, s))?;
+    let square = center_square(&pb, s)?;
+    if std::fs::create_dir_all(dir).is_ok()
+        && let Err(e) = square.savev(&cached, "jpeg", &[("quality", "88")])
+    {
+        log::debug!("thumbnail cache: {e}");
+    }
+    Some(raw(&square))
+}
+
+/// The photo's built-in EXIF preview, upright and without padding bars,
+/// when it's at least 3/4 of `s` on its short side.
+fn preview_pixbuf(path: &Path, s: i32) -> Option<gtk::gdk_pixbuf::Pixbuf> {
+    use gtk::gdk_pixbuf::{PixbufLoader, PixbufRotation};
+    use std::io::Read;
+    let ext = path.extension()?.to_string_lossy().to_lowercase();
+    if ext != "jpg" && ext != "jpeg" {
+        return None;
+    }
+    let mut file = std::fs::File::open(path).ok()?;
+    let mut head = Vec::with_capacity(thumbs::HEAD_BYTES);
+    (&mut file).take(thumbs::HEAD_BYTES as u64).read_to_end(&mut head).ok()?;
+    let p = thumbs::exif_preview(&head)?;
+    if p.end() > head.len() {
+        (&mut file).take((p.end() - head.len()) as u64).read_to_end(&mut head).ok()?;
+    }
+    let loader = PixbufLoader::new();
+    loader.write(head.get(p.start..p.end())?).ok()?;
+    loader.close().ok()?;
+    let pb = loader.pixbuf()?;
+    if pb.width().min(pb.height()) < s * 3 / 4 {
+        return None;
+    }
+    let (x, y, w, h) = thumbs::preview_content(pb.width(), pb.height(), p.width.zip(p.height));
+    let pb = pb.new_subpixbuf(x, y, w, h).copy()?;
+    // As gdk-pixbuf's own apply_embedded_orientation.
+    match p.orientation {
+        2 => pb.flip(true),
+        3 => pb.rotate_simple(PixbufRotation::Upsidedown),
+        4 => pb.flip(false),
+        5 => pb.rotate_simple(PixbufRotation::Counterclockwise).and_then(|r| r.flip(false)),
+        6 => pb.rotate_simple(PixbufRotation::Clockwise),
+        7 => pb.rotate_simple(PixbufRotation::Clockwise).and_then(|r| r.flip(false)),
+        8 => pb.rotate_simple(PixbufRotation::Counterclockwise),
+        _ => Some(pb),
+    }
+}
+
+/// The whole photo, scaled so its short side is `s`, upright.
+fn whole_pixbuf(path: &Path, s: i32) -> Option<gtk::gdk_pixbuf::Pixbuf> {
     let (w, h) = super::decodable_image(path)?;
-    // Scale so the short side is `s`, then cut the middle square.
     let k = s as f64 / w.min(h) as f64;
     let (sw, sh) = (((w as f64 * k).round() as i32).max(s), ((h as f64 * k).round() as i32).max(s));
     let pb = gtk::gdk_pixbuf::Pixbuf::from_file_at_scale(path, sw, sh, false).ok()?;
-    let pb = pb.apply_embedded_orientation().unwrap_or(pb);
+    Some(pb.apply_embedded_orientation().unwrap_or(pb))
+}
+
+/// The middle square of `pb`, `s` pixels a side (the tile "covers").
+fn center_square(pb: &gtk::gdk_pixbuf::Pixbuf, s: i32) -> Option<gtk::gdk_pixbuf::Pixbuf> {
     let side = pb.width().min(pb.height());
-    let pb = pb.new_subpixbuf((pb.width() - side) / 2, (pb.height() - side) / 2, side, side).copy()?;
-    Some((pb.read_pixel_bytes(), pb.width(), pb.height(), pb.rowstride() as usize, pb.has_alpha()))
+    let sq = pb.new_subpixbuf((pb.width() - side) / 2, (pb.height() - side) / 2, side, side);
+    if side == s { sq.copy() } else { sq.scale_simple(s, s, gtk::gdk_pixbuf::InterpType::Bilinear) }
 }
