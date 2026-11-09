@@ -12,7 +12,7 @@ PhoneRelay brings your Android phone's texts, notifications and files to your Li
 - **Search** — finds a word in any message, however old; opening a result jumps to that message. **Ctrl+F** searches inside one chat
 - **Contact names** — learned from notifications and calls, or imported from Google Contacts (one click: **Settings** (gear button) **→ Google Contacts → Connect**), a VCF or a CSV
 - **Notifications** — live phone notifications in a side tray; expand, dismiss or reply from the desktop
-- **Files** — browse the phone's storage, see recent photos as a grid, copy, save, or send files to the phone
+- **Files** — browse the phone's storage, see recent photos as a grid or list grouped by day, copy, save, or send files to the phone
 - **Battery and status** in the header bar; **ring the phone** to find it
 - **Tray icon** and **Open on Login**
 - **Optional Google Messages link** — texts go as RCS where the chat is RCS, with reactions, replies, typing, read receipts, pictures, voice and video, groups, and archive/mute/pin; chats delete and read/unread stay in step with the phone (see [Google Messages link](#optional-google-messages-link))
@@ -221,8 +221,10 @@ The Files tab has two views, switchable at the top:
 
 #### Recent Photos
 
-- Shows up to 200 most recent photos from your phone's camera and Pictures folders as square thumbnails
+- Shows up to 200 most recent photos from your phone's camera and Pictures folders, as a **grid** or a **list** (with time and size), **newest or oldest first**, optionally **grouped by day**; the view is remembered
+- Thumbnails come from each photo's built-in preview and are kept on the computer, so they load quickly and each photo is fetched only once
 - **Click** a tile to select it (blue checkmark appears); click again to deselect
+- **Drag** across photos to select a run of them, from the first to the last you pass over (it scrolls at the edges)
 - **Double-click** to open the photo in your default image viewer
 - **Right-click** → **Open / Copy / Save As…**
 - **Ctrl+C** copies selected photos to the clipboard (single image → image data; multiple → file URIs)
