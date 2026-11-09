@@ -100,9 +100,9 @@ pub fn directory_icon_name(label: &str) -> &'static str {
 /// The newest pictures under DCIM/Camera, DCIM, Pictures, Download and
 /// Movies (plus one level of subfolders), dotfiles skipped, newest first,
 /// at most [`MAX_RECENT_PHOTOS`].
-pub fn recent_photos(base: &Path) -> Vec<PathBuf> {
+pub fn recent_photos(base: &Path) -> Vec<Photo> {
     let roots = [base.join("DCIM").join("Camera"), base.join("DCIM"), base.join("Pictures"), base.join("Download"), base.join("Movies")];
-    let mut found: Vec<(PathBuf, SystemTime)> = Vec::new();
+    let mut found: Vec<Photo> = Vec::new();
     let mut seen = HashSet::new();
     for dir in &roots {
         if !dir.is_dir() {
@@ -121,12 +121,49 @@ pub fn recent_photos(base: &Path) -> Vec<PathBuf> {
             }
         }
     }
-    found.sort_by(|a, b| b.1.cmp(&a.1).then_with(|| a.0.cmp(&b.0)));
+    found.sort_by(|a, b| b.modified.cmp(&a.modified).then_with(|| a.path.cmp(&b.path)));
     found.truncate(MAX_RECENT_PHOTOS);
-    found.into_iter().map(|(p, _)| p).collect()
+    found
 }
 
-fn collect_images(dir: &Path, out: &mut Vec<(PathBuf, SystemTime)>, seen: &mut HashSet<PathBuf>) {
+/// One picture from [`recent_photos`].
+#[derive(Debug, Clone, PartialEq)]
+pub struct Photo {
+    pub path: PathBuf,
+    /// Last changed, in seconds since 1970.
+    pub modified: i64,
+    pub size: u64,
+}
+
+/// `photos` (newest first) in the order asked for.
+pub fn ordered_photos(photos: &[Photo], oldest_first: bool) -> Vec<Photo> {
+    let mut out = photos.to_vec();
+    if oldest_first {
+        out.reverse();
+    }
+    out
+}
+
+/// Runs of `photos` that share a `day` (a day key per time), in order, as
+/// (day, indexes).
+pub fn group_by_day<T: PartialEq>(photos: &[Photo], day: impl Fn(i64) -> T) -> Vec<(T, Vec<usize>)> {
+    let mut out: Vec<(T, Vec<usize>)> = Vec::new();
+    for (i, p) in photos.iter().enumerate() {
+        let d = day(p.modified);
+        match out.last_mut() {
+            Some((last, ids)) if *last == d => ids.push(i),
+            _ => out.push((d, vec![i])),
+        }
+    }
+    out
+}
+
+/// The paths of `photos`.
+pub fn photo_paths(photos: &[Photo]) -> Vec<PathBuf> {
+    photos.iter().map(|p| p.path.clone()).collect()
+}
+
+fn collect_images(dir: &Path, out: &mut Vec<Photo>, seen: &mut HashSet<PathBuf>) {
     let Ok(entries) = std::fs::read_dir(dir) else { return };
     for e in entries.flatten() {
         let name = e.file_name().to_string_lossy().into_owned();
@@ -139,7 +176,9 @@ fn collect_images(dir: &Path, out: &mut Vec<(PathBuf, SystemTime)>, seen: &mut H
         }
         let Ok(meta) = e.metadata() else { continue };
         if meta.is_file() {
-            out.push((path, meta.modified().unwrap_or(SystemTime::UNIX_EPOCH)));
+            let modified = meta.modified().unwrap_or(SystemTime::UNIX_EPOCH);
+            let secs = modified.duration_since(SystemTime::UNIX_EPOCH).map(|d| d.as_secs() as i64).unwrap_or(0);
+            out.push(Photo { path, modified: secs, size: meta.len() });
         }
     }
 }
@@ -338,8 +377,22 @@ mod tests {
         touch(&b.join("Pictures/.thumbs/t.jpg"), 1);
         touch(&b.join("Download/doc.pdf"), 1);
         touch(&b.join("Movies/clip.webp"), 100);
-        let got: Vec<_> = recent_photos(b).iter().map(|p| p.file_name().unwrap().to_string_lossy().into_owned()).collect();
+        let photos = recent_photos(b);
+        let got: Vec<_> = photos.iter().map(|p| p.path.file_name().unwrap().to_string_lossy().into_owned()).collect();
         assert_eq!(got, ["new.jpg", "shot.png", "clip.webp", "old.jpg"]);
+        assert!(photos[0].modified > photos[3].modified);
+    }
+
+    #[test]
+    fn photos_sort_and_group_by_day() {
+        let p = |name: &str, modified: i64| Photo { path: PathBuf::from(name), modified, size: 0 };
+        let photos = vec![p("a", 200), p("b", 150), p("c", 90), p("d", 10)];
+        let names = |v: &[Photo]| v.iter().map(|p| p.path.to_string_lossy().into_owned()).collect::<Vec<_>>();
+        assert_eq!(names(&ordered_photos(&photos, false)), ["a", "b", "c", "d"]);
+        assert_eq!(names(&ordered_photos(&photos, true)), ["d", "c", "b", "a"]);
+        // Days of 100 seconds.
+        assert_eq!(group_by_day(&photos, |t| t / 100), vec![(2, vec![0]), (1, vec![1]), (0, vec![2, 3])]);
+        assert!(group_by_day(&[], |t| t).is_empty());
     }
 
     #[test]

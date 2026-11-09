@@ -4,7 +4,7 @@
 //! (`gio::spawn_blocking`), because the FUSE mount can stall.
 
 use std::cell::RefCell;
-use std::collections::BTreeMap;
+use std::collections::{BTreeMap, HashMap, HashSet};
 use std::path::{Path, PathBuf};
 use std::rc::Rc;
 use std::time::{Duration, Instant};
@@ -13,12 +13,31 @@ use adw::prelude::*;
 use gtk::gdk;
 
 use super::icons;
-use crate::core::files::{self, Listing, RefreshLimit, THUMB_SIZE};
+use crate::core::files::{self, Listing, Photo, RefreshLimit, THUMB_SIZE};
 use crate::core::models::Device;
+use crate::core::settings::Settings;
 use crate::dbus::signals::{self, Subscription};
 use crate::dbus::{Client, IFACE_SFTP, device_path};
 
 const PHOTOS: &str = "__photos__";
+/// Thumbnail size in the list view.
+const LIST_THUMB: i32 = 56;
+/// How far the pointer moves before a press becomes a drag-select.
+const DRAG_START: f64 = 8.0;
+
+/// A drag-select in progress (Recent Photos, issue #10).
+struct Drag {
+    /// Where it started, in the photo area's coordinates.
+    start: (f64, f64),
+    /// The pointer's offset from the start at the last motion.
+    offset: (f64, f64),
+    /// The scroll position at the last motion.
+    scrolled_at: f64,
+    /// Which tiles were selected before (a drag adds to the selection).
+    before: Vec<bool>,
+    active: bool,
+    tick: Option<glib::SourceId>,
+}
 
 struct Tile {
     path: PathBuf,
@@ -57,6 +76,11 @@ struct State {
     photo_generation: u64,
     dir_generation: u64,
     tiles: Vec<Tile>,
+    /// The last scan, newest first.
+    photos: Vec<Photo>,
+    /// Decoded thumbnails, kept across view changes.
+    thumbs: HashMap<PathBuf, gdk::Texture>,
+    drag: Option<Drag>,
     /// Sidebar row → location (a path, or [`PHOTOS`]).
     shortcuts: Vec<(gtk::ListBoxRow, String)>,
     /// Browse rows and what they stand for.
@@ -74,7 +98,12 @@ pub struct FilesPage {
     photo_actions: gtk::Box,
     save_btn: gtk::Button,
     copy_btn: gtk::Button,
-    photo_grid: gtk::FlowBox,
+    photo_sections: gtk::Box,
+    photo_area: gtk::Overlay,
+    photo_scroll: gtk::ScrolledWindow,
+    rubber: gtk::Box,
+    sort_btn: gtk::Button,
+    settings: Rc<RefCell<Settings>>,
     photo_stack: gtk::Stack,
     photo_empty: adw::StatusPage,
     photo_status: gtk::Label,
@@ -112,7 +141,7 @@ fn uri_of(path: &Path) -> String {
 }
 
 impl FilesPage {
-    pub fn new() -> Rc<Self> {
+    pub fn new(settings: Rc<RefCell<Settings>>) -> Rc<Self> {
         let widget = gtk::Stack::new();
         widget.set_vexpand(true);
         widget.set_hexpand(true);
@@ -193,6 +222,30 @@ impl FilesPage {
         spacer.set_hexpand(true);
         view_bar.append(&spacer);
         let photo_actions = gtk::Box::new(gtk::Orientation::Horizontal, 4);
+        // How Recent Photos shows (issue #10): grid or list, order, days.
+        let (as_list, oldest_first, by_day) = settings.borrow().photos_view();
+        let grid_btn = gtk::ToggleButton::new();
+        grid_btn.set_icon_name(&icons::resolve("view-grid-symbolic"));
+        grid_btn.set_tooltip_text(Some("Show as a grid"));
+        let list_btn = gtk::ToggleButton::new();
+        list_btn.set_icon_name(&icons::resolve("view-list-symbolic"));
+        list_btn.set_tooltip_text(Some("Show as a list"));
+        list_btn.set_group(Some(&grid_btn));
+        if as_list { list_btn.set_active(true) } else { grid_btn.set_active(true) }
+        let layout = gtk::Box::new(gtk::Orientation::Horizontal, 0);
+        layout.add_css_class("linked");
+        layout.append(&grid_btn);
+        layout.append(&list_btn);
+        photo_actions.append(&layout);
+        let sort_btn = flat_icon(sort_icon(oldest_first), sort_tooltip(oldest_first));
+        photo_actions.append(&sort_btn);
+        let day_btn = gtk::ToggleButton::new();
+        day_btn.set_icon_name(&icons::resolve("x-office-calendar-symbolic"));
+        day_btn.set_tooltip_text(Some("Group by day"));
+        day_btn.add_css_class("flat");
+        day_btn.set_active(by_day);
+        photo_actions.append(&day_btn);
+        photo_actions.append(&gtk::Separator::new(gtk::Orientation::Vertical));
         let select_all = flat_icon("edit-select-all-symbolic", "Select all");
         let save_btn = flat_icon("document-save-symbolic", "Save selected to folder");
         save_btn.set_sensitive(false);
@@ -212,19 +265,24 @@ impl FilesPage {
         let photo_scroll = gtk::ScrolledWindow::new();
         photo_scroll.set_vexpand(true);
         photo_scroll.set_policy(gtk::PolicyType::Never, gtk::PolicyType::Automatic);
-        let photo_grid = gtk::FlowBox::new();
-        photo_grid.set_valign(gtk::Align::Start);
-        photo_grid.set_max_children_per_line(20);
-        photo_grid.set_min_children_per_line(2);
-        photo_grid.set_column_spacing(4);
-        photo_grid.set_row_spacing(4);
-        photo_grid.set_margin_start(8);
-        photo_grid.set_margin_end(8);
-        photo_grid.set_margin_top(8);
-        photo_grid.set_margin_bottom(8);
-        photo_grid.set_homogeneous(false);
-        photo_grid.set_selection_mode(gtk::SelectionMode::None);
-        photo_scroll.set_child(Some(&photo_grid));
+        // Sections (one per day, or one), each a heading and a FlowBox; an
+        // overlay on top draws the drag-select box.
+        let photo_sections = gtk::Box::new(gtk::Orientation::Vertical, 0);
+        photo_sections.set_valign(gtk::Align::Start);
+        photo_sections.set_margin_start(8);
+        photo_sections.set_margin_end(8);
+        photo_sections.set_margin_top(4);
+        photo_sections.set_margin_bottom(8);
+        let photo_area = gtk::Overlay::new();
+        photo_area.set_child(Some(&photo_sections));
+        let rubber = gtk::Box::new(gtk::Orientation::Vertical, 0);
+        rubber.add_css_class("photo-rubberband");
+        rubber.set_halign(gtk::Align::Start);
+        rubber.set_valign(gtk::Align::Start);
+        rubber.set_can_target(false);
+        rubber.set_visible(false);
+        photo_area.add_overlay(&rubber);
+        photo_scroll.set_child(Some(&photo_area));
         photo_page.append(&photo_scroll);
         let photo_status = caption("");
         photo_page.append(&photo_status);
@@ -288,7 +346,12 @@ impl FilesPage {
             photo_actions,
             save_btn,
             copy_btn,
-            photo_grid,
+            photo_sections,
+            photo_area,
+            photo_scroll: photo_scroll.clone(),
+            rubber,
+            sort_btn,
+            settings,
             photo_stack,
             photo_empty,
             photo_status,
@@ -302,6 +365,28 @@ impl FilesPage {
             state: RefCell::default(),
         });
 
+        let weak = Rc::downgrade(&this);
+        list_btn.connect_toggled(move |b| {
+            if let Some(this) = weak.upgrade() {
+                this.change_view(|v| v.0 = b.is_active());
+            }
+        });
+        let weak = Rc::downgrade(&this);
+        this.sort_btn.connect_clicked(move |b| {
+            if let Some(this) = weak.upgrade() {
+                this.change_view(|v| v.1 = !v.1);
+                let oldest = this.settings.borrow().photos_view().1;
+                b.set_icon_name(&icons::resolve(sort_icon(oldest)));
+                b.set_tooltip_text(Some(sort_tooltip(oldest)));
+            }
+        });
+        let weak = Rc::downgrade(&this);
+        day_btn.connect_toggled(move |b| {
+            if let Some(this) = weak.upgrade() {
+                this.change_view(|v| v.2 = b.is_active());
+            }
+        });
+        this.wire_drag_select();
         let weak = Rc::downgrade(&this);
         this.view_stack.connect_visible_child_name_notify(move |_| {
             if let Some(this) = weak.upgrade() {
@@ -694,8 +779,10 @@ impl FilesPage {
     fn clear_photos(&self) {
         let mut s = self.state.borrow_mut();
         s.photo_generation += 1;
-        for t in s.tiles.drain(..) {
-            self.photo_grid.remove(&t.child);
+        s.tiles.clear();
+        s.photos.clear();
+        while let Some(c) = self.photo_sections.first_child() {
+            self.photo_sections.remove(&c);
         }
     }
 
@@ -724,13 +811,13 @@ impl FilesPage {
     /// Rescan; rebuild the grid only when the set changed.
     fn rescan_photos(self: &Rc<Self>) {
         let Some(base) = self.photo_base() else { return };
-        let shown: Vec<PathBuf> = self.state.borrow().tiles.iter().map(|t| t.path.clone()).collect();
+        let shown = files::photo_paths(&self.state.borrow().photos);
         let weak = Rc::downgrade(self);
         glib::spawn_future_local(async move {
             let Ok(found) = gio::spawn_blocking(move || files::recent_photos(&base)).await else { return };
             let Some(this) = weak.upgrade() else { return };
-            let current: Vec<PathBuf> = this.state.borrow().tiles.iter().map(|t| t.path.clone()).collect();
-            if current != shown || !files::rescan_changes_grid(&current, &found) {
+            let current = files::photo_paths(&this.state.borrow().photos);
+            if current != shown || !files::rescan_changes_grid(&current, &files::photo_paths(&found)) {
                 return;
             }
             this.clear_photos();
@@ -739,7 +826,7 @@ impl FilesPage {
         });
     }
 
-    fn show_photos(self: &Rc<Self>, generation: u64, found: Vec<PathBuf>) {
+    fn show_photos(self: &Rc<Self>, generation: u64, found: Vec<Photo>) {
         if self.state.borrow().photo_generation != generation {
             return;
         }
@@ -749,18 +836,111 @@ impl FilesPage {
             self.photo_status.set_label("No photos found");
             return;
         }
-        self.photo_stack.set_visible_child_name("grid");
-        self.photo_status.set_label(&format!("Loading {} photos…", found.len()));
-        for path in &found {
-            let tile = self.make_tile(path);
-            self.photo_grid.append(&tile.child);
-            self.state.borrow_mut().tiles.push(tile);
+        {
+            let mut s = self.state.borrow_mut();
+            let keep: HashSet<&PathBuf> = found.iter().map(|p| &p.path).collect();
+            s.thumbs.retain(|p, _| keep.contains(p));
+            s.photos = found;
         }
+        self.photo_stack.set_visible_child_name("grid");
+        self.render_photos();
+    }
+
+    /// Change the view settings (as a list, oldest first, by day) and redraw.
+    fn change_view(self: &Rc<Self>, f: impl FnOnce(&mut (bool, bool, bool))) {
+        let mut v = self.settings.borrow().photos_view();
+        f(&mut v);
+        if let Err(e) = self.settings.borrow_mut().set_photos_view(v.0, v.1, v.2) {
+            log::warn!("save photo view: {e}");
+        }
+        self.render_photos();
+    }
+
+    /// (Re)build the tiles from the last scan in the chosen view, keeping
+    /// the selection and the thumbnails already decoded.
+    fn render_photos(self: &Rc<Self>) {
+        let (as_list, oldest_first, by_day) = self.settings.borrow().photos_view();
+        let (photos, selected, generation) = {
+            let mut s = self.state.borrow_mut();
+            let selected: HashSet<PathBuf> = s.tiles.iter().filter(|t| t.selected).map(|t| t.path.clone()).collect();
+            s.tiles.clear();
+            (files::ordered_photos(&s.photos, oldest_first), selected, s.photo_generation)
+        };
+        while let Some(c) = self.photo_sections.first_child() {
+            self.photo_sections.remove(&c);
+        }
+        if photos.is_empty() {
+            return;
+        }
+        let groups = if by_day {
+            files::group_by_day(&photos, day_key)
+        } else {
+            vec![((0, 0), (0..photos.len()).collect())]
+        };
+        let mut missing = Vec::new();
+        for (n, (_, ids)) in groups.iter().enumerate() {
+            if by_day {
+                let heading = gtk::Label::new(Some(&day_heading(photos[ids[0]].modified)));
+                heading.add_css_class("heading");
+                heading.set_xalign(0.0);
+                heading.set_margin_start(4);
+                heading.set_margin_top(if n == 0 { 4 } else { 16 });
+                heading.set_margin_bottom(6);
+                self.photo_sections.append(&heading);
+            }
+            let flow = gtk::FlowBox::new();
+            flow.set_valign(gtk::Align::Start);
+            // Packed from the left: a day with two photos doesn't spread
+            // them across the width.
+            if !as_list {
+                flow.set_halign(gtk::Align::Start);
+            }
+            flow.set_selection_mode(gtk::SelectionMode::None);
+            if as_list {
+                flow.set_max_children_per_line(1);
+                flow.set_min_children_per_line(1);
+                flow.set_row_spacing(2);
+                flow.set_homogeneous(true);
+            } else {
+                flow.set_max_children_per_line(20);
+                flow.set_min_children_per_line(2);
+                flow.set_column_spacing(4);
+                flow.set_row_spacing(4);
+                flow.set_homogeneous(false);
+            }
+            if !by_day {
+                flow.set_margin_top(4);
+            }
+            self.photo_sections.append(&flow);
+            for &i in ids {
+                let photo = &photos[i];
+                let mut tile = if as_list { self.make_row(photo, by_day) } else { self.make_tile(&photo.path) };
+                if selected.contains(&photo.path) {
+                    tile.set_selected(true);
+                }
+                if let Some(tex) = self.state.borrow().thumbs.get(&photo.path) {
+                    tile.picture.set_paintable(Some(tex));
+                    tile.stack.set_visible_child_name("image");
+                } else {
+                    missing.push(photo.path.clone());
+                }
+                flow.append(&tile.child);
+                self.state.borrow_mut().tiles.push(tile);
+            }
+        }
+        let total = photos.len();
+        if missing.is_empty() {
+            self.photo_status.set_label(&format!("{total} photos"));
+            self.update_selection_buttons();
+            return;
+        }
+        self.photo_status.set_label(&format!("Loading {total} photos…"));
+        self.update_selection_buttons();
         // Decode only once the tab is on screen: 18 thumbnails held ~7 MB
         // from startup even when Files was never opened (heaptrack,
         // 2026-11-06).
         if self.widget.is_mapped() {
-            self.load_thumbnails(generation, found);
+            self.load_thumbnails(generation, missing, total);
             return;
         }
         let weak = Rc::downgrade(self);
@@ -771,10 +951,45 @@ impl FilesPage {
                 w.disconnect(id);
             }
             if let Some(this) = weak.upgrade() {
-                this.load_thumbnails(generation, found.clone());
+                this.load_thumbnails(generation, missing.clone(), total);
             }
         });
         *handler.borrow_mut() = Some(id);
+    }
+
+    /// Clicks on a tile or row: one toggles it (unless that press became a
+    /// drag-select), two open it; right-click shows the menu.
+    fn wire_tile(self: &Rc<Self>, child: &gtk::FlowBoxChild, path: &Path) {
+        let click = gtk::GestureClick::new();
+        let (weak, p) = (Rc::downgrade(self), path.to_path_buf());
+        // Double-click on press (the FlowBox claims the second press);
+        // single on release, so a drag that starts on a tile doesn't toggle it.
+        click.connect_pressed(move |_, n, _, _| {
+            if n == 2
+                && let Some(this) = weak.upgrade()
+            {
+                open_file(&p, &this.photo_status);
+            }
+        });
+        let (weak, p) = (Rc::downgrade(self), path.to_path_buf());
+        click.connect_released(move |_, n, _, _| {
+            let Some(this) = weak.upgrade() else { return };
+            let dragged = this.state.borrow().drag.as_ref().is_some_and(|d| d.active);
+            if n == 1 && !dragged {
+                this.toggle_photo(&p);
+            }
+        });
+        child.add_controller(click);
+        let right = gtk::GestureClick::new();
+        right.set_button(gdk::BUTTON_SECONDARY);
+        let (weak, p, anchor) = (Rc::downgrade(self), path.to_path_buf(), child.clone());
+        right.connect_pressed(move |g, _, x, y| {
+            g.set_state(gtk::EventSequenceState::Claimed);
+            if let Some(this) = weak.upgrade() {
+                this.file_menu(anchor.upcast_ref(), x, y, &p, false, this.photo_status.clone());
+            }
+        });
+        child.add_controller(right);
     }
 
     fn make_tile(self: &Rc<Self>, path: &Path) -> Tile {
@@ -811,48 +1026,76 @@ impl FilesPage {
         child.set_halign(gtk::Align::Center);
         child.set_valign(gtk::Align::Start);
         child.set_child(Some(&overlay));
-        let click = gtk::GestureClick::new();
-        let (weak, p) = (Rc::downgrade(self), path.to_path_buf());
-        click.connect_pressed(move |_, n, _, _| {
-            let Some(this) = weak.upgrade() else { return };
-            match n {
-                1 => this.toggle_photo(&p),
-                2 => open_file(&p, &this.photo_status),
-                _ => {}
-            }
-        });
-        child.add_controller(click);
-        let right = gtk::GestureClick::new();
-        right.set_button(gdk::BUTTON_SECONDARY);
-        let (weak, p, anchor) = (Rc::downgrade(self), path.to_path_buf(), child.clone());
-        right.connect_pressed(move |g, _, x, y| {
-            g.set_state(gtk::EventSequenceState::Claimed);
-            if let Some(this) = weak.upgrade() {
-                this.file_menu(anchor.upcast_ref(), x, y, &p, false, this.photo_status.clone());
-            }
-        });
-        child.add_controller(right);
+        self.wire_tile(&child, path);
         Tile { path: path.to_path_buf(), child, stack, picture, check, selected: false }
+    }
+
+    /// A list row: small thumbnail, name, time and size. `time_only` when a
+    /// day heading already says the date.
+    fn make_row(self: &Rc<Self>, photo: &Photo, time_only: bool) -> Tile {
+        let row = gtk::Box::new(gtk::Orientation::Horizontal, 12);
+        row.set_margin_start(4);
+        row.set_margin_end(8);
+        row.set_margin_top(3);
+        row.set_margin_bottom(3);
+        let stack = gtk::Stack::new();
+        stack.set_size_request(LIST_THUMB, LIST_THUMB);
+        stack.add_css_class("photo-tile");
+        let placeholder = gtk::Image::from_icon_name(&icons::resolve("image-x-generic-symbolic"));
+        super::scale::icon(&placeholder, 24);
+        placeholder.set_opacity(0.4);
+        stack.add_named(&placeholder, Some("placeholder"));
+        let picture = gtk::Image::new();
+        picture.set_pixel_size(LIST_THUMB);
+        stack.add_named(&picture, Some("image"));
+        stack.set_visible_child_name("placeholder");
+        row.append(&stack);
+        let name = gtk::Label::new(photo.path.file_name().map(|n| n.to_string_lossy()).as_deref());
+        name.set_xalign(0.0);
+        name.set_hexpand(true);
+        name.set_ellipsize(gtk::pango::EllipsizeMode::Middle);
+        row.append(&name);
+        let when = gtk::Label::new(Some(&photo_time(photo.modified, time_only)));
+        when.add_css_class("dim-label");
+        when.add_css_class("numeric");
+        row.append(&when);
+        let size = gtk::Label::new(Some(&glib::format_size(photo.size)));
+        size.add_css_class("dim-label");
+        size.add_css_class("numeric");
+        size.set_width_chars(8);
+        size.set_xalign(1.0);
+        row.append(&size);
+        let check = gtk::Image::from_icon_name("object-select-symbolic");
+        super::scale::icon(&check, 20);
+        check.add_css_class("photo-check");
+        check.set_valign(gtk::Align::Center);
+        check.set_visible(false);
+        row.append(&check);
+
+        let child = gtk::FlowBoxChild::new();
+        child.add_css_class("photo-row");
+        child.set_child(Some(&row));
+        self.wire_tile(&child, &photo.path);
+        Tile { path: photo.path.clone(), child, stack, picture, check, selected: false }
     }
 
     /// Decode off the main thread at 2× tile size, several at once (one at a
     /// time was visibly slow: each read is a full camera photo over sshfs).
     /// The first screenful goes in one batch; tiles fill in batch order.
     /// Stops as soon as a newer scan starts.
-    fn load_thumbnails(self: &Rc<Self>, generation: u64, paths: Vec<PathBuf>) {
+    fn load_thumbnails(self: &Rc<Self>, generation: u64, paths: Vec<PathBuf>, total: usize) {
         const FIRST_BATCH: usize = 12;
         const BATCH: usize = 8;
         let weak = Rc::downgrade(self);
         glib::spawn_future_local(async move {
-            let total = paths.len();
+            let count = paths.len();
             let alive = |w: &std::rc::Weak<Self>| w.upgrade().filter(|t| t.state.borrow().photo_generation == generation);
-            let mut done = 0;
             let mut start = 0;
-            while start < total {
+            while start < count {
                 if alive(&weak).is_none() {
                     return;
                 }
-                let end = (start + if start == 0 { FIRST_BATCH } else { BATCH }).min(total);
+                let end = (start + if start == 0 { FIRST_BATCH } else { BATCH }).min(count);
                 // All of the batch is decoding in the thread pool at once.
                 let jobs: Vec<_> = paths[start..end]
                     .iter()
@@ -864,26 +1107,149 @@ impl FilesPage {
                 for (offset, job) in jobs.into_iter().enumerate() {
                     let decoded = job.await.ok().flatten();
                     let Some(this) = alive(&weak) else { return };
-                    let i = start + offset;
+                    let path = &paths[start + offset];
                     if let Some((bytes, w, h, stride, alpha)) = decoded {
                         let format = if alpha { gdk::MemoryFormat::R8g8b8a8 } else { gdk::MemoryFormat::R8g8b8 };
                         let tex: gdk::Texture = gdk::MemoryTexture::new(w, h, format, &bytes, stride).upcast();
-                        if let Some(t) = this.state.borrow().tiles.get(i).filter(|t| t.path == paths[i]) {
+                        let mut s = this.state.borrow_mut();
+                        // The view may have been rebuilt meanwhile: find the tile by path.
+                        if let Some(t) = s.tiles.iter().find(|t| &t.path == path) {
                             t.picture.set_paintable(Some(&tex));
                             t.stack.set_visible_child_name("image");
                         }
+                        s.thumbs.insert(path.clone(), tex);
                     }
-                    done += 1;
                 }
                 if let Some(this) = alive(&weak) {
-                    this.photo_status.set_label(&format!("Loading {done}/{total} photos…"));
+                    let have = this.state.borrow().thumbs.len().min(total);
+                    this.photo_status.set_label(&format!("Loading {have}/{total} photos…"));
                 }
                 start = end;
             }
             if let Some(this) = alive(&weak) {
                 this.photo_status.set_label(&format!("{total} photos"));
+                this.update_selection_buttons();
             }
         });
+    }
+
+    // ── Drag-select ────────────────────────────────────────────────
+
+    fn wire_drag_select(self: &Rc<Self>) {
+        let drag = gtk::GestureDrag::new();
+        drag.set_button(gdk::BUTTON_PRIMARY);
+        let weak = Rc::downgrade(self);
+        drag.connect_drag_begin(move |_, x, y| {
+            let Some(this) = weak.upgrade() else { return };
+            let before = this.state.borrow().tiles.iter().map(|t| t.selected).collect();
+            let scrolled_at = this.photo_scroll.vadjustment().value();
+            this.stop_drag();
+            this.state.borrow_mut().drag =
+                Some(Drag { start: (x, y), offset: (0.0, 0.0), scrolled_at, before, active: false, tick: None });
+        });
+        let weak = Rc::downgrade(self);
+        drag.connect_drag_update(move |g, ox, oy| {
+            let Some(this) = weak.upgrade() else { return };
+            let scrolled_at = this.photo_scroll.vadjustment().value();
+            let start_now = {
+                let mut s = this.state.borrow_mut();
+                let Some(d) = s.drag.as_mut() else { return };
+                d.offset = (ox, oy);
+                d.scrolled_at = scrolled_at;
+                let start_now = !d.active && ox.hypot(oy) >= DRAG_START;
+                if start_now {
+                    d.active = true;
+                }
+                start_now
+            };
+            if start_now {
+                // Ours from here: the tile under the press doesn't toggle.
+                g.set_state(gtk::EventSequenceState::Claimed);
+                this.rubber.set_visible(true);
+                let weak = Rc::downgrade(&this);
+                let tick = glib::timeout_add_local(Duration::from_millis(40), move || {
+                    let Some(this) = weak.upgrade() else { return glib::ControlFlow::Break };
+                    this.autoscroll();
+                    glib::ControlFlow::Continue
+                });
+                if let Some(d) = this.state.borrow_mut().drag.as_mut() {
+                    d.tick = Some(tick);
+                }
+            }
+            this.update_drag();
+        });
+        let weak = Rc::downgrade(self);
+        drag.connect_drag_end(move |_, _, _| {
+            if let Some(this) = weak.upgrade() {
+                this.stop_drag();
+            }
+        });
+        self.photo_area.add_controller(drag);
+    }
+
+    fn stop_drag(&self) {
+        if let Some(d) = self.state.borrow_mut().drag.take()
+            && let Some(t) = d.tick
+        {
+            t.remove();
+        }
+        self.rubber.set_visible(false);
+    }
+
+    /// The pointer's point in the photo area, allowing for scrolling since
+    /// the last motion.
+    fn drag_point(&self) -> Option<((f64, f64), (f64, f64))> {
+        let s = self.state.borrow();
+        let d = s.drag.as_ref().filter(|d| d.active)?;
+        let scrolled = self.photo_scroll.vadjustment().value() - d.scrolled_at;
+        Some((d.start, (d.start.0 + d.offset.0, d.start.1 + d.offset.1 + scrolled)))
+    }
+
+    fn update_drag(&self) {
+        let Some((a, b)) = self.drag_point() else { return };
+        let (x0, x1) = (a.0.min(b.0).max(0.0), a.0.max(b.0));
+        let (y0, y1) = (a.1.min(b.1).max(0.0), a.1.max(b.1));
+        self.rubber.set_margin_start(x0 as i32);
+        self.rubber.set_margin_top(y0 as i32);
+        self.rubber.set_size_request(((x1 - x0) as i32).max(1), ((y1 - y0) as i32).max(1));
+        {
+            let mut s = self.state.borrow_mut();
+            let s = &mut *s;
+            let Some(d) = s.drag.as_ref() else { return };
+            for (i, t) in s.tiles.iter_mut().enumerate() {
+                let inside = t.child.compute_bounds(&self.photo_area).is_some_and(|r| {
+                    (r.x() as f64) < x1
+                        && (r.x() + r.width()) as f64 > x0
+                        && (r.y() as f64) < y1
+                        && (r.y() + r.height()) as f64 > y0
+                });
+                let on = d.before.get(i).copied().unwrap_or(false) || inside;
+                if on != t.selected {
+                    t.set_selected(on);
+                }
+            }
+        }
+        self.update_selection_buttons();
+    }
+
+    /// While dragging near the top or bottom edge, scroll that way.
+    fn autoscroll(&self) {
+        let Some((_, p)) = self.drag_point() else { return };
+        let adj = self.photo_scroll.vadjustment();
+        let y = p.1 - adj.value();
+        let edge = 48.0;
+        let step = if y < edge {
+            -(edge - y).min(edge) / 2.0
+        } else if y > adj.page_size() - edge {
+            (y - (adj.page_size() - edge)).min(edge) / 2.0
+        } else {
+            return;
+        };
+        let to = (adj.value() + step).clamp(adj.lower(), (adj.upper() - adj.page_size()).max(adj.lower()));
+        if to != adj.value() {
+            adj.set_value(to);
+            self.update_drag();
+        }
     }
 
     fn toggle_photo(&self, path: &Path) {
@@ -1156,6 +1522,47 @@ fn open_file(path: &Path, status: &gtk::Label) {
     if let Err(e) = gio::AppInfo::launch_default_for_uri(&uri_of(path), gio::AppLaunchContext::NONE) {
         status.set_label(&format!("Cannot open: {}", e.message()));
     }
+}
+
+fn sort_icon(oldest_first: bool) -> &'static str {
+    if oldest_first { "view-sort-ascending-symbolic" } else { "view-sort-descending-symbolic" }
+}
+
+fn sort_tooltip(oldest_first: bool) -> &'static str {
+    if oldest_first { "Oldest first (click for newest first)" } else { "Newest first (click for oldest first)" }
+}
+
+fn local(t: i64) -> Option<glib::DateTime> {
+    glib::DateTime::from_unix_local(t).ok()
+}
+
+/// A local calendar day, for grouping.
+fn day_key(t: i64) -> (i32, i32) {
+    local(t).map(|d| (d.year(), d.day_of_year())).unwrap_or((0, 0))
+}
+
+/// "Today", "Yesterday", "Wednesday, November 5", or with the year when
+/// it isn't this year.
+fn day_heading(t: i64) -> String {
+    let (Some(d), Ok(now)) = (local(t), glib::DateTime::now_local()) else { return String::new() };
+    let today = (now.year(), now.day_of_year());
+    let yesterday = now.add_days(-1).map(|y| (y.year(), y.day_of_year())).ok();
+    let key = (d.year(), d.day_of_year());
+    if key == today {
+        return "Today".into();
+    }
+    if Some(key) == yesterday {
+        return "Yesterday".into();
+    }
+    let fmt = if d.year() == now.year() { "%A, %B %-d" } else { "%A, %B %-d, %Y" };
+    d.format(fmt).map(|s| s.to_string()).unwrap_or_default()
+}
+
+/// "3:42 PM", or "Nov 5, 3:42 PM" without a day heading.
+fn photo_time(t: i64, time_only: bool) -> String {
+    let Some(d) = local(t) else { return String::new() };
+    let fmt = if time_only { "%-l:%M %p" } else { "%b %-d, %-l:%M %p" };
+    d.format(fmt).map(|s| s.to_string()).unwrap_or_default()
 }
 
 /// A centered square at 2× tile size, upright, as raw pixels the main

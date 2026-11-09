@@ -249,6 +249,10 @@ pub struct Settings {
     window_width: i32,
     window_height: i32,
     window_maximized: bool,
+    /// Files → Recent Photos: list instead of grid, oldest first, headings per day.
+    photos_as_list: bool,
+    photos_oldest_first: bool,
+    photos_by_day: bool,
     /// Keys we do not know (written by Python or a newer version); preserved.
     extra: Map<String, Value>,
 
@@ -285,6 +289,9 @@ impl Settings {
             window_width: 0,
             window_height: 0,
             window_maximized: false,
+            photos_as_list: false,
+            photos_oldest_first: false,
+            photos_by_day: true,
             extra: Map::new(),
             last_written: None,
             batch_depth: 0,
@@ -342,6 +349,9 @@ impl Settings {
         self.window_width = py_int(m.remove("window_width").as_ref()).clamp(0, 100_000) as i32;
         self.window_height = py_int(m.remove("window_height").as_ref()).clamp(0, 100_000) as i32;
         self.window_maximized = py_bool(m.remove("window_maximized"), false);
+        self.photos_as_list = py_bool(m.remove("photos_as_list"), false);
+        self.photos_oldest_first = py_bool(m.remove("photos_oldest_first"), false);
+        self.photos_by_day = py_bool(m.remove("photos_by_day"), true);
 
         self.hidden = BTreeMap::new();
         if let Some(Value::Object(devices)) = m.remove("hidden_conversations") {
@@ -390,6 +400,9 @@ impl Settings {
         m.insert("window_width".into(), Value::from(self.window_width));
         m.insert("window_height".into(), Value::from(self.window_height));
         m.insert("window_maximized".into(), Value::from(self.window_maximized));
+        m.insert("photos_as_list".into(), Value::from(self.photos_as_list));
+        m.insert("photos_oldest_first".into(), Value::from(self.photos_oldest_first));
+        m.insert("photos_by_day".into(), Value::from(self.photos_by_day));
         serde_json::to_string_pretty(&m).unwrap_or_else(|_| "{}".to_string())
     }
 
@@ -459,6 +472,16 @@ impl Settings {
     /// The main window's size at the last close, once one was saved.
     pub fn window_size(&self) -> Option<(i32, i32)> {
         (self.window_width > 0 && self.window_height > 0).then_some((self.window_width, self.window_height))
+    }
+
+    /// Recent Photos view: (as a list, oldest first, headings per day).
+    pub fn photos_view(&self) -> (bool, bool, bool) {
+        (self.photos_as_list, self.photos_oldest_first, self.photos_by_day)
+    }
+
+    pub fn set_photos_view(&mut self, as_list: bool, oldest_first: bool, by_day: bool) -> io::Result<()> {
+        (self.photos_as_list, self.photos_oldest_first, self.photos_by_day) = (as_list, oldest_first, by_day);
+        self.save()
     }
 
     pub fn window_maximized(&self) -> bool {
@@ -793,6 +816,11 @@ mod tests {
         again.load();
         assert_eq!(again.window_size(), Some((1200, 800)));
         assert!(again.window_maximized());
+        assert_eq!(again.photos_view(), (false, false, true));
+        again.set_photos_view(true, true, false).unwrap();
+        let mut third = Settings::with_paths(f.path.clone(), f._dir.path().join("autostart"));
+        third.load();
+        assert_eq!(third.photos_view(), (true, true, false));
     }
 
     #[test]

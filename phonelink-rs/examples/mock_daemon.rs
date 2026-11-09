@@ -133,7 +133,7 @@ fn fake_phone_storage() -> std::path::PathBuf {
         pb.new_subpixbuf(0, 380, 800, 220).fill(0xf6_f5_f4_ff);
         pb.new_subpixbuf(80 + (i as i32 * 30) % 500, 200, 160, 160).fill(0x24_1f_31_ff);
         pb.savev(&file, "jpeg", &[("quality", "80")]).unwrap();
-        let t = SystemTime::now() - std::time::Duration::from_secs(3600 * i as u64);
+        let t = SystemTime::now() - std::time::Duration::from_secs(3600 * 9 * i as u64);
         std::fs::File::options().write(true).open(&file).unwrap().set_modified(t).unwrap();
     }
     for (name, bytes) in [("Download/boarding-pass.pdf", 48_000usize), ("Download/notes.txt", 900), ("Music/song.mp3", 3_400_000)] {

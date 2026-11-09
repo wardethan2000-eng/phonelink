@@ -219,7 +219,7 @@ impl Window {
         messages.use_toasts(&toasts);
         let page = stack.add_titled(&messages.widget, Some("sms"), "Messages");
         page.set_icon_name(Some("mail-unread-symbolic"));
-        let files = FilesPage::new();
+        let files = FilesPage::new(settings.clone());
         let page = stack.add_titled(&files.widget, Some("files"), "Files");
         page.set_icon_name(Some("folder-symbolic"));
         let clipboard = ClipboardPage::new(toast.clone());
