@@ -15,6 +15,8 @@ pub fn enabled() -> bool {
 thread_local! {
     /// When the chat being opened was asked for, and its size.
     static OPENING: Cell<Option<(Instant, usize)>> = const { Cell::new(None) };
+    /// When the open chat appeared (scroll changes after it are logged).
+    static SHOWN_AT: Cell<Option<Instant>> = const { Cell::new(None) };
 }
 
 /// A chat is being opened (before building its bubbles).
@@ -33,8 +35,23 @@ pub fn built() {
 
 /// The chat appeared on screen, at the bottom.
 pub fn revealed() {
+    if enabled() {
+        SHOWN_AT.set(Some(Instant::now()));
+    }
     if let Some((t, n)) = OPENING.take().filter(|_| enabled()) {
         log::info!("perf: chat with {n} messages on screen in {:.1} ms", t.elapsed().as_secs_f64() * 1000.0);
+    }
+}
+
+/// The chat's scroll moved or its content resized soon after it
+/// appeared.
+pub fn scroll(what: &str, upper: f64, value: f64, page: f64) {
+    if let Some(t) = SHOWN_AT.get().filter(|t| enabled() && t.elapsed() < Duration::from_secs(4)) {
+        log::info!(
+            "perf: scroll +{:.0} ms {what}: upper {upper:.0} value {value:.0} page {page:.0} gap {:.0}",
+            t.elapsed().as_secs_f64() * 1000.0,
+            upper - value - page
+        );
     }
 }
 

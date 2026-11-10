@@ -310,6 +310,8 @@ type SelectedHandler = Box<dyn Fn(i64)>;
 
 /// Everything else the list asks of the page.
 pub enum ListEvent {
+    /// A chat was opened with a plain click.
+    Clicked(i64),
     /// Start (or open) a chat with a suggested contact or typed number.
     Start {
         address: String,
@@ -495,7 +497,8 @@ impl ConversationList {
                     this.listbox.unselect_all();
                     this.listbox.select_row(Some(&row));
                 }
-                row.grab_focus();
+                // Ready to type in the chat just opened.
+                this.emit(ListEvent::Clicked(tid));
                 return;
             }
             if ctrl && !shift {

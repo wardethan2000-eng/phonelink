@@ -312,8 +312,10 @@ fn thread_messages(index: usize) -> Vec<Variant> {
             let uid = 5000 + k as i32;
             // One old text to find with search (item A in NEXT_FEATURES.md).
             let body = if k == 20 { "Don't forget the birthday party at the lake house on Saturday" } else { chatter[k % chatter.len()] };
-            // A photo every 60 texts (and one near the end).
-            let atts = if k == long_thread_len() - 3 || k % 60 == 57 {
+            // A photo every 60 texts, or every DEMO_PHOTO_EVERY (and one
+            // near the end).
+            let every: usize = std::env::var("DEMO_PHOTO_EVERY").ok().and_then(|v| v.parse().ok()).unwrap_or(60);
+            let atts = if k == long_thread_len() - 3 || k % every == every - 3 {
                 vec![(uid as i64, "image/png".to_string(), thumbnail_png(), format!("PART_{uid}.png"))]
             } else {
                 Vec::new()

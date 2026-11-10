@@ -88,10 +88,21 @@ pub fn scaled_image_size(width: i32, height: i32, full: bool) -> (i32, i32) {
 }
 
 /// (display w, display h, awaiting the full file) for an image of this size.
+/// A preview whose full picture is on its way already takes the room the
+/// full one will (a phone photo fills the frame), so the chat does not
+/// shift when it arrives.
 fn image_display(width: i32, height: i32, can_fetch_full: bool) -> (i32, i32, bool) {
     let is_full = width.max(height) > ATTACHMENT_THUMBNAIL_MAX;
-    let (w, h) = scaled_image_size(width, height, is_full);
-    (w, h, !is_full && can_fetch_full)
+    let waiting = !is_full && can_fetch_full;
+    let (w, h) = if waiting { full_frame_size(width, height) } else { scaled_image_size(width, height, is_full) };
+    (w, h, waiting)
+}
+
+/// The largest size within the full-picture frame with this aspect ratio.
+fn full_frame_size(width: i32, height: i32) -> (i32, i32) {
+    let (w, h) = (f64::from(width.max(1)), f64::from(height.max(1)));
+    let fit = (FULL_IMAGE_MAX_W / w).min(FULL_IMAGE_MAX_H / h);
+    (((w * fit).round() as i32).max(1), ((h * fit).round() as i32).max(1))
 }
 
 fn attachment_name(att: &Attachment) -> String {
@@ -875,10 +886,14 @@ fn image_widget(
     };
     let key = image_key(&path);
     let (known, texture) = IMAGES.with_borrow_mut(|c| (c.sizes.get(&key).copied(), c.texture(&key)));
-    match known {
-        Some(measured) => apply_size(measured),
-        None => picture.set_size_request(THUMB_IMAGE_MAX_W as i32, THUMB_IMAGE_MAX_H as i32),
-    }
+    // The size now (only the file's header is read), so the chat is laid out
+    // in full before it appears; sized later, every picture nudged it.
+    let measured = known.unwrap_or_else(|| {
+        let m = super::decodable_image(&path);
+        IMAGES.with_borrow_mut(|c| c.sizes.insert(key.clone(), m));
+        m
+    });
+    apply_size(measured);
     match texture {
         Some(tex) => picture.set_paintable(Some(&tex)),
         None => {
@@ -888,8 +903,10 @@ fn image_widget(
                 let Ok(decoded) = gio::spawn_blocking(move || decode(&p, can_fetch_full)).await else {
                     return;
                 };
-                IMAGES.with_borrow_mut(|c| c.sizes.insert(key.clone(), decoded.measured));
-                apply_size(decoded.measured);
+                if decoded.measured != measured {
+                    IMAGES.with_borrow_mut(|c| c.sizes.insert(key.clone(), decoded.measured));
+                    apply_size(decoded.measured);
+                }
                 if let Some((bytes, w, h, stride, alpha)) = decoded.pixels {
                     let format = if alpha { gdk::MemoryFormat::R8g8b8a8 } else { gdk::MemoryFormat::R8g8b8 };
                     let tex: gdk::Texture = gdk::MemoryTexture::new(w, h, format, &bytes, stride).upcast();
@@ -1510,6 +1527,7 @@ impl ThreadView {
         let adj = scroll.vadjustment();
         let weak = Rc::downgrade(&this);
         adj.connect_value_changed(move |a| {
+            super::perf::scroll("value", a.upper(), a.value(), a.page_size());
             if let Some(this) = weak.upgrade()
                 && let Ok(mut st) = this.state.try_borrow_mut()
             {
@@ -1525,8 +1543,23 @@ impl ThreadView {
                 this.load_older_from_phone();
             }
         });
+        // The fix goes in right after GTK's own layout pass of the same frame
+        // (the frame clock lays out again when asked), so no frame is ever
+        // painted at the old position. Connected after the window's layout
+        // handler, so it runs after it.
         let weak = Rc::downgrade(&this);
-        adj.connect_changed(move |_| {
+        scroll.connect_realize(move |w| {
+            let Some(clock) = w.frame_clock() else { return };
+            let weak = weak.clone();
+            clock.connect_layout(move |_| {
+                if let Some(this) = weak.upgrade() {
+                    this.apply_scroll_fix();
+                }
+            });
+        });
+        let weak = Rc::downgrade(&this);
+        adj.connect_changed(move |a| {
+            super::perf::scroll("changed", a.upper(), a.value(), a.page_size());
             if let Some(this) = weak.upgrade() {
                 this.queue_scroll_fix();
             }
@@ -1895,28 +1928,53 @@ impl ThreadView {
             }
             st.scroll_fix_queued = true;
         }
+        // Normally done by the frame clock's layout handler this frame; the
+        // next frame's tick is the fallback.
         let weak = Rc::downgrade(self);
-        self.scroll.add_tick_callback(move |widget, _| {
-            let Some(this) = weak.upgrade() else {
-                return glib::ControlFlow::Break;
+        self.scroll.add_tick_callback(move |_, _| match weak.upgrade() {
+            Some(this) if !this.apply_scroll_fix() => glib::ControlFlow::Continue,
+            _ => glib::ControlFlow::Break,
+        });
+    }
+
+    /// Put the view where it belongs if a fix is queued. False when the
+    /// state is busy (try again).
+    fn apply_scroll_fix(&self) -> bool {
+        let a = self.scroll.vadjustment();
+        let target = {
+            let Ok(mut st) = self.state.try_borrow_mut() else {
+                return false;
             };
-            let target = {
-                let Ok(mut st) = this.state.try_borrow_mut() else {
-                    return glib::ControlFlow::Continue;
-                };
-                st.scroll_fix_queued = false;
-                let a = widget.vadjustment();
-                match st.anchor_from_bottom {
-                    // Older bubbles going in above: keep what is on screen.
-                    Some(from_bottom) => Some(a.upper() - from_bottom),
-                    None if st.pinned => Some(a.upper() - a.page_size()),
-                    None => None,
-                }
-            };
-            if let Some(v) = target {
-                widget.vadjustment().set_value(v);
+            if !st.scroll_fix_queued {
+                return true;
             }
-            glib::ControlFlow::Break
+            st.scroll_fix_queued = false;
+            match st.anchor_from_bottom {
+                // Older bubbles going in above: keep what is on screen.
+                Some(from_bottom) => Some(a.upper() - from_bottom),
+                None if st.pinned => Some(a.upper() - a.page_size()),
+                None => None,
+            }
+        };
+        if let Some(v) = target {
+            super::perf::scroll("fix", a.upper(), v, a.page_size());
+            a.set_value(v);
+        }
+        true
+    }
+
+    /// Put the cursor in the compose bar (after a chat was clicked open),
+    /// without selecting a draft that is there.
+    pub fn focus_compose(self: &Rc<Self>) {
+        let weak = Rc::downgrade(self);
+        glib::idle_add_local_once(move || {
+            if let Some(this) = weak.upgrade()
+                && this.state.borrow().thread_id.is_some()
+                && this.widget.visible_child_name().as_deref() == Some("thread")
+            {
+                this.entry.grab_focus_without_selecting();
+                this.entry.set_position(-1);
+            }
         });
     }
 
@@ -2705,7 +2763,12 @@ mod tests {
         assert_eq!(scaled_image_size(100, 75, false), (220, 165));
         // Tiny thumbnail: upscale capped at 2.2×.
         assert_eq!(scaled_image_size(50, 50, false), (110, 110));
-        assert_eq!(image_display(100, 75, true), (220, 165, true));
+        // A preview waiting for its full picture takes the full one's room
+        // (no shift when it lands); one with nothing to fetch stays small.
+        assert_eq!(image_display(100, 75, true), (380, 285, true));
+        assert_eq!(image_display(100, 75, false), (220, 165, false));
+        assert_eq!(image_display(4000, 3000, false).0, image_display(100, 75, true).0);
+        assert_eq!(image_display(75, 100, true), (375, 500, true));
         assert!(!image_display(1000, 750, true).2);
     }
 
