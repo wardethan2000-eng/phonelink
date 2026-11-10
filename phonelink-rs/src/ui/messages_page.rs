@@ -1056,6 +1056,7 @@ impl MessagesPage {
         };
         self.hidden_banner.set_revealed(false);
         self.thread.show_empty();
+        self.thread.forget_drafts();
         self.stack.set_visible_child_name("content");
         self.run(effects);
     }
@@ -1075,6 +1076,7 @@ impl MessagesPage {
             (i.client.clone(), i.kde_device.clone())
         };
         self.thread.show_empty();
+        self.thread.forget_drafts();
         if let Some(client) = client {
             self.set_device(&client, device.as_ref());
         } else {

@@ -1020,6 +1020,12 @@ fn date_separator(text: &str) -> gtk::Box {
 
 // ── the thread view ────────────────────────────────────────────────
 
+/// A message typed in a chat but not sent.
+struct Draft {
+    text: String,
+    files: Vec<PathBuf>,
+}
+
 #[derive(Default)]
 struct State {
     thread_id: Option<i64>,
@@ -1078,6 +1084,11 @@ pub struct ThreadView {
     /// "Sam is typing…".
     typing_label: gtk::Label,
     pending: RefCell<Vec<PathBuf>>,
+    /// Unsent text and files of the chats not on screen, by thread, so each
+    /// chat keeps its own half-typed message.
+    drafts: RefCell<HashMap<i64, Draft>>,
+    /// Set while a draft is put back, so that is not "typing".
+    restoring: Cell<bool>,
     /// `(thread_id, text, files, reply_to)` → whether it was taken (then the
     /// compose bar clears).
     on_send: RefCell<Option<SendHandler>>,
@@ -1265,6 +1276,8 @@ impl ThreadView {
             reply_label,
             typing_label,
             pending: RefCell::default(),
+            drafts: RefCell::default(),
+            restoring: Cell::new(false),
             on_send: RefCell::default(),
             on_older: RefCell::default(),
             on_typing: RefCell::default(),
@@ -1389,6 +1402,9 @@ impl ThreadView {
             let Some(this) = weak.upgrade() else { return };
             let tid = this.state.borrow().thread_id;
             let f = this.on_typing.borrow().clone();
+            if this.restoring.get() {
+                return;
+            }
             if let (Some(tid), Some(f), false) = (tid, f, e.text().trim().is_empty()) {
                 f(tid);
             }
@@ -1905,8 +1921,54 @@ impl ThreadView {
     }
 
     pub fn show_empty(&self) {
-        self.state.borrow_mut().thread_id = None;
+        let old = self.state.borrow_mut().thread_id.take();
+        if let Some(old) = old {
+            self.stash_draft(old);
+        }
         self.widget.set_visible_child_name("empty");
+    }
+
+    /// Keep what is typed (and attached) in chat `tid` for when it opens
+    /// again, and empty the compose bar.
+    fn stash_draft(&self, tid: i64) {
+        let text = self.entry.text().to_string();
+        let files = self.pending.borrow().clone();
+        let mut drafts = self.drafts.borrow_mut();
+        if text.trim().is_empty() && files.is_empty() {
+            drafts.remove(&tid);
+        } else {
+            drafts.insert(tid, Draft { text, files });
+        }
+        drop(drafts);
+        self.restoring.set(true);
+        self.entry.set_text("");
+        self.restoring.set(false);
+        self.clear_pending(false);
+    }
+
+    /// Put chat `tid`'s unsent message back in the compose bar.
+    fn restore_draft(self: &Rc<Self>, tid: i64) {
+        let Some(draft) = self.drafts.borrow_mut().remove(&tid) else {
+            return;
+        };
+        self.restoring.set(true);
+        self.entry.set_text(&draft.text);
+        self.restoring.set(false);
+        self.entry.set_position(-1);
+        for path in draft.files.into_iter().filter(|p| p.is_file()) {
+            self.add_pending(path);
+        }
+    }
+
+    /// Drop every chat's unsent message (the chats belong to another phone
+    /// connection now, and their thread numbers mean other chats).
+    pub fn forget_drafts(&self) {
+        let drafts: Vec<Draft> = self.drafts.borrow_mut().drain().map(|(_, d)| d).collect();
+        for path in drafts.into_iter().flat_map(|d| d.files) {
+            if private_tmp::contains(&path) {
+                let _ = std::fs::remove_file(path);
+            }
+        }
     }
 
     fn set_header(&self, conv: &Conversation) {
@@ -1931,6 +1993,13 @@ impl ThreadView {
         let same = self.state.borrow().thread_id == Some(conv.thread_id)
             && self.widget.visible_child_name().as_deref() == Some("thread");
         let changed = self.state.borrow().thread_id != Some(conv.thread_id);
+        if changed {
+            let old = self.state.borrow().thread_id;
+            if let Some(old) = old {
+                self.stash_draft(old);
+            }
+            self.restore_draft(conv.thread_id);
+        }
         {
             let mut st = self.state.borrow_mut();
             if changed {
