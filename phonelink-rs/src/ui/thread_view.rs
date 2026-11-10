@@ -1107,8 +1107,9 @@ pub struct ThreadView {
     pending_box: gtk::Box,
     reply_bar: gtk::Box,
     reply_label: gtk::Label,
-    /// "Sam is typing…".
-    typing_label: gtk::Label,
+    /// The typing bubble after the last message, and who (in a group).
+    typing_row: gtk::Box,
+    typing_names: gtk::Label,
     pending: RefCell<Vec<PathBuf>>,
     /// Unsent text and files of the chats not on screen, by thread, so each
     /// chat keeps its own half-typed message.
@@ -1221,7 +1222,36 @@ impl ThreadView {
         let column = adw::Clamp::new();
         column.set_maximum_size(super::scale::px(900));
         column.set_tightening_threshold(super::scale::px(700));
-        column.set_child(Some(&messages_box));
+        // Someone typing: a bubble of bouncing dots after the last message,
+        // as phones show it (a group names who, over it).
+        let typing_names = gtk::Label::new(None);
+        typing_names.set_xalign(0.0);
+        typing_names.set_margin_start(12);
+        typing_names.add_css_class("dim-label");
+        typing_names.add_css_class("caption");
+        typing_names.set_visible(false);
+        let typing_bubble = gtk::Box::new(gtk::Orientation::Horizontal, 0);
+        typing_bubble.add_css_class("message-bubble-received");
+        typing_bubble.add_css_class("typing-bubble");
+        typing_bubble.set_halign(gtk::Align::Start);
+        for n in 1..=3 {
+            let dot = gtk::Box::new(gtk::Orientation::Horizontal, 0);
+            dot.add_css_class("typing-dot");
+            dot.add_css_class(&format!("typing-dot-{n}"));
+            dot.set_valign(gtk::Align::Center);
+            typing_bubble.append(&dot);
+        }
+        let typing_row = gtk::Box::new(gtk::Orientation::Vertical, 2);
+        typing_row.set_halign(gtk::Align::Start);
+        typing_row.set_margin_start(24);
+        typing_row.set_margin_bottom(10);
+        typing_row.append(&typing_names);
+        typing_row.append(&typing_bubble);
+        typing_row.set_visible(false);
+        let content = gtk::Box::new(gtk::Orientation::Vertical, 0);
+        content.append(&messages_box);
+        content.append(&typing_row);
+        column.set_child(Some(&content));
         scroll.set_child(Some(&column));
         thread_box.append(&scroll);
 
@@ -1240,17 +1270,6 @@ impl ThreadView {
         preview_bar.set_child(Some(&pending_box));
         preview_bar.set_visible(false);
         thread_box.append(&preview_bar);
-
-        // "Sam is typing…", just above the compose bar.
-        let typing_label = gtk::Label::new(None);
-        typing_label.set_xalign(0.0);
-        typing_label.set_margin_start(16);
-        typing_label.set_margin_top(4);
-        typing_label.add_css_class("dim-label");
-        typing_label.add_css_class("caption");
-        typing_label.add_css_class("typing-label");
-        typing_label.set_visible(false);
-        thread_box.append(&typing_label);
 
         // "Replying to …": the next send answers that message.
         let reply_bar = gtk::Box::new(gtk::Orientation::Horizontal, 8);
@@ -1309,7 +1328,8 @@ impl ThreadView {
             pending_box,
             reply_bar,
             reply_label,
-            typing_label,
+            typing_row,
+            typing_names,
             pending: RefCell::default(),
             drafts: RefCell::default(),
             restoring: Cell::new(false),
@@ -1668,10 +1688,14 @@ impl ThreadView {
         *self.on_typing.borrow_mut() = Some(Rc::new(f));
     }
 
-    /// "Sam is typing…" (None hides it).
-    pub fn set_typing(&self, text: Option<&str>) {
-        self.typing_label.set_label(text.unwrap_or(""));
-        self.typing_label.set_visible(text.is_some());
+    /// The typing bubble (None hides it).
+    pub fn set_typing(&self, who: Option<&crate::core::messages::TypingShown>) {
+        let names = who.and_then(|w| w.names.as_deref());
+        self.typing_names.set_label(names.unwrap_or(""));
+        self.typing_names.set_visible(names.is_some());
+        self.typing_row.set_tooltip_text(who.map(|w| w.text.as_str()));
+        self.typing_row.update_property(&[gtk::accessible::Property::Label(who.map_or("", |w| w.text.as_str()))]);
+        self.typing_row.set_visible(who.is_some());
     }
 
     /// Whether the phone has older messages of chat `tid` than those here,
@@ -2197,7 +2221,7 @@ impl ThreadView {
                 st.more_on_phone = false;
                 st.loading_older = false;
                 self.reply_bar.set_visible(false);
-                self.typing_label.set_visible(false);
+                self.typing_row.set_visible(false);
             }
             st.routes = conv.messages.iter().filter_map(|m| route(m.uid).map(|r| (m.uid, r))).collect();
         }

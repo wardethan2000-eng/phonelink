@@ -3,7 +3,8 @@
 # Broadway backend on 127.0.0.1:8085 (ssh -L 8085:127.0.0.1:8085 the box to
 # look at it). Uses a throwaway HOME, so no real store or settings.
 # DEMO_GM=1 adds the fake Google Messages helper (examples/fake_gm.rs), so
-# the Messages tab runs on Google Messages.
+# the Messages tab runs on Google Messages; DEMO_TYPING=1 with it keeps
+# someone typing in the first chat and the group.
 #   scripts/remote-build.sh run -- bash scripts/ui-demo.sh
 set -u
 cargo build -q --example mock_daemon --example fake_gm && cargo build -q || exit 1

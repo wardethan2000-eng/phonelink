@@ -106,7 +106,18 @@ const EXTRA_CSS: &str = "
 .message-file-chip { padding: 6px 4px; }
 .compose-thumb { border-radius: 12px; }
 .compose-file { border-radius: 12px; background-color: alpha(currentColor, 0.08); }
-.typing-label { font-style: italic; }
+/* Someone typing: three dots bouncing in turn inside a received bubble,
+   in em so they follow the message zoom. */
+.message-bubble-received.typing-bubble { padding: 0.85em 0.95em; }
+.typing-dot { min-width: 0.6em; min-height: 0.6em; margin: 0 0.15em; border-radius: 9999px; background-color: currentColor; opacity: 0.35; animation: typing-bounce 1.2s ease-in-out infinite; }
+.typing-dot-2 { animation-delay: 0.15s; }
+.typing-dot-3 { animation-delay: 0.3s; }
+@keyframes typing-bounce {
+  0% { transform: translateY(0); opacity: 0.35; }
+  25% { transform: translateY(-0.3em); opacity: 0.9; }
+  50% { transform: translateY(0); opacity: 0.35; }
+  100% { transform: translateY(0); opacity: 0.35; }
+}
 flowboxchild.photo-row { border-radius: 8px; padding: 0; }
 flowboxchild.photo-row.photo-tile-selected { background-color: alpha(@accent_bg_color, 0.18); }
 .conversation-pin { opacity: 0.6; }

@@ -231,6 +231,17 @@ fn cache_full(
     Some(dest)
 }
 
+/// Someone typing in the open chat: a bubble of dots at its end.
+#[derive(Debug, Clone, PartialEq)]
+pub struct TypingShown {
+    /// "Sam is typing…" (the bubble's tooltip).
+    pub text: String,
+    /// Over the bubble in a group: "Sam", "Sam and Alex".
+    pub names: Option<String>,
+    /// When it runs out without news (epoch seconds).
+    pub until: f64,
+}
+
 /// One Google Messages chat behind a local thread.
 #[derive(Debug, Clone, Default)]
 struct GmChat {
@@ -2093,10 +2104,11 @@ impl Messages {
         if self.active == Some(primary) { vec![Effect::Typing(primary)] } else { Vec::new() }
     }
 
-    /// "Sam is typing…" for chat `primary`, and when it next needs looking
-    /// at (epoch seconds); `None` when nobody is.
-    pub fn typing_label(&self, primary: i64, now: f64) -> Option<(String, f64)> {
+    /// Who is typing in chat `primary`, and when it next needs looking at;
+    /// `None` when nobody is.
+    pub fn typing_label(&self, primary: i64, now: f64) -> Option<TypingShown> {
         let gm = self.gm.as_ref()?;
+        let group = self.conversation_threads(primary).iter().any(|t| gm.chats.get(t).is_some_and(|c| c.group));
         let who: Vec<&(String, f64)> = gm.typing.get(&primary)?.iter().filter(|(_, until)| *until > now).collect();
         let next = who.iter().map(|w| w.1).reduce(f64::min)?;
         let first = |n: &str| {
@@ -2108,12 +2120,16 @@ impl Messages {
                 name.split_whitespace().next().unwrap_or(&name).to_string()
             }
         };
-        let text = match who.as_slice() {
-            [one] => format!("{} is typing…", first(&one.0)),
-            [a, b] => format!("{} and {} are typing…", first(&a.0), first(&b.0)),
-            _ => "Several people are typing…".to_string(),
+        let (names, text) = match who.as_slice() {
+            [one] => (first(&one.0), format!("{} is typing…", first(&one.0))),
+            [a, b] => {
+                let names = format!("{} and {}", first(&a.0), first(&b.0));
+                let text = format!("{names} are typing…");
+                (names, text)
+            }
+            _ => ("Several people".to_string(), "Several people are typing…".to_string()),
         };
-        Some((text, next))
+        Some(TypingShown { text, names: group.then_some(names), until: next })
     }
 
     /// The user is typing in chat `primary`: tell the phone, at most every
@@ -3413,9 +3429,14 @@ mod tests {
             p.m.contact_map.insert(normalize_phone("+13165551111"), "Sam Ortiz".into());
             p.m.select(tid, &p.store, 0.0);
             assert_eq!(p.m.gm_typing(tid, "+13165551111", true, 100.0), vec![Effect::Typing(tid)]);
-            assert_eq!(p.m.typing_label(tid, 101.0), Some(("Sam is typing…".to_string(), 100.0 + TYPING_SHOWN_SECS)));
+            let shown = p.m.typing_label(tid, 101.0).unwrap();
+            assert_eq!((shown.text.as_str(), shown.until), ("Sam is typing…", 100.0 + TYPING_SHOWN_SECS));
+            // A group names who, over the bubble.
+            assert_eq!(shown.names.as_deref(), Some("Sam"));
             p.m.gm_typing(tid, "+13165552222", true, 102.0);
-            assert_eq!(p.m.typing_label(tid, 103.0).unwrap().0, "Sam and +13165552222 are typing…");
+            let shown = p.m.typing_label(tid, 103.0).unwrap();
+            assert_eq!(shown.text, "Sam and +13165552222 are typing…");
+            assert_eq!(shown.names.as_deref(), Some("Sam and +13165552222"));
             // Runs out without news.
             assert_eq!(p.m.typing_label(tid, 200.0), None);
             // Their text ends it.

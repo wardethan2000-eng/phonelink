@@ -1477,7 +1477,7 @@ impl MessagesPage {
         dialog.present();
     }
 
-    /// "… is typing" under the open chat, cleared when it runs out.
+    /// The typing bubble at the end of the open chat, gone when it runs out.
     fn show_typing(self: &Rc<Self>, tid: i64) {
         let label = {
             let i = self.inner.borrow();
@@ -1489,8 +1489,8 @@ impl MessagesPage {
         if let Some(old) = self.inner.borrow_mut().typing_timer.take() {
             old.remove();
         }
-        self.thread.set_typing(label.as_ref().map(|(t, _)| t.as_str()));
-        if let Some((_, until)) = label {
+        self.thread.set_typing(label.as_ref());
+        if let Some(until) = label.map(|l| l.until) {
             let wait = Duration::from_secs_f64((until - now()).max(0.0) + 0.05);
             let weak = Rc::downgrade(self);
             let id = glib::timeout_add_local_once(wait, move || {

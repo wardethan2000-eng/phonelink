@@ -284,6 +284,18 @@ fn main() {
     for c in CHATS {
         put(&out, &conversation(c, start));
     }
+    // DEMO_TYPING=1: someone keeps typing in the first chat and the group,
+    // to look at the typing bubble.
+    if std::env::var("DEMO_TYPING").is_ok_and(|v| v == "1") {
+        let out = out.clone();
+        std::thread::spawn(move || {
+            loop {
+                put(&out, &json!({"event": "typing", "conv": "1", "from": "+15555550101", "typing": true}));
+                put(&out, &json!({"event": "typing", "conv": "2", "from": "+15555550103", "typing": true}));
+                std::thread::sleep(Duration::from_secs(5));
+            }
+        });
+    }
     // A little later, someone in the group starts typing, then the
     // group's picture arrives full size.
     {
