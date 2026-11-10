@@ -1,6 +1,6 @@
 [package]
 name = "phonelink-rs"
-version = "0.3.3"
+version = "0.3.4"
 edition = "2024"
 rust-version = "1.98"
 license = "MIT"
