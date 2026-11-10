@@ -20,6 +20,7 @@ use super::google_sync::GoogleSync;
 use super::notifications_model::{NoteEvent, NotificationsModel, Props};
 use super::thread_view::{BubbleActions, ThreadView};
 use crate::core::attachments::full_cache_dir;
+use crate::core::autocap::AutocapRules;
 use crate::core::contacts::load_contact_map;
 use crate::core::contacts::notification_message_text;
 use crate::core::message::parse_message;
@@ -291,7 +292,7 @@ impl MessagesPage {
             this.show_gm_banner("Connecting to Google Messages…", None);
         }
         let settings = this.inner.borrow().settings.clone();
-        this.thread.set_autocap(move || settings.try_borrow().map_or(true, |s| s.auto_capitalize()));
+        this.thread.set_autocap(move || settings.try_borrow().map_or(AutocapRules::OFF, |s| s.autocap_rules()));
         let saved_scale = this.inner.borrow().settings.borrow().message_font_scale();
         let weak = Rc::downgrade(&this);
         this.thread.set_zoom(saved_scale, move |scale| {

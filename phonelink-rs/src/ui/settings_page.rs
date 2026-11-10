@@ -177,15 +177,22 @@ impl SettingsPage {
         }
         startup.add(&open_on_login);
         let typing = group("Typing");
-        let autocap = switch_row(
-            "Capitalize Automatically",
-            "Start sentences and the word “I” with a capital letter. Ctrl+Z right after one keeps the letter as typed.",
-            settings.borrow().auto_capitalize(),
-        );
-        typing.add(&autocap);
+        typing.set_description(Some("Capitals as you type. Ctrl+Z right after one keeps the letter as typed."));
+        let rules = settings.borrow().autocap_rules();
+        let cap_sentences =
+            switch_row("Capitalize Sentences", "The first letter of a message and of each sentence", rules.sentences);
+        let cap_i = switch_row("Capitalize “I”", "Also in I'm, I'll, I've and I'd", rules.lone_i);
+        typing.add(&cap_sentences);
+        typing.add(&cap_i);
         let s = settings.clone();
-        autocap.connect_active_notify(move |r| {
-            if let Err(e) = s.borrow_mut().set_auto_capitalize(r.is_active()) {
+        cap_sentences.connect_active_notify(move |r| {
+            if let Err(e) = s.borrow_mut().set_capitalize_sentences(r.is_active()) {
+                log::warn!("saving the capitals setting failed: {e}");
+            }
+        });
+        let s = settings.clone();
+        cap_i.connect_active_notify(move |r| {
+            if let Err(e) = s.borrow_mut().set_capitalize_i(r.is_active()) {
                 log::warn!("saving the capitals setting failed: {e}");
             }
         });

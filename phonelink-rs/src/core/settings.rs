@@ -25,6 +25,8 @@ use std::sync::atomic::{AtomicU64, Ordering};
 use serde::Serialize;
 use serde_json::{Map, Value};
 
+use crate::core::autocap::AutocapRules;
+
 /// GitHub-verified id, as Flathub requires (Ethan, 2026-11-05). The Python
 /// app used `dev.phonelink.app`; its autostart entry is cleaned up as legacy.
 pub const APPLICATION_ID: &str = "io.github.wardethan2000_eng.phonelink";
@@ -253,8 +255,9 @@ pub struct Settings {
     photos_as_list: bool,
     photos_oldest_first: bool,
     photos_by_day: bool,
-    /// Capitals at the start of sentences and for "I" while typing.
-    auto_capitalize: bool,
+    /// Capitals while typing: at the start of sentences, and for "I".
+    capitalize_sentences: bool,
+    capitalize_i: bool,
     /// Keys we do not know (written by Python or a newer version); preserved.
     extra: Map<String, Value>,
 
@@ -294,7 +297,8 @@ impl Settings {
             photos_as_list: false,
             photos_oldest_first: false,
             photos_by_day: true,
-            auto_capitalize: true,
+            capitalize_sentences: true,
+            capitalize_i: true,
             extra: Map::new(),
             last_written: None,
             batch_depth: 0,
@@ -355,7 +359,9 @@ impl Settings {
         self.photos_as_list = py_bool(m.remove("photos_as_list"), false);
         self.photos_oldest_first = py_bool(m.remove("photos_oldest_first"), false);
         self.photos_by_day = py_bool(m.remove("photos_by_day"), true);
-        self.auto_capitalize = py_bool(m.remove("auto_capitalize"), true);
+        self.capitalize_sentences = py_bool(m.remove("capitalize_sentences"), true);
+        self.capitalize_i = py_bool(m.remove("capitalize_i"), true);
+        m.remove("auto_capitalize"); // one switch for both, never released
 
         self.hidden = BTreeMap::new();
         if let Some(Value::Object(devices)) = m.remove("hidden_conversations") {
@@ -407,7 +413,8 @@ impl Settings {
         m.insert("photos_as_list".into(), Value::from(self.photos_as_list));
         m.insert("photos_oldest_first".into(), Value::from(self.photos_oldest_first));
         m.insert("photos_by_day".into(), Value::from(self.photos_by_day));
-        m.insert("auto_capitalize".into(), Value::from(self.auto_capitalize));
+        m.insert("capitalize_sentences".into(), Value::from(self.capitalize_sentences));
+        m.insert("capitalize_i".into(), Value::from(self.capitalize_i));
         serde_json::to_string_pretty(&m).unwrap_or_else(|_| "{}".to_string())
     }
 
@@ -503,12 +510,17 @@ impl Settings {
         self.save()
     }
 
-    pub fn auto_capitalize(&self) -> bool {
-        self.auto_capitalize
+    pub fn autocap_rules(&self) -> AutocapRules {
+        AutocapRules { sentences: self.capitalize_sentences, lone_i: self.capitalize_i }
     }
 
-    pub fn set_auto_capitalize(&mut self, value: bool) -> io::Result<()> {
-        self.auto_capitalize = value;
+    pub fn set_capitalize_sentences(&mut self, value: bool) -> io::Result<()> {
+        self.capitalize_sentences = value;
+        self.save()
+    }
+
+    pub fn set_capitalize_i(&mut self, value: bool) -> io::Result<()> {
+        self.capitalize_i = value;
         self.save()
     }
 
@@ -835,6 +847,20 @@ mod tests {
         let mut third = Settings::with_paths(f.path.clone(), f._dir.path().join("autostart"));
         third.load();
         assert_eq!(third.photos_view(), (true, true, false));
+    }
+
+    #[test]
+    fn capitals_have_two_switches_both_on_at_first() {
+        let mut f = fixture();
+        assert_eq!(f.s.autocap_rules(), AutocapRules { sentences: true, lone_i: true });
+        f.s.set_capitalize_sentences(false).unwrap();
+        let mut again = Settings::with_paths(f.path.clone(), f._dir.path().join("autostart"));
+        again.load();
+        assert_eq!(again.autocap_rules(), AutocapRules { sentences: false, lone_i: true });
+        again.set_capitalize_i(false).unwrap();
+        let mut third = Settings::with_paths(f.path.clone(), f._dir.path().join("autostart"));
+        third.load();
+        assert_eq!(third.autocap_rules(), AutocapRules::OFF);
     }
 
     #[test]

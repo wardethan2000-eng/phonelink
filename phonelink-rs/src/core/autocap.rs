@@ -11,6 +11,24 @@ pub enum Autocap {
     LoneI,
 }
 
+/// Which capitals to make (Settings > General > Typing).
+#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+pub struct AutocapRules {
+    pub sentences: bool,
+    pub lone_i: bool,
+}
+
+impl AutocapRules {
+    pub const OFF: Self = Self { sentences: false, lone_i: false };
+
+    pub fn allows(self, fix: &Autocap) -> bool {
+        match fix {
+            Autocap::Typed => self.sentences,
+            Autocap::LoneI => self.lone_i,
+        }
+    }
+}
+
 /// Abbreviations whose full stop does not end a sentence.
 const ABBREVIATIONS: &[&str] = &["e.g.", "i.e.", "vs.", "mr.", "mrs.", "ms.", "dr.", "st."];
 
@@ -97,6 +115,14 @@ mod tests {
         assert_eq!(autocap("so do i", '?'), Some(Autocap::LoneI));
         assert_eq!(autocap("so do i", '.'), Some(Autocap::LoneI));
         assert_eq!(autocap("\"i", ' '), Some(Autocap::LoneI));
+    }
+
+    #[test]
+    fn each_rule_has_its_own_switch() {
+        let only_i = AutocapRules { sentences: false, lone_i: true };
+        assert!(!only_i.allows(&Autocap::Typed));
+        assert!(only_i.allows(&Autocap::LoneI));
+        assert!(!AutocapRules::OFF.allows(&Autocap::LoneI));
     }
 
     #[test]

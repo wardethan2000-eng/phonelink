@@ -1107,7 +1107,7 @@ pub struct ThreadView {
     /// Set while a draft is put back, so that is not "typing".
     restoring: Cell<bool>,
     /// Whether to capitalize while typing (Settings), asked on each key.
-    autocap_on: RefCell<Option<Box<dyn Fn() -> bool>>>,
+    autocap_on: RefCell<Option<Box<dyn Fn() -> crate::core::autocap::AutocapRules>>>,
     /// The automatic capital just made (where, and the letter as typed),
     /// until the next edit: Ctrl+Z then puts the typed letter back.
     autocap_last: Cell<Option<(i32, char)>>,
@@ -2000,7 +2000,7 @@ impl ThreadView {
     }
 
     /// Capitalize while typing, if Settings allow it.
-    pub fn set_autocap(&self, on: impl Fn() -> bool + 'static) {
+    pub fn set_autocap(&self, on: impl Fn() -> crate::core::autocap::AutocapRules + 'static) {
         *self.autocap_on.borrow_mut() = Some(Box::new(on));
     }
 
@@ -2016,11 +2016,14 @@ impl ThreadView {
         let (Some(c), None) = (chars.next(), chars.next()) else {
             return; // a paste or a draft put back
         };
-        if self.restoring.get() || !self.autocap_on.borrow().as_ref().is_some_and(|f| f()) {
+        if self.restoring.get() {
             return;
         }
+        let Some(rules) = self.autocap_on.borrow().as_ref().map(|f| f()) else {
+            return;
+        };
         let before = ed.chars(0, pos);
-        let at = match crate::core::autocap::autocap(&before, c) {
+        let at = match crate::core::autocap::autocap(&before, c).filter(|fix| rules.allows(fix)) {
             Some(crate::core::autocap::Autocap::Typed) => pos,
             Some(crate::core::autocap::Autocap::LoneI) => pos - 1,
             None => return,
