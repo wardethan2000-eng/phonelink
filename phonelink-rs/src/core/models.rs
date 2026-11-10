@@ -94,10 +94,6 @@ pub struct Attachment {
 
 pub const MSG_TYPE_RECEIVED: i32 = 1;
 pub const MSG_TYPE_SENT: i32 = 2;
-/// Not Android values: a call shown in a chat's timeline (see [`Call`]).
-pub const MSG_TYPE_CALL_INCOMING: i32 = 101;
-pub const MSG_TYPE_CALL_MISSED: i32 = 102;
-
 /// A phone call KDE Connect told us about (it only reports calls while it
 /// runs, and only ringing and missed: not answered or ended).
 #[derive(Debug, Clone, PartialEq, Default)]
@@ -106,29 +102,14 @@ pub struct Call {
     /// When it rang, ms since epoch.
     pub date: i64,
     pub missed: bool,
-    /// Opened in the app since (a missed call unseen keeps the chat unread).
+    /// Looked at in the calls list since (unseen missed calls are counted
+    /// on the calls button).
     pub seen: bool,
 }
 
 impl Call {
     pub fn label(&self) -> &'static str {
         if self.missed { "Missed call" } else { "Incoming call" }
-    }
-
-    /// The call as a timeline item. Its uid is negative so it never
-    /// collides with a phone message, and changes when the call turns
-    /// missed so the open chat redraws it.
-    pub fn as_message(&self, thread_id: i64) -> SmsMessage {
-        SmsMessage {
-            uid: -(self.date.max(1) * 2 + i64::from(self.missed)),
-            body: self.label().to_string(),
-            address: self.number.clone(),
-            date: self.date,
-            msg_type: if self.missed { MSG_TYPE_CALL_MISSED } else { MSG_TYPE_CALL_INCOMING },
-            read: 1,
-            thread_id,
-            ..Default::default()
-        }
     }
 }
 
@@ -151,11 +132,6 @@ pub struct SmsMessage {
 }
 
 impl SmsMessage {
-    /// A call shown in the timeline, not a text.
-    pub fn is_call(&self) -> bool {
-        matches!(self.msg_type, MSG_TYPE_CALL_INCOMING | MSG_TYPE_CALL_MISSED)
-    }
-
     pub fn is_sent(&self) -> bool {
         self.msg_type == MSG_TYPE_SENT
     }
@@ -188,9 +164,6 @@ pub struct Conversation {
     pub identity: String,
     /// Every phone thread id merged into this conversation.
     pub thread_ids: Vec<i64>,
-    /// Calls with this chat's number, oldest first (1:1 chats only; not in
-    /// `messages`, so search, sync and the store never see them as texts).
-    pub calls: Vec<Call>,
 }
 
 impl Conversation {
@@ -202,30 +175,7 @@ impl Conversation {
         self.addresses.len() > 1
     }
 
-    /// The newest call, when it is newer than the newest text.
-    pub fn newest_call(&self) -> Option<&Call> {
-        let text_date = if self.last_date != 0 { self.last_date } else { self.messages.last().map_or(0, |m| m.date) };
-        self.calls.last().filter(|c| c.date > text_date)
-    }
-
-    /// A missed call newer than every text, not opened yet: keeps the chat
-    /// unread.
-    pub fn has_unseen_missed_call(&self) -> bool {
-        self.newest_call().is_some_and(|c| c.missed && !c.seen)
-    }
-
-    /// Texts and calls in time order.
-    pub fn timeline(&self) -> Vec<SmsMessage> {
-        let mut v = self.messages.clone();
-        v.extend(self.calls.iter().map(|c| c.as_message(self.thread_id)));
-        v.sort_by_key(|m| m.date);
-        v
-    }
-
     pub fn preview(&self) -> String {
-        if let Some(call) = self.newest_call() {
-            return call.label().to_string();
-        }
         let text = if !self.last_message.is_empty() {
             self.last_message.as_str()
         } else if let Some(last) = self.messages.last() {
@@ -237,8 +187,7 @@ impl Conversation {
     }
 
     pub fn sort_key(&self) -> i64 {
-        let text = if self.last_date != 0 { self.last_date } else { self.messages.last().map_or(0, |m| m.date) };
-        text.max(self.calls.last().map_or(0, |c| c.date))
+        if self.last_date != 0 { self.last_date } else { self.messages.last().map_or(0, |m| m.date) }
     }
 
     pub fn time_label(&self) -> String {

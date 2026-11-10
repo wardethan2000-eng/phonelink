@@ -116,6 +116,8 @@ struct Inner {
     gm_draining: bool,
     /// Clears "… is typing" when it runs out.
     typing_timer: Option<glib::SourceId>,
+    /// Ends the calls button's ringing when it runs out.
+    calls_timer: Option<glib::SourceId>,
 }
 
 impl Inner {
@@ -123,6 +125,8 @@ impl Inner {
         self.kde_device.as_ref().map(|d| d.id.clone())
     }
 }
+
+type CallsHandler = Box<dyn Fn(&crate::core::messages::CallsView)>;
 
 pub struct MessagesPage {
     /// The page; toasts float over it.
@@ -157,6 +161,8 @@ pub struct MessagesPage {
     unseen_reads: RefCell<std::collections::HashSet<i64>>,
     /// The window's focus is watched (set once the page is in a window).
     watching_window: std::cell::Cell<bool>,
+    /// The header's calls button, fed on every change.
+    on_calls: RefCell<Option<CallsHandler>>,
     inner: RefCell<Inner>,
 }
 
@@ -205,14 +211,6 @@ impl MessagesPage {
                     }
                 })
             },
-            text_back: {
-                let target = download_target.clone();
-                Rc::new(move || {
-                    if let Some(page) = target.borrow().upgrade() {
-                        page.thread.entry.grab_focus();
-                    }
-                })
-            },
             react: {
                 let target = download_target.clone();
                 Rc::new(move |uid, emoji| {
@@ -249,6 +247,7 @@ impl MessagesPage {
             gm: RefCell::default(),
             phone_read: RefCell::default(),
             phone_read_queued: Default::default(),
+            on_calls: RefCell::default(),
             unseen_reads: RefCell::default(),
             watching_window: Default::default(),
             inner: RefCell::new(Inner {
@@ -274,6 +273,7 @@ impl MessagesPage {
                 gm_queue: VecDeque::new(),
                 gm_draining: false,
                 typing_timer: None,
+                calls_timer: None,
             }),
         });
         *download_target.borrow_mut() = Rc::downgrade(&this);
@@ -422,7 +422,9 @@ impl MessagesPage {
             i.queue.clear();
             i.kde_device = None;
             i.m.reset_for_device(None, false);
+            drop(i);
             self.stack.set_visible_child_name("status");
+            self.show_calls();
             return;
         };
         let effects = {
@@ -669,6 +671,7 @@ impl MessagesPage {
                 Effect::GmFetchOlder { thread_id, conv, cursor } => self.gm_fetch_older(thread_id, conv, cursor),
                 Effect::GmUpdateChat { thread_id, conv, change } => self.gm_update_chat(thread_id, conv, change),
                 Effect::Typing(tid) => self.show_typing(tid),
+                Effect::Calls => self.show_calls(),
                 Effect::MoreHistory(tid) => self.show_more_history(tid),
                 Effect::Redraw(tid) => {
                     {
@@ -1477,6 +1480,60 @@ impl MessagesPage {
         dialog.present();
     }
 
+    /// `f(view)` whenever the calls change (the header's calls button).
+    pub fn connect_calls(self: &Rc<Self>, f: impl Fn(&crate::core::messages::CallsView) + 'static) {
+        *self.on_calls.borrow_mut() = Some(Box::new(f));
+        self.show_calls();
+    }
+
+    /// Feed the calls button; while the phone rings, again when it stops.
+    fn show_calls(self: &Rc<Self>) {
+        let now_ms = chrono::Utc::now().timestamp_millis();
+        let view = self.inner.borrow().m.calls_view(now_ms);
+        if let Some(old) = self.inner.borrow_mut().calls_timer.take() {
+            old.remove();
+        }
+        if let Some(f) = self.on_calls.borrow().as_ref() {
+            f(&view);
+        }
+        if let Some((_, until)) = view.ringing {
+            let wait = Duration::from_millis((until - now_ms).max(0) as u64 + 50);
+            let weak = Rc::downgrade(self);
+            let id = glib::timeout_add_local_once(wait, move || {
+                let Some(this) = weak.upgrade() else { return };
+                this.inner.borrow_mut().calls_timer = None;
+                this.show_calls();
+            });
+            self.inner.borrow_mut().calls_timer = Some(id);
+        }
+    }
+
+    /// The calls list was looked at: its missed calls are seen.
+    pub fn see_calls(self: &Rc<Self>) {
+        let effects = {
+            let mut guard = self.inner.borrow_mut();
+            let i = &mut *guard;
+            i.m.see_calls(&i.store)
+        };
+        self.run(effects);
+    }
+
+    /// "Clear" in the calls list.
+    pub fn clear_calls(self: &Rc<Self>) {
+        let effects = {
+            let mut guard = self.inner.borrow_mut();
+            let i = &mut *guard;
+            i.m.clear_calls(&i.store)
+        };
+        self.run(effects);
+    }
+
+    /// "Text them" on a call: that number's chat, or a new one.
+    pub fn text_number(self: &Rc<Self>, number: &str, name: &str) {
+        self.list_event(ListEvent::Start { address: number.to_string(), name: name.to_string() });
+        self.thread.focus_compose();
+    }
+
     /// The typing bubble at the end of the open chat, gone when it runs out.
     fn show_typing(self: &Rc<Self>, tid: i64) {
         let label = {
@@ -1894,7 +1951,7 @@ impl MessagesPage {
                 if crate::core::calls::CallEvent::parse(&event).is_none() {
                     return;
                 }
-                // The call, as a line in that number's chat.
+                // The call, for the calls button.
                 let effects = {
                     let mut guard = this.inner.borrow_mut();
                     let i = &mut *guard;

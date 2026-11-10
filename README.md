@@ -13,6 +13,7 @@ PhoneRelay brings your Android phone's texts, notifications and files to your Li
 - **Contact names** — learned from notifications and calls, or imported from Google Contacts (one click: **Settings** (gear button) **→ Google Contacts → Connect**), a VCF or a CSV
 - **Notifications** — live phone notifications in a side tray; expand, dismiss or reply from the desktop
 - **Files** — browse the phone's storage, see recent photos as a grid or list grouped by day, copy, save, or send files to the phone
+- **Calls** — a phone button in the header counts missed calls and shows who is calling while the phone rings; click it for recent calls and to text the caller back
 - **Battery and status** in the header bar; **ring the phone** to find it
 - **Tray icon** and **Open on Login**
 - **Optional Google Messages link** — texts go as RCS where the chat is RCS, with reactions, replies, typing, read receipts, pictures, voice and video, groups, and archive/mute/pin; chats delete and read/unread stay in step with the phone (see [Google Messages link](#optional-google-messages-link))
@@ -194,7 +195,7 @@ The header bar is always visible and shows:
 
 - **Left**: Phone icon, device name, and a coloured dot (green = connected, orange = paired but not reachable, grey = no device)
 - **Centre**: Tab switcher (Messages / Files / Clipboard)
-- **Right**: Battery icon and percentage, notification bell button, ring phone button
+- **Right**: Battery icon and percentage, ring phone button, notification bell button, calls button (missed calls count; the caller's name while the phone rings)
 
 ### Messages Tab
 

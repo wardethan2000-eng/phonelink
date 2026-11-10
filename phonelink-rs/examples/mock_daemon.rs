@@ -489,16 +489,16 @@ fn main() {
                 .build()
                 .unwrap();
         }
-        // `DEMO_CALLS=1`: a call rings and is missed in an existing chat
-        // (+15555550107), and a new number calls and is missed.
+        // `DEMO_CALLS=1`: a known number rings from 15 s and is missed at
+        // 40 s, then a new number calls and is missed.
         if std::env::var_os("DEMO_CALLS").is_some() {
             let calls = conn.clone();
             let tel = format!("{}/telephony", device_path(DEVICE));
             let iface = phonelink_rs::dbus::IFACE_TELEPHONY;
             for (secs, kind, number) in [
-                (20, "callReceived", "+15555550107"),
-                (22, "missedCall", "+15555550107"),
-                (23, "missedCall", "+15555550199"),
+                (15, "callReceived", "+15555550107"),
+                (40, "missedCall", "+15555550107"),
+                (45, "missedCall", "+15555550199"),
             ] {
                 let (c, t) = (calls.clone(), tel.clone());
                 glib::timeout_add_seconds_local_once(secs, move || {

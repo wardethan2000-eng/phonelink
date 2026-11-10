@@ -27,6 +27,8 @@ const FALLBACKS: &[(&str, &[&str])] = &[
     // Find Phone: a phone (Breeze's location icon looked like a photo).
     ("phone-ring-symbolic", &["smartphone-symbolic", "phone-symbolic", "find-location-symbolic"]),
     ("view-pin-symbolic", &["pin-symbolic", "window-pin-symbolic"]),
+    // The calls button (a handset).
+    ("call-start-symbolic", &["call-incoming-symbolic", "phone-symbolic"]),
 ];
 
 fn theme() -> Option<gtk::IconTheme> {

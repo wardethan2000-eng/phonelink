@@ -1,4 +1,4 @@
-//! Calls in the chat timeline (port brief item D).
+//! Calls, for the calls button in the header (not in the chats).
 //!
 //! KDE Connect 26.08 emits `telephony.callReceived(type, number, name)` with
 //! `type` = `"callReceived"` when the phone rings and `"missedCall"` when a
@@ -16,6 +16,10 @@ pub const MISS_JOINS_RING_MS: i64 = 10 * 60_000;
 /// A second ring this soon with the same number is the same call (the
 /// phone can report one call twice).
 pub const RING_REPEAT_MS: i64 = 60_000;
+
+/// Nothing says when a ringing call is answered or ends: it shows as
+/// ringing this long unless a miss comes first.
+pub const RING_SHOWN_MS: i64 = 30_000;
 
 /// What a `callReceived` signal means.
 #[derive(Debug, Clone, Copy, PartialEq, Eq)]
@@ -35,7 +39,7 @@ impl CallEvent {
     }
 }
 
-/// A number worth a chat: at least 3 digits (KDE Connect sends "unknown
+/// A number worth listing: at least 3 digits (KDE Connect sends "unknown
 /// number", localized, for hidden callers).
 pub fn callable(number: &str) -> bool {
     normalize_phone(number).chars().count() >= 3
@@ -70,9 +74,9 @@ pub fn record(calls: &mut Vec<Call>, event: CallEvent, number: &str, now_ms: i64
     }
 }
 
-/// Does this call belong in the chat with `address`?
-pub fn belongs(call: &Call, address: &str) -> bool {
-    same(&call.number, address)
+/// The call ringing now, if any: the newest, not missed, recent.
+pub fn ringing(calls: &[Call], now_ms: i64) -> Option<&Call> {
+    calls.last().filter(|c| !c.missed && (0..RING_SHOWN_MS).contains(&(now_ms - c.date)))
 }
 
 #[cfg(test)]
@@ -112,7 +116,18 @@ mod tests {
         record(&mut calls, CallEvent::Missed, "3165552222", 2).unwrap();
         assert_eq!(calls.len(), 2);
         assert!(!calls[0].missed && calls[1].missed);
-        assert!(belongs(&calls[0], "+13165551111") && !belongs(&calls[0], "3165552222"));
+        assert!(same(&calls[0].number, "+13165551111") && !same(&calls[0].number, "3165552222"));
+    }
+
+    #[test]
+    fn rings_until_missed_or_for_a_while() {
+        let mut calls = Vec::new();
+        assert_eq!(ringing(&calls, 0), None);
+        record(&mut calls, CallEvent::Ringing, "3165551111", 1_000).unwrap();
+        assert!(ringing(&calls, 2_000).is_some());
+        assert_eq!(ringing(&calls, 1_000 + RING_SHOWN_MS), None);
+        record(&mut calls, CallEvent::Missed, "3165551111", 9_000).unwrap();
+        assert_eq!(ringing(&calls, 10_000), None);
     }
 
     #[test]
@@ -123,7 +138,7 @@ mod tests {
         store.upsert_call("dev", &Call { seen: true, ..c.clone() });
         store.upsert_call("other", &c);
         assert_eq!(store.load_calls("dev"), vec![Call { seen: true, ..c.clone() }]);
-        store.delete_calls("dev", &["+13165551111".to_string()]);
+        store.clear_calls("dev");
         assert!(store.load_calls("dev").is_empty());
         assert_eq!(store.load_calls("other").len(), 1);
     }

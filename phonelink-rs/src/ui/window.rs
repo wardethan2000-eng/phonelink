@@ -180,7 +180,8 @@ impl Window {
         switcher.set_policy(adw::ViewSwitcherPolicy::Wide);
         header_bar.set_title_widget(Some(&switcher));
 
-        // Right, from the edge in: battery, Find Phone, notifications, settings.
+        // Right, from the edge in: battery, Find Phone, notifications, calls,
+        // settings.
         let right = gtk::Box::new(gtk::Orientation::Horizontal, 6);
         let battery_icon = gtk::Image::new();
         // 16 px: the stylesheet sizes it (Settings > Size).
@@ -196,6 +197,8 @@ impl Window {
         notif_toggle.set_icon_name(&icons::resolve("xsi-notifications-symbolic"));
         notif_toggle.set_tooltip_text(Some("Notifications"));
         header_bar.pack_end(&notif_toggle);
+        let calls_button = super::calls_button::CallsButton::new();
+        header_bar.pack_end(&calls_button.widget);
         let settings_btn = gtk::Button::from_icon_name(&icons::resolve("preferences-system-symbolic"));
         settings_btn.set_tooltip_text(Some("Preferences"));
         header_bar.pack_end(&settings_btn);
@@ -217,6 +220,22 @@ impl Window {
         let notifications = NotificationsModel::new();
         let messages = MessagesPage::new(MessageStore::open_default(), settings.clone(), notifications.clone());
         messages.use_toasts(&toasts);
+        {
+            let button = calls_button.clone();
+            messages.connect_calls(move |view| button.show(view));
+            let page = Rc::downgrade(&messages);
+            calls_button.connect_looked(move || {
+                if let Some(p) = page.upgrade() {
+                    p.see_calls();
+                }
+            });
+            let page = Rc::downgrade(&messages);
+            calls_button.connect_clear(move || {
+                if let Some(p) = page.upgrade() {
+                    p.clear_calls();
+                }
+            });
+        }
         let page = stack.add_titled(&messages.widget, Some("sms"), "Messages");
         page.set_icon_name(Some("mail-unread-symbolic"));
         let files = FilesPage::new(settings.clone());
@@ -268,6 +287,19 @@ impl Window {
         };
         body.add_named(&settings_page.widget, Some("settings"));
         body.add_named(&adw::StatusPage::new(), Some("status"));
+        // "Text them" on a call: that chat, in the Messages tab.
+        {
+            let (page, stack, body) = (Rc::downgrade(&messages), stack.downgrade(), body.downgrade());
+            calls_button.connect_text(move |number, name| {
+                if let (Some(stack), Some(body)) = (stack.upgrade(), body.upgrade()) {
+                    body.set_visible_child_name("main");
+                    stack.set_visible_child_name("sms");
+                }
+                if let Some(p) = page.upgrade() {
+                    p.text_number(number, name);
+                }
+            });
+        }
         toasts.set_child(Some(&body));
         toasts.set_vexpand(true);
         outer.append(&toasts);

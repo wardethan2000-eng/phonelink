@@ -149,10 +149,39 @@ pub enum Effect {
     },
     /// A shown message changed (its delivery state): redraw the open chat.
     Redraw(i64),
+    /// The calls changed: redraw the calls button ([`Messages::calls_view`]).
+    Calls,
     RefreshList,
     ShowThread(i64),
     ShowEmpty,
     Toast(&'static str),
+}
+
+/// How many calls the calls list shows, newest first.
+pub const CALLS_LISTED: usize = 30;
+
+/// One call in the calls list.
+#[derive(Debug, Clone, PartialEq)]
+pub struct CallShown {
+    pub number: String,
+    /// The contact's name, else the number.
+    pub name: String,
+    /// When it rang, ms since epoch.
+    pub date: i64,
+    pub missed: bool,
+    /// Missed and not looked at yet.
+    pub unseen: bool,
+}
+
+/// What the calls button shows.
+#[derive(Debug, Clone, PartialEq, Default)]
+pub struct CallsView {
+    /// The phone is ringing: who, and until when it counts as ringing.
+    pub ringing: Option<(CallShown, i64)>,
+    /// Missed calls not looked at yet (the button's count).
+    pub missed: usize,
+    /// Newest first.
+    pub recent: Vec<CallShown>,
 }
 
 pub const TOAST_NOT_CONNECTED: &str = "Can't send — your phone isn't connected right now";
@@ -528,8 +557,7 @@ impl Messages {
         self.calls = store.load_calls(&dev);
         let mut cached: Vec<Conversation> = store.load_conversations(&dev).into_values().collect();
         if cached.is_empty() {
-            self.attach_calls();
-            return if self.calls.is_empty() { Vec::new() } else { vec![Effect::RefreshList] };
+            return vec![Effect::Calls];
         }
         // Deterministic order, collapsing legacy duplicate rows.
         cached.sort_by_key(|c| c.thread_id);
@@ -538,8 +566,7 @@ impl Messages {
             self.index.register(conv);
         }
         self.refresh_names();
-        self.attach_calls();
-        vec![Effect::RefreshList]
+        vec![Effect::RefreshList, Effect::Calls]
     }
 
     // ── calls ──────────────────────────────────────────────────────
@@ -549,108 +576,51 @@ impl Messages {
         let (Some(dev), Some(event)) = (self.device_id.clone(), CallEvent::parse(kind)) else {
             return Vec::new();
         };
-        let Some(mut call) = call_log::record(&mut self.calls, event, number, now_ms) else {
+        let Some(call) = call_log::record(&mut self.calls, event, number, now_ms) else {
             return Vec::new();
         };
-        // Ringing while its chat is open: seen as it happens.
-        let open = self
-            .active
-            .and_then(|a| self.index.get(a))
-            .is_some_and(|c| !c.is_group() && call_log::belongs(&call, &c.address));
-        if open && !call.seen {
-            call.seen = true;
-            if let Some(c) = self.calls.iter_mut().rev().find(|c| c.date == call.date && call_log::belongs(c, number)) {
-                c.seen = true;
-            }
-        }
         store.upsert_call(&dev, &call);
-        self.attach_calls();
-        let mut out = vec![Effect::RefreshList];
-        if open && let Some(a) = self.active {
-            out.push(Effect::ShowThread(a));
-        }
-        out
+        vec![Effect::Calls]
     }
 
-    /// Put each call in its number's 1:1 chat (a call-only chat when there
-    /// is none), and keep a chat with an unseen missed call unread.
-    /// Idempotent; cheap when nothing changed.
-    pub fn attach_calls(&mut self) {
-        use std::collections::BTreeMap;
-        let key = |n: &str| reconcile::phone_key(n);
-        let mut by_key: BTreeMap<String, Vec<Call>> = BTreeMap::new();
-        for c in &self.calls {
-            by_key.entry(key(&c.number)).or_default().push(c.clone());
-        }
-        // Real 1:1 threads first, so a call-only chat gives way to one.
-        let mut owner: HashMap<String, i64> = HashMap::new();
-        let mut ids: Vec<(bool, i64)> =
-            self.index.conversations.values().map(|c| (c.thread_id < 0, c.thread_id)).collect();
-        ids.sort();
-        let active = self.active;
-        let mut stale_drafts = Vec::new();
-        for (_, tid) in ids {
-            let Some(conv) = self.index.conversations.get_mut(&tid) else {
-                continue;
-            };
-            let k = if conv.is_group() { String::new() } else { key(&conv.address) };
-            let want = match by_key.get(&k) {
-                Some(calls) if !k.is_empty() && !owner.contains_key(&k) => {
-                    owner.insert(k.clone(), tid);
-                    calls.clone()
-                }
-                _ => Vec::new(),
-            };
-            if want.is_empty() && tid < 0 && conv.messages.is_empty() && !conv.calls.is_empty() && active != Some(tid) {
-                stale_drafts.push(tid);
-                continue;
-            }
-            if conv.calls != want {
-                conv.calls = want;
-            }
-            if active != Some(tid) && conv.has_unseen_missed_call() {
-                conv.is_read = false;
-            }
-        }
-        for tid in stale_drafts {
-            self.index.conversations.remove(&tid);
-        }
-        for (k, calls) in by_key {
-            if k.is_empty() || owner.contains_key(&k) {
-                continue;
-            }
-            let draft_id = self.next_draft_id;
-            self.next_draft_id -= 1;
-            let mut conv = Conversation::new(draft_id);
-            conv.address = calls.last().map(|c| c.number.clone()).unwrap_or_default();
-            conv.display_name = name_for(&self.contact_map, &[], &conv.address);
-            conv.calls = calls;
-            conv.is_read = !conv.has_unseen_missed_call();
-            self.index.conversations.insert(draft_id, conv);
+    /// What the calls button shows at `now_ms`.
+    pub fn calls_view(&self, now_ms: i64) -> CallsView {
+        let shown = |c: &Call| CallShown {
+            name: resolve_name(&self.contact_map, &c.number),
+            number: c.number.clone(),
+            date: c.date,
+            missed: c.missed,
+            unseen: c.missed && !c.seen,
+        };
+        CallsView {
+            ringing: call_log::ringing(&self.calls, now_ms).map(|c| (shown(c), c.date + call_log::RING_SHOWN_MS)),
+            missed: self.calls.iter().filter(|c| c.missed && !c.seen).count(),
+            recent: self.calls.iter().rev().take(CALLS_LISTED).map(shown).collect(),
         }
     }
 
-    /// The chat was opened: its calls are seen.
-    fn see_calls(&mut self, thread_id: i64, store: &MessageStore) {
+    /// The calls list was opened: every missed call is seen.
+    pub fn see_calls(&mut self, store: &MessageStore) -> Vec<Effect> {
         let Some(dev) = self.device_id.clone() else {
-            return;
+            return Vec::new();
         };
-        let Some(conv) = self.index.get(thread_id) else {
-            return;
-        };
-        if conv.is_group() || conv.calls.iter().all(|c| c.seen) {
-            return;
-        }
-        let address = conv.address.clone();
-        for c in self.calls.iter_mut().filter(|c| !c.seen && call_log::belongs(c, &address)) {
+        let mut changed = false;
+        for c in self.calls.iter_mut().filter(|c| !c.seen) {
             c.seen = true;
             store.upsert_call(&dev, c);
+            changed = true;
         }
-        if let Some(conv) = self.index.get_mut(thread_id) {
-            for c in &mut conv.calls {
-                c.seen = true;
-            }
-        }
+        if changed { vec![Effect::Calls] } else { Vec::new() }
+    }
+
+    /// "Clear" in the calls list.
+    pub fn clear_calls(&mut self, store: &MessageStore) -> Vec<Effect> {
+        let Some(dev) = self.device_id.clone() else {
+            return Vec::new();
+        };
+        self.calls.clear();
+        store.clear_calls(&dev);
+        vec![Effect::Calls]
     }
 
     /// Re-resolve every display name (contacts changed).
@@ -685,7 +655,6 @@ impl Messages {
             }
         });
         if !msgs.is_empty() {
-            self.attach_calls();
             out.push(Effect::RefreshList);
         }
         out
@@ -745,10 +714,6 @@ impl Messages {
         let resolver = |a: &[String], ad: &str| name_for(contact_map, a, ad);
         let result = self.index.ingest(msg, Some(&all_addrs), &resolver);
 
-        // A new chat may take over a call-only one's calls.
-        if result.created && !self.calls.is_empty() {
-            self.attach_calls();
-        }
         // A newer latest message on a known thread means the phone may have
         // received others in between that it never sent us.
         if result.is_newer && !result.created {
@@ -782,10 +747,6 @@ impl Messages {
                 } else if reopen_unread {
                     // New incoming text on a chat opened earlier but not
                     // being viewed now: unread again.
-                    conv.is_read = false;
-                }
-                // A replayed text doesn't hide an unseen missed call.
-                if !active && conv.has_unseen_missed_call() {
                     conv.is_read = false;
                 }
             }
@@ -858,7 +819,6 @@ impl Messages {
             return out;
         }
         self.active = Some(thread_id);
-        self.see_calls(thread_id, store);
         let Some(conv) = self.index.get_mut(thread_id) else {
             return out;
         };
@@ -924,8 +884,7 @@ impl Messages {
         let me = self.gm_me_keys();
         let mut changed = false;
         for conv in self.index.conversations.values_mut() {
-            // An unseen missed call isn't something Google Messages knows.
-            if conv.is_read || conv.thread_id < 0 || conv.has_unseen_missed_call() {
+            if conv.is_read || conv.thread_id < 0 {
                 continue;
             }
             let key = super::gm::chat_key(&conv.addresses, &conv.address, &me);
@@ -1534,23 +1493,6 @@ impl Messages {
             .get(thread_id)
             .map(|c| if c.addresses.is_empty() { vec![c.address.clone()] } else { c.addresses.clone() })
             .unwrap_or_default();
-        // A 1:1 chat's calls go with it.
-        if let (Some(dev), Some(conv)) = (self.device_id.clone(), self.index.get(thread_id))
-            && !conv.is_group()
-            && !conv.calls.is_empty()
-        {
-            let address = conv.address.clone();
-            let numbers: Vec<String> = self
-                .calls
-                .iter()
-                .filter(|c| call_log::belongs(c, &address))
-                .map(|c| c.number.clone())
-                .collect::<HashSet<_>>()
-                .into_iter()
-                .collect();
-            self.calls.retain(|c| !call_log::belongs(c, &address));
-            store.delete_calls(&dev, &numbers);
-        }
         let key = self.hide_locally(thread_id, hidden, now_ms);
         if can_delete_on_phone && thread_id >= 0 {
             out.push(Effect::DeleteOnPhone { thread_id, addresses });
@@ -1694,11 +1636,8 @@ impl Messages {
                     out.push(Effect::MarkRead { thread_id: primary });
                 }
             } else {
-                conv.is_read = !c.unread && !conv.has_unseen_missed_call();
+                conv.is_read = !c.unread;
             }
-        }
-        if !known && !self.calls.is_empty() {
-            self.attach_calls();
         }
         self.gm_name(primary);
         if let Some(conv) = self.index.get(primary) {
@@ -2467,53 +2406,45 @@ mod tests {
     // ── calls ───────────────────────────────────────────────────────
 
     #[test]
-    fn a_missed_call_is_a_line_in_its_chat_and_unread_until_opened() {
+    fn calls_stay_out_of_the_chats_and_count_until_looked_at() {
         let mut p = Panel::new();
         p.apply(&[tup(1, 10, &["+13165551111"], 1_000)]);
-        assert!(p.m.index.get(10).unwrap().is_read);
-        let fx = p.m.call_event("callReceived", "3165551111", 5_000, &p.store);
-        assert!(fx.contains(&Effect::RefreshList));
+        p.m.contact_map.insert(normalize_phone("+13165551111"), "Avery Lane".into());
+        assert_eq!(p.m.call_event("callReceived", "3165551111", 5_000, &p.store), vec![Effect::Calls]);
+        // Ringing, by name, for a while.
+        let v = p.m.calls_view(6_000);
+        let (who, until) = v.ringing.expect("ringing");
+        assert_eq!((who.name.as_str(), until), ("Avery Lane", 5_000 + call_log::RING_SHOWN_MS));
+        assert!(p.m.calls_view(5_000 + call_log::RING_SHOWN_MS).ringing.is_none());
+        // Missed: no longer ringing, and counted.
         p.m.call_event("missedCall", "3165551111", 20_000, &p.store);
+        let v = p.m.calls_view(21_000);
+        assert!(v.ringing.is_none());
+        assert_eq!(v.missed, 1);
+        assert!(v.recent[0].missed && v.recent[0].unseen);
+        // The chat is untouched: no call in it, its text still the preview.
         let c = p.m.index.get(10).unwrap();
-        assert_eq!(c.calls.len(), 1);
-        assert!(c.calls[0].missed && !c.is_read);
-        assert_eq!(c.sort_key(), 5_000);
-        assert_eq!(c.preview(), "Missed call");
-        let tl = c.timeline();
-        assert_eq!(tl.len(), 2);
-        assert!(tl[1].is_call() && tl[1].uid < 0);
-        // The phone replays the chat's (read) newest text: still unread.
-        p.merge(tup(1, 10, &["+13165551111"], 1_000));
-        assert!(!p.m.index.get(10).unwrap().is_read);
-        // Opening it: read, and the call is seen for good.
-        p.m.select(10, &p.store, 0.0);
-        assert!(p.m.index.get(10).unwrap().is_read);
-        assert!(p.store.load_calls("dev1")[0].seen);
-        // A text after the call: the preview is the text again.
-        p.apply(&[tup(2, 10, &["+13165551111"], 30_000)]);
-        assert_eq!(p.m.index.get(10).unwrap().preview(), "hi");
-    }
-
-    #[test]
-    fn a_call_from_a_new_number_gets_its_own_chat_until_a_text_arrives() {
-        let mut p = Panel::new();
-        p.apply(&[tup(1, 10, &["+13165551111"], 1_000)]);
-        p.m.call_event("missedCall", "+13165552222", 5_000, &p.store);
-        let draft = p.visible().iter().find(|c| c.thread_id < 0).map(|c| (c.thread_id, c.is_read, c.calls.len()));
-        let (draft_id, read, n) = draft.expect("a call-only chat");
-        assert!(!read && n == 1);
-        // The same calls come back after a restart.
+        assert!(c.is_read);
+        assert_eq!((c.preview().as_str(), c.sort_key()), ("hi", 1_000));
+        // A new number makes no chat.
+        p.m.call_event("missedCall", "+13165552222", 30_000, &p.store);
+        assert_eq!(p.visible().len(), 1);
+        let v = p.m.calls_view(31_000);
+        assert_eq!((v.missed, v.recent[0].name.as_str()), (2, "+13165552222"));
+        // They come back after a restart; opening the list sees them.
         let mut again = Messages::new();
         again.reset_for_device(Some("dev1"), true);
-        again.load_cached(&p.store);
-        assert!(again.index.conversations.values().any(|c| c.thread_id < 0 && c.calls.len() == 1));
-        // A text from that number: the calls move into the real chat.
-        p.apply(&[tup(2, 20, &["3165552222"], 9_000)]);
-        assert!(p.m.index.get(draft_id).is_none());
-        assert_eq!(p.m.index.get(20).unwrap().calls.len(), 1);
-        // Hidden callers make no chat.
-        p.m.call_event("missedCall", "unknown number", 10_000, &p.store);
-        assert_eq!(p.visible().len(), 2);
+        assert!(again.load_cached(&p.store).contains(&Effect::Calls));
+        assert_eq!(again.calls_view(31_000).missed, 2);
+        assert_eq!(again.see_calls(&p.store), vec![Effect::Calls]);
+        assert!(again.see_calls(&p.store).is_empty());
+        assert_eq!(again.calls_view(31_000).missed, 0);
+        assert!(p.store.load_calls("dev1").iter().all(|c| c.seen));
+        // Clear empties it for good; hidden callers never count.
+        again.call_event("missedCall", "unknown number", 40_000, &p.store);
+        again.clear_calls(&p.store);
+        assert_eq!(again.calls_view(41_000), CallsView::default());
+        assert!(p.store.load_calls("dev1").is_empty());
     }
 
     // ── read on the phone (Google Messages) ─────────────────────────

@@ -545,11 +545,10 @@ impl MessageStore {
         })
     }
 
-    pub fn delete_calls(&self, device_id: &str, numbers: &[String]) {
-        self.write_txn("delete_calls", |c| {
-            for n in numbers {
-                c.execute("DELETE FROM calls WHERE device_id=? AND number=?", params![device_id, n])?;
-            }
+    /// Every call for a device ("Clear" in the calls list).
+    pub fn clear_calls(&self, device_id: &str) {
+        self.write("clear_calls", |c| {
+            c.execute("DELETE FROM calls WHERE device_id=?", params![device_id])?;
             Ok(())
         });
     }

@@ -1,6 +1,7 @@
 //! The GTK app. Pure logic lives in `core`; this layer only builds widgets,
 //! runs D-Bus calls and applies the controllers' effects.
 
+pub mod calls_button;
 pub mod clipboard_page;
 pub mod conversation_list;
 pub mod files_page;
@@ -142,6 +143,20 @@ button.settings-open { background-color: alpha(currentColor, 0.1); }
 /* Bubbles in em: they keep their shape when the text is zoomed. */
 .message-bubble-sent { padding: 0.45em 0.85em; border-radius: 1.15em 1.15em 0.3em 1.15em; }
 .message-bubble-received { padding: 0.45em 0.85em; border-radius: 1.15em 1.15em 1.15em 0.3em; }
+/* The calls button: a count of missed calls on the icon's corner; green
+   with the caller's name while the phone rings. */
+.calls-badge { min-width: 15px; min-height: 15px; padding: 0 3px; margin: -5px -7px 0 0; border-radius: 8px; background-color: @error_bg_color; color: @error_fg_color; font-size: 10px; font-weight: bold; }
+button.calls-ringing, menubutton.calls-ringing > button { background-color: @success_bg_color; color: @success_fg_color; }
+menubutton.calls-ringing > button:hover { background-color: mix(@success_bg_color, white, 0.12); }
+menubutton.calls-ringing image { animation: calls-ring 1s ease-in-out infinite; }
+@keyframes calls-ring {
+  0% { transform: rotate(0deg); }
+  10% { transform: rotate(-14deg); }
+  20% { transform: rotate(14deg); }
+  30% { transform: rotate(-14deg); }
+  40% { transform: rotate(0deg); }
+  100% { transform: rotate(0deg); }
+}
 .compose-reply-bar { padding: 6px 4px 6px 10px; border-left: 3px solid @accent_color; border-radius: 4px; background-color: alpha(currentColor, 0.05); }
 ";
 
