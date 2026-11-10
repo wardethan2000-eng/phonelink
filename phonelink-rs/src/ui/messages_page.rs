@@ -777,6 +777,13 @@ impl MessagesPage {
     fn list_event(self: &Rc<Self>, e: ListEvent) {
         match e {
             ListEvent::Clicked(_) => self.thread.focus_compose(),
+            ListEvent::Contacts(names) => {
+                let ordinary = crate::core::autocap::dictionary_words();
+                if ordinary.is_none() {
+                    log::info!("capitals: no spelling dictionary, so contacts' names are not capitalized");
+                }
+                self.thread.set_names(crate::core::autocap::Names::new(names.iter().map(String::as_str), ordinary));
+            }
             ListEvent::Start { address, name } => {
                 let effects = self.inner.borrow_mut().m.open_or_create(&address, &name);
                 if effects.is_empty() {

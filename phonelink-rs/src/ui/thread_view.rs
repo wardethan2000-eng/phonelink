@@ -1035,6 +1035,15 @@ fn date_separator(text: &str) -> gtk::Box {
     b
 }
 
+/// `c` as one capital letter (not "ß" → "SS").
+fn capital(c: char) -> Option<String> {
+    let mut upper = c.to_uppercase();
+    match (upper.next(), upper.next()) {
+        (Some(u), None) if u != c => Some(u.to_string()),
+        _ => None,
+    }
+}
+
 // ── the thread view ────────────────────────────────────────────────
 
 /// A message typed in a chat but not sent.
@@ -1108,9 +1117,11 @@ pub struct ThreadView {
     restoring: Cell<bool>,
     /// Whether to capitalize while typing (Settings), asked on each key.
     autocap_on: RefCell<Option<Box<dyn Fn() -> crate::core::autocap::AutocapRules>>>,
-    /// The automatic capital just made (where, and the letter as typed),
-    /// until the next edit: Ctrl+Z then puts the typed letter back.
-    autocap_last: Cell<Option<(i32, char)>>,
+    /// The automatic capital just made (where, what it made, what was
+    /// typed), until the next edit: Ctrl+Z then puts the typing back.
+    autocap_last: RefCell<Option<(i32, String, String)>>,
+    /// Names to capitalize (contacts and the built-in list).
+    names: RefCell<crate::core::autocap::Names>,
     /// Set while a capital is being put in.
     autocap_busy: Cell<bool>,
     /// `(thread_id, text, files, reply_to)` → whether it was taken (then the
@@ -1303,7 +1314,8 @@ impl ThreadView {
             drafts: RefCell::default(),
             restoring: Cell::new(false),
             autocap_on: RefCell::default(),
-            autocap_last: Cell::new(None),
+            autocap_last: RefCell::default(),
+            names: RefCell::new(crate::core::autocap::Names::new([], None)),
             autocap_busy: Cell::new(false),
             on_send: RefCell::default(),
             on_older: RefCell::default(),
@@ -1449,7 +1461,7 @@ impl ThreadView {
                 if let Some(this) = weak.upgrade()
                     && !this.autocap_busy.get()
                 {
-                    this.autocap_last.set(None);
+                    this.autocap_last.take();
                 }
             });
         }
@@ -1999,6 +2011,11 @@ impl ThreadView {
         true
     }
 
+    /// The names to capitalize (when the contacts change).
+    pub fn set_names(&self, names: crate::core::autocap::Names) {
+        *self.names.borrow_mut() = names;
+    }
+
     /// Capitalize while typing, if Settings allow it.
     pub fn set_autocap(&self, on: impl Fn() -> crate::core::autocap::AutocapRules + 'static) {
         *self.autocap_on.borrow_mut() = Some(Box::new(on));
@@ -2008,10 +2025,11 @@ impl ThreadView {
     /// "i" before it). The change goes in right after the insert, before the
     /// next frame is drawn.
     fn autocap_typed(self: &Rc<Self>, ed: &gtk::Editable, typed: &str, pos: i32) {
+        use crate::core::autocap::{Autocap, autocap, ends_word};
         if self.autocap_busy.get() {
             return;
         }
-        self.autocap_last.set(None);
+        self.autocap_last.take();
         let mut chars = typed.chars();
         let (Some(c), None) = (chars.next(), chars.next()) else {
             return; // a paste or a draft put back
@@ -2023,53 +2041,54 @@ impl ThreadView {
             return;
         };
         let before = ed.chars(0, pos);
-        let at = match crate::core::autocap::autocap(&before, c).filter(|fix| rules.allows(fix)) {
-            Some(crate::core::autocap::Autocap::Typed) => pos,
-            Some(crate::core::autocap::Autocap::LoneI) => pos - 1,
-            None => return,
+        // (where, what is there now, what it becomes)
+        let change: Option<(i32, String, String)> = match autocap(&before, c).filter(|fix| rules.allows(fix)) {
+            // The letter goes in after this signal: capitalize it then.
+            Some(Autocap::Typed) => capital(c).map(|u| (pos, c.to_string(), u)),
+            Some(Autocap::LoneI) => Some((pos - 1, "i".into(), "I".into())),
+            None if rules.proper_nouns && ends_word(c) => self.names.borrow().fix(&before).map(|(start, proper)| {
+                let word: String = before.chars().skip(start).collect();
+                (start as i32, word, proper)
+            }),
+            None => None,
         };
+        let Some((at, from, to)) = change else { return };
         let weak = Rc::downgrade(self);
         let ed = ed.clone();
         glib::idle_add_local_full(glib::Priority::HIGH, move || {
-            if let Some(this) = weak.upgrade() {
-                this.capitalize_at(&ed, at);
+            if let Some(this) = weak.upgrade()
+                && this.replace_text(&ed, at, &from, &to)
+            {
+                *this.autocap_last.borrow_mut() = Some((at, to.clone(), from.clone()));
             }
             glib::ControlFlow::Break
         });
     }
 
-    fn capitalize_at(&self, ed: &gtk::Editable, at: i32) {
-        let current = ed.chars(at, at + 1);
-        let mut chars = current.chars();
-        let Some(lower) = chars.next().filter(|c| c.is_lowercase()) else {
-            return;
-        };
-        let mut upper = lower.to_uppercase();
-        let (Some(cap), None) = (upper.next(), upper.next()) else {
-            return; // no single capital (ß)
-        };
-        self.replace_char(ed, at, cap);
-        self.autocap_last.set(Some((at, lower)));
-    }
-
-    /// Put back the letter as typed if the last thing that happened was an
+    /// Put back what was typed if the last thing that happened was an
     /// automatic capital. Whether it did.
     fn undo_autocap(&self) -> bool {
-        let (Some((at, lower)), Some(ed)) = (self.autocap_last.take(), self.entry.delegate()) else {
+        let (Some((at, made, typed)), Some(ed)) = (self.autocap_last.take(), self.entry.delegate()) else {
             return false;
         };
-        self.replace_char(&ed, at, lower);
-        true
+        self.replace_text(&ed, at, &made, &typed)
     }
 
-    fn replace_char(&self, ed: &gtk::Editable, at: i32, c: char) {
+    /// Swap `from` (still there at `at`) for `to`, the cursor kept. Whether
+    /// it did.
+    fn replace_text(&self, ed: &gtk::Editable, at: i32, from: &str, to: &str) -> bool {
+        let len = from.chars().count() as i32;
+        if ed.chars(at, at + len) != from {
+            return false;
+        }
         let cursor = ed.position();
         self.autocap_busy.set(true);
-        ed.delete_text(at, at + 1);
+        ed.delete_text(at, at + len);
         let mut p = at;
-        ed.insert_text(&c.to_string(), &mut p);
+        ed.insert_text(to, &mut p);
         ed.set_position(cursor);
         self.autocap_busy.set(false);
+        true
     }
 
     /// Put the cursor in the compose bar (after a chat was clicked open),

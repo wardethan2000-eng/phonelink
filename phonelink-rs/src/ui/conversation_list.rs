@@ -312,6 +312,8 @@ type SelectedHandler = Box<dyn Fn(i64)>;
 pub enum ListEvent {
     /// A chat was opened with a plain click.
     Clicked(i64),
+    /// The contacts' names changed.
+    Contacts(Vec<String>),
     /// Start (or open) a chat with a suggested contact or typed number.
     Start {
         address: String,
@@ -961,8 +963,10 @@ impl ConversationList {
     }
 
     pub fn set_contacts(&self, contacts: HashMap<String, String>) {
+        let names: Vec<String> = contacts.values().cloned().collect();
         self.state.borrow_mut().contacts = contacts;
         self.update_suggestions();
+        self.emit(ListEvent::Contacts(names));
     }
 
     fn update_suggestions(&self) {

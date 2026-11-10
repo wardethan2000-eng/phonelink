@@ -181,9 +181,13 @@ impl SettingsPage {
         let rules = settings.borrow().autocap_rules();
         let cap_sentences =
             switch_row("Capitalize Sentences", "The first letter of a message and of each sentence", rules.sentences);
-        let cap_i = switch_row("Capitalize “I”", "Also in I'm, I'll, I've and I'd", rules.lone_i);
+        let cap_nouns = switch_row(
+            "Capitalize Proper Nouns",
+            "“I”, your contacts' names, days, months, holidays and some places and brands",
+            rules.proper_nouns,
+        );
         typing.add(&cap_sentences);
-        typing.add(&cap_i);
+        typing.add(&cap_nouns);
         let s = settings.clone();
         cap_sentences.connect_active_notify(move |r| {
             if let Err(e) = s.borrow_mut().set_capitalize_sentences(r.is_active()) {
@@ -191,8 +195,8 @@ impl SettingsPage {
             }
         });
         let s = settings.clone();
-        cap_i.connect_active_notify(move |r| {
-            if let Err(e) = s.borrow_mut().set_capitalize_i(r.is_active()) {
+        cap_nouns.connect_active_notify(move |r| {
+            if let Err(e) = s.borrow_mut().set_capitalize_proper_nouns(r.is_active()) {
                 log::warn!("saving the capitals setting failed: {e}");
             }
         });

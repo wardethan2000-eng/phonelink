@@ -257,7 +257,7 @@ pub struct Settings {
     photos_by_day: bool,
     /// Capitals while typing: at the start of sentences, and for "I".
     capitalize_sentences: bool,
-    capitalize_i: bool,
+    capitalize_proper_nouns: bool,
     /// Keys we do not know (written by Python or a newer version); preserved.
     extra: Map<String, Value>,
 
@@ -298,7 +298,7 @@ impl Settings {
             photos_oldest_first: false,
             photos_by_day: true,
             capitalize_sentences: true,
-            capitalize_i: true,
+            capitalize_proper_nouns: true,
             extra: Map::new(),
             last_written: None,
             batch_depth: 0,
@@ -360,7 +360,11 @@ impl Settings {
         self.photos_oldest_first = py_bool(m.remove("photos_oldest_first"), false);
         self.photos_by_day = py_bool(m.remove("photos_by_day"), true);
         self.capitalize_sentences = py_bool(m.remove("capitalize_sentences"), true);
-        self.capitalize_i = py_bool(m.remove("capitalize_i"), true);
+        self.capitalize_proper_nouns = py_bool(m.remove("capitalize_proper_nouns"), true);
+        // Earlier switches, never released.
+        for old in ["capitalize_i", "capitalize_names"] {
+            m.remove(old);
+        }
         m.remove("auto_capitalize"); // one switch for both, never released
 
         self.hidden = BTreeMap::new();
@@ -414,7 +418,7 @@ impl Settings {
         m.insert("photos_oldest_first".into(), Value::from(self.photos_oldest_first));
         m.insert("photos_by_day".into(), Value::from(self.photos_by_day));
         m.insert("capitalize_sentences".into(), Value::from(self.capitalize_sentences));
-        m.insert("capitalize_i".into(), Value::from(self.capitalize_i));
+        m.insert("capitalize_proper_nouns".into(), Value::from(self.capitalize_proper_nouns));
         serde_json::to_string_pretty(&m).unwrap_or_else(|_| "{}".to_string())
     }
 
@@ -511,7 +515,7 @@ impl Settings {
     }
 
     pub fn autocap_rules(&self) -> AutocapRules {
-        AutocapRules { sentences: self.capitalize_sentences, lone_i: self.capitalize_i }
+        AutocapRules { sentences: self.capitalize_sentences, proper_nouns: self.capitalize_proper_nouns }
     }
 
     pub fn set_capitalize_sentences(&mut self, value: bool) -> io::Result<()> {
@@ -519,8 +523,8 @@ impl Settings {
         self.save()
     }
 
-    pub fn set_capitalize_i(&mut self, value: bool) -> io::Result<()> {
-        self.capitalize_i = value;
+    pub fn set_capitalize_proper_nouns(&mut self, value: bool) -> io::Result<()> {
+        self.capitalize_proper_nouns = value;
         self.save()
     }
 
@@ -852,12 +856,12 @@ mod tests {
     #[test]
     fn capitals_have_two_switches_both_on_at_first() {
         let mut f = fixture();
-        assert_eq!(f.s.autocap_rules(), AutocapRules { sentences: true, lone_i: true });
+        assert_eq!(f.s.autocap_rules(), AutocapRules { sentences: true, proper_nouns: true });
         f.s.set_capitalize_sentences(false).unwrap();
         let mut again = Settings::with_paths(f.path.clone(), f._dir.path().join("autostart"));
         again.load();
-        assert_eq!(again.autocap_rules(), AutocapRules { sentences: false, lone_i: true });
-        again.set_capitalize_i(false).unwrap();
+        assert_eq!(again.autocap_rules(), AutocapRules { sentences: false, proper_nouns: true });
+        again.set_capitalize_proper_nouns(false).unwrap();
         let mut third = Settings::with_paths(f.path.clone(), f._dir.path().join("autostart"));
         third.load();
         assert_eq!(third.autocap_rules(), AutocapRules::OFF);
