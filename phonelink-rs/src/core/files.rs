@@ -12,9 +12,14 @@ pub const THUMB_SIZE: i32 = 160;
 pub const MAX_RECENT_PHOTOS: usize = 200;
 /// `refresh_from_phone` runs at most this often.
 pub const PHONE_REFRESH_MIN_INTERVAL_SECONDS: f64 = 30.0;
-/// After `startBrowsing`, poll `isMounted` this many times, this far apart.
-pub const BROWSE_POLLS: u32 = 10;
-pub const BROWSE_POLL_MS: u64 = 500;
+/// KDE Connect says "mounted" as soon as it starts sshfs, before sshfs has
+/// connected: check the storage this many times, this far apart, before
+/// giving up on a mount.
+pub const MOUNT_READY_POLLS: u32 = 16;
+pub const MOUNT_READY_POLL_MS: u64 = 500;
+/// One look at the mount (a stalled sftp link can hang a read) takes at
+/// most this long.
+pub const MOUNT_CHECK_TIMEOUT_MS: u64 = 4000;
 
 const IMAGE_EXTS: [&str; 8] = ["jpg", "jpeg", "png", "gif", "webp", "bmp", "heic", "heif"];
 
@@ -344,9 +349,157 @@ impl RefreshLimit {
     }
 }
 
+/// When the phone's storage drops, mount again after a growing wait, but
+/// only a few times in a row: an sshfs that keeps failing (a dead mount
+/// left by a crash, issue #12) otherwise mounts and drops forever, with a
+/// KDE Connect error notification each time.
+#[derive(Debug, Default)]
+pub struct RemountGuard {
+    drops: Vec<f64>,
+}
+
+/// Drops further apart than this don't add up.
+pub const REMOUNT_WINDOW_SECONDS: f64 = 120.0;
+
+impl RemountGuard {
+    /// The mount dropped or failed at `now`: how long to wait before trying
+    /// again, or `None` to stop and let the user retry.
+    pub fn dropped(&mut self, now: f64) -> Option<f64> {
+        self.drops.retain(|t| now - t < REMOUNT_WINDOW_SECONDS);
+        self.drops.push(now);
+        match self.drops.len() {
+            1 => Some(1.0),
+            2 => Some(4.0),
+            3 => Some(10.0),
+            _ => None,
+        }
+    }
+
+    /// The user asked to try again, or another phone: start over.
+    pub fn reset(&mut self) {
+        self.drops.clear();
+    }
+}
+
+/// What is at the mount point.
+#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+pub enum MountCheck {
+    /// Mounted and readable.
+    Ready,
+    /// Nothing mounted there (yet).
+    Absent,
+    /// Mounted but dead: sshfs is gone and reads fail ("Transport endpoint
+    /// is not connected"). Only a lazy unmount clears it.
+    Stale,
+}
+
+/// `\040`-style escapes in `/proc/self/mountinfo` paths.
+fn unescape_mountinfo(field: &str) -> String {
+    let b = field.as_bytes();
+    let mut out = Vec::with_capacity(b.len());
+    let mut i = 0;
+    while i < b.len() {
+        if b[i] == b'\\'
+            && i + 3 < b.len()
+            && let Ok(v) = u8::from_str_radix(&field[i + 1..i + 4], 8)
+        {
+            out.push(v);
+            i += 4;
+            continue;
+        }
+        out.push(b[i]);
+        i += 1;
+    }
+    String::from_utf8_lossy(&out).into_owned()
+}
+
+/// Whether `mountinfo` (the text of `/proc/self/mountinfo`) lists a mount
+/// at `mount_point`.
+pub fn mountinfo_lists(mountinfo: &str, mount_point: &str) -> bool {
+    let want = mount_point.trim_end_matches('/');
+    mountinfo.lines().filter_map(|l| l.split_whitespace().nth(4)).any(|m| unescape_mountinfo(m) == want)
+}
+
+/// Look at the mount point (blocking: run it off the main thread). Before
+/// sshfs connects it is an empty folder; the phone's storage is a mount
+/// with something in it.
+pub fn check_mount(mount_point: &Path) -> MountCheck {
+    match std::fs::read_dir(mount_point) {
+        // ENOTCONN: the FUSE server (sshfs) is gone.
+        Err(e) if e.raw_os_error() == Some(107) => MountCheck::Stale,
+        Err(_) => MountCheck::Absent,
+        Ok(mut entries) => {
+            let info = std::fs::read_to_string("/proc/self/mountinfo").unwrap_or_default();
+            if mountinfo_lists(&info, &mount_point.to_string_lossy()) || entries.next().is_some() {
+                MountCheck::Ready
+            } else {
+                MountCheck::Absent
+            }
+        }
+    }
+}
+
+/// Clear a dead mount (blocking). KDE Connect runs `fusermount -u`, which
+/// refuses a mount that is "busy"; the lazy `-z` always detaches it.
+pub fn clear_stale_mount(mount_point: &Path) {
+    for tool in ["fusermount3", "fusermount"] {
+        let done = std::process::Command::new(tool)
+            .args(["-u", "-z"])
+            .arg(mount_point)
+            .stdin(std::process::Stdio::null())
+            .stdout(std::process::Stdio::null())
+            .stderr(std::process::Stdio::null())
+            .status();
+        if done.is_ok_and(|s| s.success()) {
+            log::info!("files: cleared a dead mount at {}", mount_point.display());
+            return;
+        }
+    }
+    log::warn!("files: could not clear the dead mount at {}", mount_point.display());
+}
+
 #[cfg(test)]
 mod tests {
     use super::*;
+
+    #[test]
+    fn remounts_back_off_then_stop_until_asked() {
+        let mut g = RemountGuard::default();
+        assert_eq!(g.dropped(0.0), Some(1.0));
+        assert_eq!(g.dropped(3.0), Some(4.0));
+        assert_eq!(g.dropped(10.0), Some(10.0));
+        // A fourth drop in a row: stop.
+        assert_eq!(g.dropped(25.0), None);
+        assert_eq!(g.dropped(26.0), None);
+        g.reset();
+        assert_eq!(g.dropped(30.0), Some(1.0));
+        // A drop long after the last ones starts over.
+        let mut g = RemountGuard::default();
+        g.dropped(0.0);
+        g.dropped(5.0);
+        assert_eq!(g.dropped(5.0 + REMOUNT_WINDOW_SECONDS + 1.0), Some(1.0));
+    }
+
+    #[test]
+    fn finds_a_mount_point_in_mountinfo() {
+        let info = "22 1 0:21 / /proc rw,nosuid - proc proc rw\n\
+                    98 29 0:52 / /run/user/1000/abc123 rw,nosuid,nodev - fuse.sshfs kdeconnect@192.168.1.5:/ rw\n\
+                    99 29 0:53 / /mnt/my\\040disk rw - ext4 /dev/sdb1 rw\n";
+        assert!(mountinfo_lists(info, "/run/user/1000/abc123"));
+        assert!(mountinfo_lists(info, "/run/user/1000/abc123/"));
+        assert!(!mountinfo_lists(info, "/run/user/1000/abc"));
+        assert!(mountinfo_lists(info, "/mnt/my disk"));
+        assert!(!mountinfo_lists("", "/run/user/1000/abc123"));
+    }
+
+    #[test]
+    fn an_empty_folder_is_not_mounted_yet() {
+        let t = tempfile::tempdir().unwrap();
+        assert_eq!(check_mount(t.path()), MountCheck::Absent);
+        assert_eq!(check_mount(&t.path().join("missing")), MountCheck::Absent);
+        std::fs::create_dir(t.path().join("storage")).unwrap();
+        assert_eq!(check_mount(t.path()), MountCheck::Ready);
+    }
 
     fn touch(p: &Path, age_s: u64) {
         std::fs::create_dir_all(p.parent().unwrap()).unwrap();

@@ -530,6 +530,9 @@ fn main() {
 
         let mount = fake_phone_storage().to_string_lossy().into_owned();
         let mounted = std::rc::Rc::new(std::cell::Cell::new(false));
+        // `DEMO_SFTP_DROPS=1`: every mount drops a second later, as when
+        // sshfs can't use the mount point (issue #12).
+        let drops = std::env::var_os("DEMO_SFTP_DROPS").is_some();
         let sftp = gio::DBusNodeInfo::for_xml(SFTP_XML).unwrap();
         conn.register_object(&format!("{path}/sftp"), &sftp.lookup_interface(IFACE_SFTP).unwrap())
             .method_call(move |conn, _, path, iface, method, _, inv| match method {
@@ -539,13 +542,23 @@ fn main() {
                     mounted.set(true);
                     // Like the phone: the mount takes a moment.
                     let (conn, path, iface) = (conn.clone(), path.to_string(), iface.unwrap().to_string());
+                    let m = mounted.clone();
                     glib::timeout_add_local_once(std::time::Duration::from_millis(1500), move || {
                         conn.emit_signal(None, &path, &iface, "mounted", None).unwrap();
                         inv.return_value(Some(&(true,).to_variant()));
+                        if drops {
+                            glib::timeout_add_local_once(std::time::Duration::from_millis(1000), move || {
+                                m.set(false);
+                                conn.emit_signal(None, &path, &iface, "unmounted", None).unwrap();
+                            });
+                        }
                     });
                 }
                 "mountPoint" => inv.return_value(Some(&(mount.as_str(),).to_variant())),
-                "getMountError" => inv.return_value(Some(&("",).to_variant())),
+                "getMountError" => {
+                    let e = if drops { "Error when accessing filesystem. sshfs finished with exit code 1" } else { "" };
+                    inv.return_value(Some(&(e,).to_variant()))
+                }
                 "getDirectories" => {
                     let dirs = glib::VariantDict::new(None);
                     dirs.insert_value(&format!("{mount}/storage/emulated/0"), &"All files".to_variant());

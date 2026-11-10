@@ -531,10 +531,6 @@ impl Client {
         self.sftp_bool(device_id, "mountAndWait", MOUNT_TIMEOUT_MS).await
     }
 
-    pub async fn sftp_start_browsing(&self, device_id: &str) -> bool {
-        self.sftp_bool(device_id, "startBrowsing", MOUNT_TIMEOUT_MS).await
-    }
-
     pub async fn sftp_unmount(&self, device_id: &str) {
         self.call(&Self::sftp_path(device_id), IFACE_SFTP, "unmount", None, None).await;
     }

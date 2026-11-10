@@ -87,12 +87,18 @@ struct State {
     /// Browse rows and what they stand for.
     entries: Vec<(gtk::ListBoxRow, files::Entry)>,
     refresh: RefreshLimit,
+    /// Automatic remounts after a drop (a few, then the "Try Again" page).
+    remounts: files::RemountGuard,
+    /// The next automatic remount, while one waits.
+    retry: Option<glib::SourceId>,
     subs: Vec<Subscription>,
 }
 
 pub struct FilesPage {
     pub widget: gtk::Stack,
     status: adw::StatusPage,
+    /// The storage keeps failing to mount: why, and "Try Again".
+    trouble: adw::StatusPage,
     spinner: gtk::Spinner,
     shortcuts_list: gtk::ListBox,
     view_stack: adw::ViewStack,
@@ -136,6 +142,38 @@ fn flat_icon(icon: &str, tooltip: &str) -> gtk::Button {
     b
 }
 
+/// One look at the mount point, off the main thread; a look that hangs
+/// (a stalled sftp link) counts as there.
+async fn check_once(mount_point: &str) -> files::MountCheck {
+    let p = PathBuf::from(mount_point);
+    let look = gio::spawn_blocking(move || files::check_mount(&p));
+    match glib::future_with_timeout(Duration::from_millis(files::MOUNT_CHECK_TIMEOUT_MS), look).await {
+        Ok(Ok(check)) => check,
+        Ok(Err(_)) => files::MountCheck::Absent,
+        Err(_) => files::MountCheck::Ready,
+    }
+}
+
+/// Wait for a fresh mount to answer (sshfs connects a moment after KDE
+/// Connect says "mounted").
+async fn mount_state(mount_point: &str) -> files::MountCheck {
+    for i in 0..files::MOUNT_READY_POLLS {
+        if i > 0 {
+            glib::timeout_future(Duration::from_millis(files::MOUNT_READY_POLL_MS)).await;
+        }
+        match check_once(mount_point).await {
+            files::MountCheck::Absent => {}
+            found => return found,
+        }
+    }
+    files::MountCheck::Absent
+}
+
+async fn clear_stale(mount_point: &str) {
+    let p = PathBuf::from(mount_point);
+    let _ = gio::spawn_blocking(move || files::clear_stale_mount(&p)).await;
+}
+
 fn uri_of(path: &Path) -> String {
     gio::File::for_path(path).uri().to_string()
 }
@@ -169,6 +207,16 @@ impl FilesPage {
         mounting.append(&l);
         widget.add_named(&mounting, Some("mounting"));
 
+        let trouble = adw::StatusPage::new();
+        trouble.set_icon_name(Some(&icons::resolve("dialog-warning-symbolic")));
+        trouble.set_title("Can't Open the Phone's Storage");
+        let try_again = gtk::Button::with_label("Try Again");
+        try_again.add_css_class("pill");
+        try_again.add_css_class("suggested-action");
+        try_again.set_halign(gtk::Align::Center);
+        trouble.set_child(Some(&try_again));
+        widget.add_named(&trouble, Some("trouble"));
+
         let content = gtk::Box::new(gtk::Orientation::Horizontal, 0);
         widget.add_named(&content, Some("content"));
 
@@ -201,6 +249,20 @@ impl FilesPage {
         send_row.append(&send_label);
         send_btn.set_child(Some(&send_row));
         sidebar.append(&send_btn);
+        // Mount the phone's storage afresh (issue #12): clears a dead mount
+        // left behind by a crash, then mounts and reloads.
+        let reconnect_btn = gtk::Button::new();
+        reconnect_btn.add_css_class("flat");
+        reconnect_btn.set_margin_start(8);
+        reconnect_btn.set_margin_end(8);
+        reconnect_btn.set_tooltip_text(Some("Mount the phone's storage again and reload"));
+        let reconnect_row = gtk::Box::new(gtk::Orientation::Horizontal, 8);
+        reconnect_row.append(&gtk::Image::from_icon_name("view-refresh-symbolic"));
+        let reconnect_label = gtk::Label::new(Some("Reconnect Phone Storage"));
+        reconnect_label.set_xalign(0.0);
+        reconnect_row.append(&reconnect_label);
+        reconnect_btn.set_child(Some(&reconnect_row));
+        sidebar.append(&reconnect_btn);
         content.append(&sidebar);
         content.append(&gtk::Separator::new(gtk::Orientation::Vertical));
 
@@ -332,6 +394,7 @@ impl FilesPage {
         let this = Rc::new(Self {
             widget,
             status,
+            trouble,
             spinner,
             shortcuts_list,
             view_stack,
@@ -396,6 +459,14 @@ impl FilesPage {
                 this.send_files();
             }
         });
+        for b in [&reconnect_btn, &try_again] {
+            let weak = Rc::downgrade(&this);
+            b.connect_clicked(move |_| {
+                if let Some(this) = weak.upgrade() {
+                    this.reconnect();
+                }
+            });
+        }
         let weak = Rc::downgrade(&this);
         select_all.connect_clicked(move |_| {
             if let Some(this) = weak.upgrade() {
@@ -479,6 +550,12 @@ impl FilesPage {
             let id = device.map(|d| d.id.clone());
             let reachable = device.is_some_and(|d| d.reachable);
             let fresh = reachable && (s.device_id != id || !s.reachable);
+            if fresh || !reachable {
+                s.remounts.reset();
+                if let Some(t) = s.retry.take() {
+                    t.remove();
+                }
+            }
             if s.device_id != id {
                 s.subs.clear();
                 s.mounted = false;
@@ -526,9 +603,17 @@ impl FilesPage {
         for name in ["mounted", "unmounted"] {
             let weak = Rc::downgrade(self);
             subs.push(signals::subscribe(client.bus(), &path, IFACE_SFTP, name, move |_| {
-                if let Some(this) = weak.upgrade() {
-                    let mounted = name == "mounted";
-                    this.sync_mount(mounted, false);
+                let Some(this) = weak.upgrade() else { return };
+                // A mount of ours in progress reads the outcome itself.
+                if this.state.borrow().mounting {
+                    return;
+                }
+                if name == "mounted" {
+                    this.sync_mount(true, false);
+                } else if this.state.borrow().mounted {
+                    // sshfs went away: mount again after a pause, a few times.
+                    let mount_point = this.state.borrow().mount_point.clone();
+                    this.mount_failed(files::MountCheck::Absent, mount_point, None);
                 }
             }));
         }
@@ -546,6 +631,9 @@ impl FilesPage {
     /// Locations when the mount point changed, then load photos if asked.
     fn sync_mount(self: &Rc<Self>, load_photos: bool, load_if_photo_view_empty: bool) {
         let Some((client, id)) = self.current() else { return };
+        if self.state.borrow().mounting {
+            return;
+        }
         let weak = Rc::downgrade(self);
         glib::spawn_future_local(async move {
             let st = client.fetch_sftp_state(&id).await;
@@ -562,6 +650,13 @@ impl FilesPage {
                 }
                 this.update_mount_ui();
                 this.start_mount();
+                return;
+            }
+            // The daemon says mounted; make sure the storage is really there.
+            let check = mount_state(&st.mount_point).await;
+            let Some(this) = weak.upgrade() else { return };
+            if check != files::MountCheck::Ready {
+                this.mount_failed(check, st.mount_point, None);
                 return;
             }
             let changed = {
@@ -587,64 +682,166 @@ impl FilesPage {
         });
     }
 
-    /// `mountAndWait` (30 s); if that fails, `startBrowsing` and poll
-    /// `isMounted` for 5 s; else show the daemon's mount error.
+    /// `mountAndWait` (KDE Connect's 10 s timeout), then wait for the
+    /// storage to answer: the daemon says "mounted" when it starts sshfs,
+    /// not when sshfs has connected. A dead mount from an earlier crash is
+    /// cleared first, or sshfs can't mount there.
     fn start_mount(self: &Rc<Self>) {
         let Some((client, id)) = self.current() else { return };
         if std::mem::replace(&mut self.state.borrow_mut().mounting, true) {
             return;
         }
+        if let Some(t) = self.state.borrow_mut().retry.take() {
+            t.remove();
+        }
         self.widget.set_visible_child_name("mounting");
         self.spinner.start();
         let weak = Rc::downgrade(self);
         glib::spawn_future_local(async move {
-            let mut ok = client.sftp_mount_and_wait(&id).await;
-            if !ok && client.sftp_start_browsing(&id).await {
-                for _ in 0..files::BROWSE_POLLS {
-                    if client.sftp_is_mounted(&id).await {
-                        break;
-                    }
-                    glib::timeout_future(Duration::from_millis(files::BROWSE_POLL_MS)).await;
-                }
-                ok = client.sftp_is_mounted(&id).await;
+            let point = client.sftp_mount_point(&id).await;
+            if !point.is_empty() && check_once(&point).await == files::MountCheck::Stale {
+                clear_stale(&point).await;
             }
-            let result = if ok { Ok(client.fetch_sftp_state(&id).await) } else { Err(client.sftp_get_mount_error(&id).await) };
+            let ok = client.sftp_mount_and_wait(&id).await;
+            let st = client.fetch_sftp_state(&id).await;
+            let check = if ok && st.mounted && !st.mount_point.is_empty() {
+                mount_state(&st.mount_point).await
+            } else {
+                files::MountCheck::Absent
+            };
             let Some(this) = weak.upgrade() else { return };
             this.state.borrow_mut().mounting = false;
             if this.state.borrow().device_id.as_deref() != Some(id.as_str()) {
                 return;
             }
             this.spinner.stop();
+            if check != files::MountCheck::Ready {
+                let error = if ok { None } else { Some(client.sftp_get_mount_error(&id).await) };
+                if let Some(this) = weak.upgrade() {
+                    let at = if st.mount_point.is_empty() { point } else { st.mount_point };
+                    this.mount_failed(check, at, error);
+                }
+                return;
+            }
             {
                 let mut s = this.state.borrow_mut();
-                match &result {
-                    Ok(st) => {
-                        s.mounted = true;
-                        s.mount_point = st.mount_point.clone();
-                        s.directories = st.directories.clone();
-                    }
-                    Err(_) => {
-                        s.mounted = false;
-                        s.mount_point.clear();
-                        s.directories.clear();
-                    }
-                }
+                s.mounted = true;
+                s.mount_point = st.mount_point.clone();
+                s.directories = st.directories.clone();
                 s.storage_base = files::storage_base(&s.directories, &s.mount_point);
-            }
-            if let Err(e) = &result {
-                let text = format!("Mount failed: {e}");
-                this.photo_status.set_label(&text);
-                this.status_bar.set_label(&text);
             }
             this.update_mount_ui();
             this.build_shortcuts();
             this.widget.set_visible_child_name("content");
-            let ready = {
-                let s = this.state.borrow();
-                s.mounted && !s.mount_point.is_empty()
-            };
-            if ready {
-                this.load_recent_photos();
+            this.load_recent_photos();
+        });
+    }
+
+    /// The storage didn't mount, or dropped: clear a dead mount, then mount
+    /// again after a growing pause; after a few failures in a row, stop and
+    /// show why, with "Try Again" (issue #12: it used to remount at once,
+    /// forever).
+    fn mount_failed(self: &Rc<Self>, check: files::MountCheck, mount_point: String, error: Option<String>) {
+        let Some((client, id)) = self.current() else { return };
+        let wait = {
+            let mut s = self.state.borrow_mut();
+            s.mounted = false;
+            s.mount_point.clear();
+            s.directories.clear();
+            s.storage_base.clear();
+            let now = self.started.elapsed().as_secs_f64();
+            s.remounts.dropped(now)
+        };
+        let next = match wait {
+            Some(w) => format!("trying again in {w} s"),
+            None => "stopped trying".to_string(),
+        };
+        log::warn!("files: the phone's storage didn't mount ({check:?}); {next}");
+        self.update_mount_ui();
+        self.build_shortcuts();
+        self.widget.set_visible_child_name("content");
+        let weak = Rc::downgrade(self);
+        glib::spawn_future_local(async move {
+            // Stop the daemon's sshfs, then detach a dead mount it leaves.
+            client.sftp_unmount(&id).await;
+            let stale = check == files::MountCheck::Stale
+                || (!mount_point.is_empty() && check_once(&mount_point).await == files::MountCheck::Stale);
+            if stale && !mount_point.is_empty() {
+                clear_stale(&mount_point).await;
+            }
+            let Some(this) = weak.upgrade() else { return };
+            if this.state.borrow().device_id.as_deref() != Some(id.as_str()) {
+                return;
+            }
+            match wait {
+                Some(secs) => {
+                    let weak = Rc::downgrade(&this);
+                    let t = glib::timeout_add_local_once(Duration::from_secs_f64(secs), move || {
+                        let Some(this) = weak.upgrade() else { return };
+                        let go = {
+                            let mut s = this.state.borrow_mut();
+                            s.retry = None;
+                            s.reachable && !s.mounted && s.device_id.as_deref() == Some(id.as_str())
+                        };
+                        if go {
+                            this.start_mount();
+                        }
+                    });
+                    if let Some(old) = this.state.borrow_mut().retry.replace(t) {
+                        old.remove();
+                    }
+                }
+                None => {
+                    let error = match error {
+                        Some(e) if !e.is_empty() => e,
+                        _ => client.sftp_get_mount_error(&id).await,
+                    };
+                    let Some(this) = weak.upgrade() else { return };
+                    this.show_trouble(&error);
+                }
+            }
+        });
+    }
+
+    fn show_trouble(&self, error: &str) {
+        let why = if error.is_empty() { String::new() } else { format!("KDE Connect says: {error}\n\n") };
+        self.trouble.set_description(Some(&format!(
+            "{why}The connection to your phone's files keeps dropping. Try again; if it keeps \
+             happening, check that KDE Connect on the phone may access files, or restart KDE \
+             Connect on this computer."
+        )));
+        self.widget.set_visible_child_name("trouble");
+    }
+
+    /// "Try Again" and "Reconnect Phone Storage": unmount, clear a dead
+    /// mount, mount again and reload.
+    fn reconnect(self: &Rc<Self>) {
+        let Some((client, id)) = self.current() else { return };
+        {
+            let mut s = self.state.borrow_mut();
+            if s.mounting || !s.reachable {
+                return;
+            }
+            s.remounts.reset();
+            if let Some(t) = s.retry.take() {
+                t.remove();
+            }
+            s.mounted = false;
+            s.mount_point.clear();
+            s.directories.clear();
+            s.storage_base.clear();
+        }
+        self.update_mount_ui();
+        self.widget.set_visible_child_name("mounting");
+        let weak = Rc::downgrade(self);
+        glib::spawn_future_local(async move {
+            client.sftp_unmount(&id).await;
+            let point = client.sftp_mount_point(&id).await;
+            if !point.is_empty() && check_once(&point).await == files::MountCheck::Stale {
+                clear_stale(&point).await;
+            }
+            if let Some(this) = weak.upgrade() {
+                this.start_mount();
             }
         });
     }
