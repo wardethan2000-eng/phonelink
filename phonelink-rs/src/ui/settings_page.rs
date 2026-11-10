@@ -176,7 +176,20 @@ impl SettingsPage {
             );
         }
         startup.add(&open_on_login);
-        content.add_named(&page_with(&[&startup]), Some("general"));
+        let typing = group("Typing");
+        let autocap = switch_row(
+            "Capitalize Automatically",
+            "Start sentences and the word “I” with a capital letter",
+            settings.borrow().auto_capitalize(),
+        );
+        typing.add(&autocap);
+        let s = settings.clone();
+        autocap.connect_active_notify(move |r| {
+            if let Err(e) = s.borrow_mut().set_auto_capitalize(r.is_active()) {
+                log::warn!("saving the capitals setting failed: {e}");
+            }
+        });
+        content.add_named(&page_with(&[&startup, &typing]), Some("general"));
 
         // Google Messages.
         let gm_group = group("Google Messages");

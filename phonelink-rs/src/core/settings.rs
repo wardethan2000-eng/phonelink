@@ -253,6 +253,8 @@ pub struct Settings {
     photos_as_list: bool,
     photos_oldest_first: bool,
     photos_by_day: bool,
+    /// Capitals at the start of sentences and for "I" while typing.
+    auto_capitalize: bool,
     /// Keys we do not know (written by Python or a newer version); preserved.
     extra: Map<String, Value>,
 
@@ -292,6 +294,7 @@ impl Settings {
             photos_as_list: false,
             photos_oldest_first: false,
             photos_by_day: true,
+            auto_capitalize: true,
             extra: Map::new(),
             last_written: None,
             batch_depth: 0,
@@ -352,6 +355,7 @@ impl Settings {
         self.photos_as_list = py_bool(m.remove("photos_as_list"), false);
         self.photos_oldest_first = py_bool(m.remove("photos_oldest_first"), false);
         self.photos_by_day = py_bool(m.remove("photos_by_day"), true);
+        self.auto_capitalize = py_bool(m.remove("auto_capitalize"), true);
 
         self.hidden = BTreeMap::new();
         if let Some(Value::Object(devices)) = m.remove("hidden_conversations") {
@@ -403,6 +407,7 @@ impl Settings {
         m.insert("photos_as_list".into(), Value::from(self.photos_as_list));
         m.insert("photos_oldest_first".into(), Value::from(self.photos_oldest_first));
         m.insert("photos_by_day".into(), Value::from(self.photos_by_day));
+        m.insert("auto_capitalize".into(), Value::from(self.auto_capitalize));
         serde_json::to_string_pretty(&m).unwrap_or_else(|_| "{}".to_string())
     }
 
@@ -495,6 +500,15 @@ impl Settings {
             return Ok(());
         }
         (self.window_width, self.window_height, self.window_maximized) = (w, h, maximized);
+        self.save()
+    }
+
+    pub fn auto_capitalize(&self) -> bool {
+        self.auto_capitalize
+    }
+
+    pub fn set_auto_capitalize(&mut self, value: bool) -> io::Result<()> {
+        self.auto_capitalize = value;
         self.save()
     }
 

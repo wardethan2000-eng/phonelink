@@ -290,6 +290,8 @@ impl MessagesPage {
             this.switch_to_gm(&dev);
             this.show_gm_banner("Connecting to Google Messages…", None);
         }
+        let settings = this.inner.borrow().settings.clone();
+        this.thread.set_autocap(move || settings.try_borrow().map_or(true, |s| s.auto_capitalize()));
         let saved_scale = this.inner.borrow().settings.borrow().message_font_scale();
         let weak = Rc::downgrade(&this);
         this.thread.set_zoom(saved_scale, move |scale| {

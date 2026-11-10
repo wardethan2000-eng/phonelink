@@ -1106,6 +1106,14 @@ pub struct ThreadView {
     drafts: RefCell<HashMap<i64, Draft>>,
     /// Set while a draft is put back, so that is not "typing".
     restoring: Cell<bool>,
+    /// Whether to capitalize while typing (Settings), asked on each key.
+    autocap_on: RefCell<Option<Box<dyn Fn() -> bool>>>,
+    /// Where the last automatic capital went, and a spot where it was
+    /// backspaced away (typed again there, the letter stays as typed).
+    autocap_last: Cell<Option<i32>>,
+    autocap_skip: Cell<Option<i32>>,
+    /// Set while a capital is being put in.
+    autocap_busy: Cell<bool>,
     /// `(thread_id, text, files, reply_to)` → whether it was taken (then the
     /// compose bar clears).
     on_send: RefCell<Option<SendHandler>>,
@@ -1295,6 +1303,10 @@ impl ThreadView {
             pending: RefCell::default(),
             drafts: RefCell::default(),
             restoring: Cell::new(false),
+            autocap_on: RefCell::default(),
+            autocap_last: Cell::new(None),
+            autocap_skip: Cell::new(None),
+            autocap_busy: Cell::new(false),
             on_send: RefCell::default(),
             on_older: RefCell::default(),
             on_typing: RefCell::default(),
@@ -1426,6 +1438,27 @@ impl ThreadView {
                 f(tid);
             }
         });
+        // Capitals at the start of a sentence and for "I", as typed.
+        if let Some(text) = entry.delegate() {
+            let weak = Rc::downgrade(&this);
+            text.connect_insert_text(move |ed, typed, pos| {
+                if let Some(this) = weak.upgrade() {
+                    this.autocap_typed(ed, typed, *pos);
+                }
+            });
+            let weak = Rc::downgrade(&this);
+            text.connect_delete_text(move |_, start, end| {
+                if let Some(this) = weak.upgrade()
+                    && !this.autocap_busy.get()
+                    && let Some(at) = this.autocap_last.get()
+                    && end - start == 1
+                    && start == at
+                {
+                    this.autocap_last.set(None);
+                    this.autocap_skip.set(Some(at));
+                }
+            });
+        }
         // Ctrl+V / Shift+Insert with a picture on the clipboard attaches it.
         let keys = gtk::EventControllerKey::new();
         keys.set_propagation_phase(gtk::PropagationPhase::Capture);
@@ -1961,6 +1994,61 @@ impl ThreadView {
             a.set_value(v);
         }
         true
+    }
+
+    /// Capitalize while typing, if Settings allow it.
+    pub fn set_autocap(&self, on: impl Fn() -> bool + 'static) {
+        *self.autocap_on.borrow_mut() = Some(Box::new(on));
+    }
+
+    /// One character was typed at `pos`: queue its capital (or the lone
+    /// "i" before it). The change goes in right after the insert, before the
+    /// next frame is drawn.
+    fn autocap_typed(self: &Rc<Self>, ed: &gtk::Editable, typed: &str, pos: i32) {
+        let mut chars = typed.chars();
+        let (Some(c), None) = (chars.next(), chars.next()) else {
+            return; // a paste or a draft put back
+        };
+        if self.autocap_busy.get() || self.restoring.get() || !self.autocap_on.borrow().as_ref().is_some_and(|f| f()) {
+            return;
+        }
+        if self.autocap_skip.take() == Some(pos) && c.is_lowercase() {
+            return; // the user took this capital back
+        }
+        let before = ed.chars(0, pos);
+        let at = match crate::core::autocap::autocap(&before, c) {
+            Some(crate::core::autocap::Autocap::Typed) => pos,
+            Some(crate::core::autocap::Autocap::LoneI) => pos - 1,
+            None => return,
+        };
+        let weak = Rc::downgrade(self);
+        let ed = ed.clone();
+        glib::idle_add_local_full(glib::Priority::HIGH, move || {
+            if let Some(this) = weak.upgrade() {
+                this.capitalize_at(&ed, at);
+            }
+            glib::ControlFlow::Break
+        });
+    }
+
+    fn capitalize_at(&self, ed: &gtk::Editable, at: i32) {
+        let current = ed.chars(at, at + 1);
+        let mut chars = current.chars();
+        let Some(lower) = chars.next().filter(|c| c.is_lowercase()) else {
+            return;
+        };
+        let mut upper = lower.to_uppercase();
+        let (Some(cap), None) = (upper.next(), upper.next()) else {
+            return; // no single capital (ß)
+        };
+        let cursor = ed.position();
+        self.autocap_busy.set(true);
+        ed.delete_text(at, at + 1);
+        let mut p = at;
+        ed.insert_text(&cap.to_string(), &mut p);
+        ed.set_position(cursor);
+        self.autocap_busy.set(false);
+        self.autocap_last.set(Some(at));
     }
 
     /// Put the cursor in the compose bar (after a chat was clicked open),

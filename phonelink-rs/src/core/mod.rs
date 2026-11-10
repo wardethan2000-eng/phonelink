@@ -2,6 +2,7 @@
 
 pub mod compat;
 pub mod attachments;
+pub mod autocap;
 pub mod calls;
 pub mod clipboard;
 pub mod contacts;
