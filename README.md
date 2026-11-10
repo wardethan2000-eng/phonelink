@@ -8,7 +8,7 @@ PhoneRelay brings your Android phone's texts, notifications and files to your Li
 
 ## Features
 
-- **Texts** — every conversation from the phone; send texts and pictures from the desktop
+- **Texts** — every conversation from the phone; send texts and pictures from the desktop, with capitals at sentence starts and for names as you type (each can be turned off)
 - **Search** — finds a word in any message, however old; opening a result jumps to that message. **Ctrl+F** searches inside one chat
 - **Contact names** — learned from notifications and calls, or imported from Google Contacts (one click: **Settings** (gear button) **→ Google Contacts → Connect**), a VCF or a CSV
 - **Notifications** — live phone notifications in a side tray; expand, dismiss or reply from the desktop
@@ -199,8 +199,9 @@ The header bar is always visible and shows:
 ### Messages Tab
 
 - Conversations are listed on the left, sorted by most recent
-- Click a conversation to open the full message thread on the right
-- Type in the compose bar at the bottom and press **Enter** or click **Send**
+- Click a conversation to open the full message thread on the right, ready to type
+- Type in the compose bar at the bottom and press **Enter** or click **Send**; a half-typed message stays with its own chat when you switch
+- Capitals go in as you type: the start of each sentence, and proper nouns ("I", your contacts' names, days, months, holidays, some places and brands). **Ctrl+Z** right after one keeps the letter as typed; **Settings → General → Typing** turns either off
 - Click **+** to start a new conversation with any phone number
 - **Right-click** a conversation → **Set contact name** to assign a display name, or **Delete**
 - Type in the search box to find any message; **Ctrl+F** finds text inside the open chat
