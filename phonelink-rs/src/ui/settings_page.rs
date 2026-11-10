@@ -179,7 +179,7 @@ impl SettingsPage {
         let typing = group("Typing");
         let autocap = switch_row(
             "Capitalize Automatically",
-            "Start sentences and the word “I” with a capital letter",
+            "Start sentences and the word “I” with a capital letter. Ctrl+Z right after one keeps the letter as typed.",
             settings.borrow().auto_capitalize(),
         );
         typing.add(&autocap);
