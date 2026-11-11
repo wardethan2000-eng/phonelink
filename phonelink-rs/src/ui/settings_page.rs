@@ -42,6 +42,8 @@ pub struct GmControls {
     pub linked_now: Rc<dyn Fn()>,
     /// Unlink; the callback gets (ok, the phone was told).
     pub unlink: Rc<dyn Fn(UnlinkDone)>,
+    /// "Reload All Texts": Err says why it can't now.
+    pub reload_texts: Rc<dyn Fn() -> Result<(), &'static str>>,
 }
 
 /// Told when unlinking ends: (ok, the phone was told).
@@ -51,7 +53,11 @@ struct GmRows {
     status: adw::ActionRow,
     link: gtk::Button,
     unlink: gtk::Button,
+    reload: adw::ActionRow,
+    reload_btn: gtk::Button,
 }
+
+const RELOAD_SUBTITLE: &str = "Texts deleted on your phone still showing here? This forgets the copies saved on this computer and fetches every chat again from the phone.";
 
 struct GoogleRows {
     account: adw::ActionRow,
@@ -218,6 +224,15 @@ impl SettingsPage {
         gm_status.add_suffix(&gm_link);
         gm_status.add_suffix(&gm_unlink);
         gm_group.add(&gm_status);
+        // Reload (issue #12): KDE Connect never says a text was deleted.
+        let texts_group = group("Texts on This Computer");
+        let reload = adw::ActionRow::new();
+        reload.set_title("Reload All Texts");
+        reload.set_subtitle(RELOAD_SUBTITLE);
+        let reload_btn = gtk::Button::with_label("Reload…");
+        reload_btn.set_valign(gtk::Align::Center);
+        reload.add_suffix(&reload_btn);
+        texts_group.add(&reload);
         let gm_info = group("Good to Know");
         for (t, sub) in [
             (
@@ -238,7 +253,7 @@ impl SettingsPage {
             r.set_subtitle(sub);
             gm_info.add(&r);
         }
-        content.add_named(&page_with(&[&gm_group, &gm_info]), Some("messages"));
+        content.add_named(&page_with(&[&gm_group, &texts_group, &gm_info]), Some("messages"));
 
         // Google Contacts.
         let account_group = group("Account");
@@ -330,10 +345,45 @@ impl SettingsPage {
                 background: background.clone(),
             },
             gm,
-            gm_rows: GmRows { status: gm_status, link: gm_link.clone(), unlink: gm_unlink.clone() },
+            gm_rows: GmRows {
+                status: gm_status,
+                link: gm_link.clone(),
+                unlink: gm_unlink.clone(),
+                reload,
+                reload_btn: reload_btn.clone(),
+            },
             ignored_group,
             ignored_rows: RefCell::default(),
             on_notifications_changed,
+        });
+        let weak = Rc::downgrade(&this);
+        reload_btn.connect_clicked(move |b| {
+            let Some(this) = weak.upgrade() else { return };
+            let parent = b.root().and_downcast::<gtk::Window>();
+            let dialog = adw::MessageDialog::new(
+                parent.as_ref(),
+                Some("Reload All Texts?"),
+                Some("PhoneRelay forgets the texts saved on this computer and fetches them again from your phone, so texts deleted there disappear here. Chats come back within a minute; each chat's older texts fill in when you open it.\n\nKDE Connect remembers texts until it restarts, so ones deleted since then can still show until it does."),
+            );
+            dialog.add_response("cancel", "Cancel");
+            dialog.add_response("reload", "Reload");
+            dialog.set_response_appearance("reload", adw::ResponseAppearance::Suggested);
+            dialog.set_default_response(Some("cancel"));
+            dialog.set_close_response("cancel");
+            let w = Rc::downgrade(&this);
+            dialog.connect_response(None, move |_, response| {
+                if response != "reload" {
+                    return;
+                }
+                let Some(this) = w.upgrade() else { return };
+                match (this.gm.reload_texts)() {
+                    Ok(()) => this.gm_rows.reload.set_subtitle(
+                        "Reloading: chats are coming back from your phone. Each chat's older texts fill in when you open it.",
+                    ),
+                    Err(why) => this.gm_rows.reload.set_subtitle(why),
+                }
+            });
+            dialog.present();
         });
         let weak = Rc::downgrade(&this);
         gm_link.connect_clicked(move |b| {
@@ -469,6 +519,13 @@ impl SettingsPage {
         r.link.set_visible(installed && !linked);
         r.unlink.set_visible(linked);
         r.unlink.set_sensitive(true);
+        // Google Messages keeps deletes in step: no reload needed.
+        r.reload_btn.set_sensitive(!linked);
+        r.reload.set_subtitle(if linked {
+            "Not needed while Google Messages is linked: texts deleted on the phone already go here too."
+        } else {
+            RELOAD_SUBTITLE
+        });
     }
 
     /// Called each time the panel opens, as Python.

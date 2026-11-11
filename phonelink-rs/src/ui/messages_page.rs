@@ -984,7 +984,7 @@ impl MessagesPage {
 
     /// Settings' Link / Unlink.
     pub fn gm_controls(self: &Rc<Self>) -> super::settings_page::GmControls {
-        let (w1, w2) = (Rc::downgrade(self), Rc::downgrade(self));
+        let (w1, w2, w3) = (Rc::downgrade(self), Rc::downgrade(self), Rc::downgrade(self));
         super::settings_page::GmControls {
             linked: Rc::new(crate::core::phone_delete::available),
             linked_now: Rc::new(move || {
@@ -997,7 +997,33 @@ impl MessagesPage {
                 let Some(this) = w2.upgrade() else { return };
                 this.unlink_google(done);
             }),
+            reload_texts: Rc::new(move || w3.upgrade().map_or(Err("PhoneRelay is closing."), |t| t.reload_texts())),
         }
+    }
+
+    /// "Reload All Texts" (issue #12): forget the texts saved on this
+    /// computer and pull every chat from the phone again, as on a first
+    /// connect. Texts deleted on the phone don't come back.
+    pub fn reload_texts(self: &Rc<Self>) -> Result<(), &'static str> {
+        let effects = {
+            let mut guard = self.inner.borrow_mut();
+            let i = &mut *guard;
+            if i.m.is_gm() {
+                return Err(
+                    "Not needed while Google Messages is linked: texts deleted on the phone already go here too.",
+                );
+            }
+            if i.kde_device.as_ref().is_none_or(|d| !d.reachable) {
+                return Err("Your phone isn't connected. Connect it, then reload.");
+            }
+            log::info!("Messages: reloading every text from the phone");
+            i.m.forget_texts(&i.store)
+        };
+        self.thread.forget_drafts();
+        self.run(effects);
+        self.inner.borrow_mut().m.catch_up.catch_up(now(), 0.5, 0.0);
+        self.reschedule();
+        Ok(())
     }
 
     /// Stop the link, unlink on the phone, and go back to KDE Connect.

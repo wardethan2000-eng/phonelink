@@ -431,6 +431,15 @@ impl MessageStore {
         });
     }
 
+    /// Every conversation and message of a device ("Reload All Texts").
+    pub fn forget_texts(&self, device_id: &str) {
+        self.write_txn("forget_texts", |c| {
+            c.execute("DELETE FROM conversations WHERE device_id=?", params![device_id])?;
+            c.execute("DELETE FROM messages WHERE device_id=?", params![device_id])?;
+            Ok(())
+        });
+    }
+
     // ── Google Messages ids (the Python app doesn't know this table) ──
 
     /// The local number for one of Google Messages' string ids (`kind` is

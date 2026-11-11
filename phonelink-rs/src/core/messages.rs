@@ -542,6 +542,25 @@ impl Messages {
     // ── loading ────────────────────────────────────────────────────
 
     /// Show persisted history immediately, before the daemon responds.
+    /// "Reload All Texts": forget this phone's texts on this computer, so the
+    /// next catch-up fetches them again (issue #12: KDE Connect never says a
+    /// text was deleted on the phone). Calls, contacts, locally deleted
+    /// chats (`HiddenStore`) and notifications stay. Not for Google
+    /// Messages, which keeps deletes in step itself.
+    pub fn forget_texts(&mut self, store: &MessageStore) -> Vec<Effect> {
+        let Some(dev) = self.device_id.clone().filter(|_| self.gm.is_none()) else {
+            return Vec::new();
+        };
+        store.forget_texts(&dev);
+        self.index.clear();
+        self.read_thread_ids.clear();
+        self.active = None;
+        self.catch_up.cancel();
+        self.full_requested.clear();
+        self.sent_routes.clear();
+        vec![Effect::ShowEmpty, Effect::RefreshList]
+    }
+
     pub fn load_cached(&mut self, store: &MessageStore) -> Vec<Effect> {
         let Some(dev) = self.device_id.clone() else {
             return Vec::new();
@@ -2404,6 +2423,31 @@ mod tests {
     }
 
     // ── calls ───────────────────────────────────────────────────────
+
+    #[test]
+    fn reload_forgets_this_phones_texts_and_pulls_every_thread_again() {
+        let mut p = Panel::new();
+        p.apply(&[tup(1, 10, &["+13165551111"], 1_000), tup(2, 20, &["+13165552222"], 2_000)]);
+        p.m.call_event("missedCall", "+13165553333", 3_000, &p.store);
+        p.store.upsert_conversation("other-phone", &Conversation::new(5));
+        p.m.select(10, &p.store, 0.0);
+        assert_eq!(p.m.forget_texts(&p.store), vec![Effect::ShowEmpty, Effect::RefreshList]);
+        assert!(p.visible().is_empty());
+        assert!(p.store.load_conversations("dev1").is_empty());
+        // Only this phone's texts: calls and other phones' texts stay.
+        assert_eq!(p.store.load_calls("dev1").len(), 1);
+        assert_eq!(p.m.calls_view(4_000).missed, 1);
+        assert_eq!(p.store.load_conversations("other-phone").len(), 1);
+        // The next catch-up asks for every thread again, and they come back.
+        p.m.catch_up.catch_up(100.0, 0.0, 0.0);
+        assert!(p.m.catch_up.tick(100.0, &[]).contains(&sync::Action::RequestAllThreads));
+        p.apply(&[tup(2, 20, &["+13165552222"], 2_000)]);
+        assert_eq!(p.visible().len(), 1);
+        // Google Messages keeps deletes in step: nothing to do there.
+        let mut gm = Messages::new();
+        gm.reset_for_device(Some("gm:5555550100"), true);
+        assert!(gm.forget_texts(&p.store).is_empty());
+    }
 
     #[test]
     fn calls_stay_out_of_the_chats_and_count_until_looked_at() {

@@ -19,6 +19,7 @@ pub struct CallsButton {
     badge: gtk::Label,
     caller: gtk::Label,
     list: gtk::ListBox,
+    scroll: gtk::ScrolledWindow,
     empty: gtk::Label,
     clear: gtk::Button,
     on_looked: RefCell<Option<Handler>>,
@@ -95,6 +96,7 @@ impl CallsButton {
             badge,
             caller,
             list,
+            scroll,
             empty,
             clear: clear.clone(),
             on_looked: RefCell::default(),
@@ -166,7 +168,8 @@ impl CallsButton {
         for call in &view.recent {
             self.list.append(&self.row(call, ringing == Some(call.date)));
         }
-        self.list.set_visible(!view.recent.is_empty());
+        // The scroller, not the list: an empty one still takes room.
+        self.scroll.set_visible(!view.recent.is_empty());
         self.empty.set_visible(view.recent.is_empty());
         self.clear.set_sensitive(!view.recent.is_empty());
     }
