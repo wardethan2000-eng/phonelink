@@ -8,7 +8,7 @@ PhoneRelay brings your Android phone's texts, notifications and files to your Li
 
 ## Features
 
-- **Texts** — every conversation from the phone; send texts and pictures from the desktop, with capitals at sentence starts and for names as you type (each can be turned off)
+- **Texts** — every conversation from the phone; send texts and pictures from the desktop, with capitals at sentence starts and for names as you type (each can be turned off). Texts deleted on the phone still here? **Settings → Google Messages → Reload All Texts** fetches them all again
 - **Search** — finds a word in any message, however old; opening a result jumps to that message. **Ctrl+F** searches inside one chat
 - **Contact names** — learned from notifications and calls, or imported from Google Contacts (one click: **Settings** (gear button) **→ Google Contacts → Connect**), a VCF or a CSV
 - **Notifications** — live phone notifications in a side tray; expand, dismiss or reply from the desktop
