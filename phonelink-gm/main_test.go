@@ -133,3 +133,36 @@ func TestGmcliPairingIsCopiedInOnce(t *testing.T) {
 		t.Fatal("unlinking must stay unlinked")
 	}
 }
+
+// The hello lists every request serve handles, and only those.
+func TestHelloListsEveryRequest(t *testing.T) {
+	src, err := os.ReadFile("serve.go")
+	if err != nil {
+		t.Fatal(err)
+	}
+	handled := map[string]bool{"reply": true}
+	for _, line := range strings.Split(string(src), "\n") {
+		line = strings.TrimSpace(line)
+		if !strings.HasPrefix(line, `case "`) {
+			continue
+		}
+		for _, op := range strings.Split(strings.TrimSuffix(strings.TrimPrefix(line, "case "), ":"), ",") {
+			handled[strings.Trim(strings.TrimSpace(op), `"`)] = true
+		}
+	}
+	listed := map[string]bool{}
+	for _, op := range hello()["supports"].([]string) {
+		listed[op] = true
+		if !handled[op] {
+			t.Errorf("hello lists %q, which serve doesn't handle", op)
+		}
+	}
+	for op := range handled {
+		if !listed[op] {
+			t.Errorf("serve handles %q, which hello doesn't list", op)
+		}
+	}
+	if hello()["protocol"] != protocol || protocol != 1 {
+		t.Errorf("protocol %v", hello()["protocol"])
+	}
+}

@@ -298,6 +298,8 @@ struct State {
     anchor: Option<i64>,
     /// Pin, mute and archive state by thread (Google Messages).
     flags: HashMap<i64, ChatFlags>,
+    /// The messages helper can't mute, archive or block (its hello said).
+    no_chat_changes: bool,
     /// Showing the archive.
     archive_shown: bool,
 }
@@ -716,13 +718,21 @@ impl ConversationList {
         let menu = gtk::Box::new(gtk::Orientation::Vertical, 2);
         let flags = self.state.borrow().flags.get(&thread_id).copied().unwrap_or_default();
         if flags.gm {
-            let items = [
-                if flags.pinned { ("Unpin", ChatAction::Unpin) } else { ("Pin to top", ChatAction::Pin) },
-                if flags.muted { ("Unmute", ChatAction::Unmute) } else { ("Mute", ChatAction::Mute) },
-                if flags.archived { ("Unarchive", ChatAction::Unarchive) } else { ("Archive", ChatAction::Archive) },
-                ("Block…", ChatAction::Block),
-                ("Report spam…", ChatAction::Spam),
-            ];
+            let mut items =
+                vec![if flags.pinned { ("Unpin", ChatAction::Unpin) } else { ("Pin to top", ChatAction::Pin) }];
+            // Pins stay on this computer; the rest is the phone's.
+            if !self.state.borrow().no_chat_changes {
+                items.extend([
+                    if flags.muted { ("Unmute", ChatAction::Unmute) } else { ("Mute", ChatAction::Mute) },
+                    if flags.archived {
+                        ("Unarchive", ChatAction::Unarchive)
+                    } else {
+                        ("Archive", ChatAction::Archive)
+                    },
+                    ("Block…", ChatAction::Block),
+                    ("Report spam…", ChatAction::Spam),
+                ]);
+            }
             for (label, action) in items {
                 let b = gtk::Button::with_label(label);
                 b.add_css_class("flat");
@@ -779,6 +789,11 @@ impl ConversationList {
     /// Pin, mute and archive state, and the archive button: `archive` is
     /// (archived chats, showing them), or None when there is no archive
     /// (KDE Connect).
+    /// Can the messages helper mute, archive and block chats?
+    pub fn set_chat_changes(&self, on: bool) {
+        self.state.borrow_mut().no_chat_changes = !on;
+    }
+
     pub fn set_flags(&self, flags: HashMap<i64, ChatFlags>, archive: Option<(usize, bool)>) {
         let mut st = self.state.borrow_mut();
         st.flags = flags;

@@ -22,6 +22,13 @@ if [ -n "${DEMO_ICONS:-}" ]; then
     mkdir -p "$demo/.local/share" "$demo/.config/gtk-4.0" && ln -sfn "$HOME/demo-icons" "$demo/.local/share/icons"
     printf 'gtk-icon-theme-name=%s\n' "$DEMO_ICONS" >> "$demo/.config/gtk-4.0/settings.ini"
 fi
+# DEMO_HELPER=1: the fake helper chosen in Settings as another messages
+# helper that only sends, fetches and marks read (FAKE_GM_SUPPORTS).
+if [ "${DEMO_HELPER:-0}" = 1 ]; then
+    mkdir -p "$demo/.local/share/phonelink"
+    echo "{\"messages_helper\": \"$PWD/target/debug/examples/fake_gm\"}" > "$demo/.local/share/phonelink/settings.json"
+    export FAKE_GM_SUPPORTS=${FAKE_GM_SUPPORTS:-send_text,fetch,mark_read}
+fi
 if [ "${DEMO_GM:-0}" = 1 ]; then
     mkdir -p "$demo/.local/state/gmcli" && echo '{}' > "$demo/.local/state/gmcli/session.json"
     export PHONELINK_GM=$PWD/target/debug/examples/fake_gm

@@ -96,7 +96,7 @@ bring_back() {
 }
 
 # Static Go build of the helper, into target/ (which the sync leaves alone).
-GM_BUILD='(export PATH=$HOME/opt/go/bin:$PATH && mkdir -p target/gm && cd phonelink-gm && CGO_ENABLED=0 go build -mod=readonly -trimpath -ldflags="-s -w" -o ../target/gm/phonelink-gm .)'
+GM_BUILD='(export PATH=$HOME/opt/go/bin:$PATH && mkdir -p target/gm && cd phonelink-gm && CGO_ENABLED=0 go build -mod=readonly -trimpath -ldflags="-s -w -X main.version=${GM_VERSION:-dev}" -o ../target/gm/phonelink-gm .)'
 
 [[ $# -ge 1 ]] || usage
 action=$1; shift
@@ -147,7 +147,7 @@ case "$action" in
         git -C "$ROOT" archive "$tag" | tar -x -C "$export_dir"
         install -m 600 "$ROOT/data/google_oauth_client.json" "$export_dir/data/google_oauth_client.json"
         sync_up "$export_dir"
-        code=0; run_remote bash -c "cargo build --release --locked && $GM_BUILD && bash scripts/pack-release.sh '$version'" || code=$?
+        code=0; run_remote bash -c "cargo build --release --locked && export GM_VERSION='$version' && $GM_BUILD && bash scripts/pack-release.sh '$version'" || code=$?
         [[ $code -eq 0 ]] || exit "$code"
         mkdir -p "$ROOT/target/dist"
         rsync -az "$HOST:$REMOTE_DIR/target/dist/phonerelay-$version-x86_64.tar.gz"* "$ROOT/target/dist/"

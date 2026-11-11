@@ -440,6 +440,23 @@ impl MessageStore {
         });
     }
 
+    /// Forget everything a messages helper sent (another helper was
+    /// chosen): its chats and texts, the ids it mapped, and the chat
+    /// states kept by local id. The new helper sends its own on connect.
+    pub fn forget_helper_texts(&self) {
+        self.write_txn("forget_helper_texts", |c| {
+            c.execute("DELETE FROM conversations WHERE device_id LIKE 'gm:%'", [])?;
+            c.execute("DELETE FROM messages WHERE device_id LIKE 'gm:%'", [])?;
+            c.execute("DELETE FROM gm_ids", [])?;
+            c.execute(
+                "DELETE FROM meta WHERE key IN ('gm_device', 'gm_archived', 'gm_pinned', 'gm_muted', 'gm_pins_on', 'gm_pins_off')",
+                [],
+            )?;
+            Ok(())
+        });
+        self.gm_cache.borrow_mut().clear();
+    }
+
     // ── Google Messages ids (the Python app doesn't know this table) ──
 
     /// The local number for one of Google Messages' string ids (`kind` is
@@ -937,6 +954,29 @@ mod tests {
         assert_eq!(s.gm_local_id("conv", "new"), 3);
         assert_eq!(s.meta("gm_device").as_deref(), Some("gm:3165550000"));
         assert_eq!(s.meta("missing"), None);
+        std::fs::remove_dir_all(&dir).ok();
+    }
+
+    #[test]
+    fn another_helper_starts_from_nothing() {
+        let dir = std::env::temp_dir().join(format!("phonelink-helper-switch-{}", std::process::id()));
+        std::fs::create_dir_all(&dir).unwrap();
+        let s = MessageStore::open(dir.join("m.db"));
+        assert_eq!(s.gm_local_id("conv", "a"), 1);
+        assert_eq!(s.gm_local_id("conv", "b"), 2);
+        s.set_meta("gm_device", "gm:3165550000");
+        s.set_meta("gm_muted", "2");
+        s.set_meta("other", "kept");
+        let conv = Conversation { thread_id: 1, address: "+13165551111".into(), ..Default::default() };
+        s.upsert_conversation("gm:3165550000", &conv);
+        s.upsert_conversation("kdephone", &conv);
+        s.forget_helper_texts();
+        assert!(s.load_conversations("gm:3165550000").is_empty());
+        assert_eq!(s.load_conversations("kdephone").len(), 1);
+        // Ids start over: the new helper's "b" is not the old one's chat 2.
+        assert_eq!(s.gm_local_id("conv", "b"), 1);
+        assert_eq!((s.meta("gm_device"), s.meta("gm_muted")), (None, None));
+        assert_eq!(s.meta("other").as_deref(), Some("kept"));
         std::fs::remove_dir_all(&dir).ok();
     }
 

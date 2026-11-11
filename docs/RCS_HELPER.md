@@ -2,8 +2,9 @@
 
 Design, 2026-11-05. **Built so far (2026-11-07):** `serve` with `mark_read`,
 `delete`, `list`, `fetch`, `send_text` and `set_active`, plus `conversation`
-and `message` events. The protocol as built is the comment at the top of
-`phonelink-gm/serve.go` (it uses an `op` field; chats are named by Google's
+and `message` events. The protocol as built is
+[HELPER_PROTOCOL.md](HELPER_PROTOCOL.md), which any other helper can speak
+too (it uses an `op` field; chats are named by Google's
 `conv` id, or by member key for `mark_read`/`delete`). When linked, the app's
 Messages tab runs on it (`core::messages` Google mode: device `gm:<my number
 key>`, ids mapped through `gm_ids`). Not built yet: linking inside the app

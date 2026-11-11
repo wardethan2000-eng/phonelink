@@ -299,6 +299,8 @@ pub struct BubbleActions {
     pub react: Rc<dyn Fn(i64, String)>,
     /// Reply to the message `uid` (through Google Messages).
     pub reply: Rc<dyn Fn(i64)>,
+    /// Does the messages helper do this (`react`, `reply`...)?
+    pub allowed: Rc<dyn Fn(&str) -> bool>,
 }
 
 struct Bubble {
@@ -659,6 +661,27 @@ fn run_action(
 /// A right-click menu at the pointer.
 /// The reactions row and Reply, at the top of a message's menu.
 fn react_items(menu: &gtk::Box, popover: &gtk::Popover, e: &Extras, uid: i64, actions: &BubbleActions) {
+    if (actions.allowed)("react") {
+        react_row(menu, popover, e, uid, actions);
+    }
+    if !((actions.allowed)("reply") && (actions.allowed)("send_text")) {
+        return;
+    }
+    let reply = gtk::Button::with_label("Reply");
+    reply.add_css_class("flat");
+    if let Some(l) = reply.child().and_downcast::<gtk::Label>() {
+        l.set_xalign(0.0);
+    }
+    let (act, pop) = (actions.reply.clone(), popover.clone());
+    reply.connect_clicked(move |_| {
+        pop.popdown();
+        act(uid);
+    });
+    menu.append(&reply);
+}
+
+/// The quick reactions, in a row.
+fn react_row(menu: &gtk::Box, popover: &gtk::Popover, e: &Extras, uid: i64, actions: &BubbleActions) {
     let row = gtk::Box::new(gtk::Orientation::Horizontal, 0);
     for emoji in rcs::QUICK_REACTIONS {
         let b = gtk::Button::with_label(emoji);
@@ -676,17 +699,6 @@ fn react_items(menu: &gtk::Box, popover: &gtk::Popover, e: &Extras, uid: i64, ac
         row.append(&b);
     }
     menu.append(&row);
-    let reply = gtk::Button::with_label("Reply");
-    reply.add_css_class("flat");
-    if let Some(l) = reply.child().and_downcast::<gtk::Label>() {
-        l.set_xalign(0.0);
-    }
-    let (act, pop) = (actions.reply.clone(), popover.clone());
-    reply.connect_clicked(move |_| {
-        pop.popdown();
-        act(uid);
-    });
-    menu.append(&reply);
 }
 
 /// `react`: the message's Google Messages share and uid, to put reactions

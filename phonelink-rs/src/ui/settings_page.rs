@@ -44,6 +44,10 @@ pub struct GmControls {
     pub unlink: Rc<dyn Fn(UnlinkDone)>,
     /// "Reload All Texts": Err says why it can't now.
     pub reload_texts: Rc<dyn Fn() -> Result<(), &'static str>>,
+    /// The running messages helper's hello, if it has said one.
+    pub helper: Rc<dyn Fn() -> Option<crate::core::gm::HelperInfo>>,
+    /// Another helper (or the built-in one) was chosen: restart the link.
+    pub helper_changed: Rc<dyn Fn()>,
 }
 
 /// Told when unlinking ends: (ok, the phone was told).
@@ -55,7 +59,12 @@ struct GmRows {
     unlink: gtk::Button,
     reload: adw::ActionRow,
     reload_btn: gtk::Button,
+    helper: adw::ActionRow,
+    helper_reset: gtk::Button,
 }
+
+/// Where the helper protocol is written down.
+const HELPER_DOC: &str = "https://github.com/wardethan2000-eng/phonelink/blob/main/docs/HELPER_PROTOCOL.md";
 
 const RELOAD_SUBTITLE: &str = "Texts deleted on your phone still showing here? This forgets the copies saved on this computer and fetches every chat again from the phone.";
 
@@ -233,6 +242,21 @@ impl SettingsPage {
         reload_btn.set_valign(gtk::Align::Center);
         reload.add_suffix(&reload_btn);
         texts_group.add(&reload);
+        // Another program in place of phonelink-gm (issue #13).
+        let helper_group = group("Messages Helper");
+        helper_group.set_description(Some(&format!(
+            "For other sources of texts: PhoneRelay can run another program in place of its Google Messages helper. It must speak <a href=\"{HELPER_DOC}\">PhoneRelay's helper protocol</a>."
+        )));
+        let helper = adw::ActionRow::new();
+        helper.set_title("Helper Program");
+        helper.set_subtitle_selectable(true);
+        let helper_choose = gtk::Button::with_label("Choose…");
+        helper_choose.set_valign(gtk::Align::Center);
+        let helper_reset = gtk::Button::with_label("Use Built-in");
+        helper_reset.set_valign(gtk::Align::Center);
+        helper.add_suffix(&helper_choose);
+        helper.add_suffix(&helper_reset);
+        helper_group.add(&helper);
         let gm_info = group("Good to Know");
         for (t, sub) in [
             (
@@ -253,7 +277,7 @@ impl SettingsPage {
             r.set_subtitle(sub);
             gm_info.add(&r);
         }
-        content.add_named(&page_with(&[&gm_group, &texts_group, &gm_info]), Some("messages"));
+        content.add_named(&page_with(&[&gm_group, &texts_group, &gm_info, &helper_group]), Some("messages"));
 
         // Google Contacts.
         let account_group = group("Account");
@@ -351,6 +375,8 @@ impl SettingsPage {
                 unlink: gm_unlink.clone(),
                 reload,
                 reload_btn: reload_btn.clone(),
+                helper,
+                helper_reset: helper_reset.clone(),
             },
             ignored_group,
             ignored_rows: RefCell::default(),
@@ -384,6 +410,25 @@ impl SettingsPage {
                 }
             });
             dialog.present();
+        });
+        let weak = Rc::downgrade(&this);
+        helper_choose.connect_clicked(move |b| {
+            let Some(this) = weak.upgrade() else { return };
+            let parent = b.root().and_downcast::<gtk::Window>();
+            let dialog = gtk::FileDialog::builder().title("Choose a Messages Helper").modal(true).build();
+            let w = Rc::downgrade(&this);
+            dialog.open(parent.as_ref(), gio::Cancellable::NONE, move |res| {
+                let (Some(this), Ok(file)) = (w.upgrade(), res) else { return };
+                if let Some(path) = file.path() {
+                    this.set_helper(Some(path));
+                }
+            });
+        });
+        let weak = Rc::downgrade(&this);
+        helper_reset.connect_clicked(move |_| {
+            if let Some(this) = weak.upgrade() {
+                this.set_helper(None);
+            }
         });
         let weak = Rc::downgrade(&this);
         gm_link.connect_clicked(move |b| {
@@ -504,24 +549,55 @@ impl SettingsPage {
         this
     }
 
+    /// Run `path` in place of phonelink-gm (None: phonelink-gm again).
+    fn set_helper(&self, path: Option<std::path::PathBuf>) {
+        if path == crate::core::phone_delete::custom_helper() {
+            return;
+        }
+        if let Err(e) = self.settings.borrow_mut().set_messages_helper(path.as_deref()) {
+            log::warn!("saving the messages helper failed: {e}");
+        }
+        log::info!(
+            "messages helper: now {}",
+            path.as_ref().map_or("the built-in one".into(), |p| p.display().to_string())
+        );
+        crate::core::phone_delete::set_custom_helper(path);
+        (self.gm.helper_changed)();
+        self.refresh_gm_status();
+        // Its hello comes in a moment.
+        let rows = self.gm_rows.helper.clone();
+        let helper = self.gm.helper.clone();
+        glib::timeout_add_local_once(std::time::Duration::from_secs(2), move || {
+            rows.set_subtitle(&helper_subtitle(helper().as_ref()));
+        });
+    }
+
     /// Linked or not, as the Google Messages row shows it.
     pub fn refresh_gm_status(&self) {
         let r = &self.gm_rows;
+        let custom = crate::core::phone_delete::custom_helper().is_some();
+        r.helper.set_subtitle(&helper_subtitle((self.gm.helper)().as_ref()));
+        r.helper_reset.set_visible(custom);
         let installed = crate::core::phone_delete::helper_path().is_some();
         let linked = (self.gm.linked)();
-        r.status.set_subtitle(if !installed {
+        r.status.set_subtitle(if custom {
+            "Not used: PhoneRelay runs another messages helper (below)."
+        } else if !installed {
             "The Google Messages helper (phonelink-gm) isn't installed."
         } else if linked {
             "Linked. Texts go through Google Messages on your phone."
         } else {
             "Not linked. Texts go through KDE Connect (SMS only)."
         });
-        r.link.set_visible(installed && !linked);
-        r.unlink.set_visible(linked);
+        r.link.set_visible(!custom && installed && !linked);
+        r.unlink.set_visible(!custom && linked);
         r.unlink.set_sensitive(true);
-        // Google Messages keeps deletes in step: no reload needed.
+        // Google Messages keeps deletes in step: no reload needed. (Another
+        // helper is the source too; switching it already starts over.)
         r.reload_btn.set_sensitive(!linked);
-        r.reload.set_subtitle(if linked {
+        r.reload.set_subtitle(if custom && linked {
+            "Not needed while another messages helper is the source."
+        } else if linked {
             "Not needed while Google Messages is linked: texts deleted on the phone already go here too."
         } else {
             RELOAD_SUBTITLE
@@ -580,4 +656,21 @@ impl SettingsPage {
             self.ignored_rows.borrow_mut().push(row);
         }
     }
+}
+
+/// The helper row: which program, and what it said about itself.
+fn helper_subtitle(info: Option<&crate::core::gm::HelperInfo>) -> String {
+    let Some(path) = crate::core::phone_delete::custom_helper() else {
+        return "Built in: Google Messages (phonelink-gm).".into();
+    };
+    let mut s = path.display().to_string();
+    if !path.is_file() {
+        s += "\nNot found. Choose it again, or use the built-in helper.";
+    } else if let Some(i) = info.filter(|i| !i.everything) {
+        s += &format!("\nRunning: {} {}", i.title(), i.version);
+        if i.name != i.title() {
+            s += &format!(" ({})", i.name);
+        }
+    }
+    s
 }

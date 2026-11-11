@@ -35,7 +35,7 @@ use crate::dbus::{Client, IFACE_CONTACTS, IFACE_CONVERSATIONS, IFACE_SHARE, IFAC
 /// Google Messages chats/messages merged per idle callback.
 const GM_BATCH_SIZE: usize = 60;
 /// Messages fetched when a chat is opened.
-const TOAST_GM_DOWNLOAD_FAILED: &str = "Couldn't download that file from Google Messages";
+const TOAST_GM_DOWNLOAD_FAILED: &str = "Couldn't download that file from your phone";
 const GM_FETCH_COUNT: u32 = 50;
 
 fn epoch_now() -> f64 {
@@ -228,6 +228,13 @@ impl MessagesPage {
                     }
                 })
             },
+            allowed: {
+                let target = download_target.clone();
+                Rc::new(move |what| {
+                    let gm = target.borrow().upgrade().and_then(|p| p.gm.borrow().clone());
+                    gm.is_none_or(|g| g.supports(what))
+                })
+            },
         });
         content.append(&thread.widget);
         stack.add_named(&content, Some("content"));
@@ -289,7 +296,7 @@ impl MessagesPage {
         let cached = this.inner.borrow().store.meta("gm_device").filter(|d| !d.is_empty());
         if let Some(dev) = cached.filter(|_| this.gm.borrow().is_some()) {
             this.switch_to_gm(&dev);
-            this.show_gm_banner("Connecting to Google Messages…", None);
+            this.show_gm_banner(&format!("Connecting to {}…", this.source_title()), None);
         }
         let settings = this.inner.borrow().settings.clone();
         this.thread.set_autocap(move || settings.try_borrow().map_or(AutocapRules::OFF, |s| s.autocap_rules()));
@@ -664,7 +671,7 @@ impl MessagesPage {
                 Effect::GmFetch { thread_id } => self.gm_fetch(thread_id),
                 Effect::GmSendNew { addresses, text, attachments } => self.gm_send_new(addresses, text, attachments),
                 Effect::GmTyping { conv } => {
-                    if let Some(gm) = self.gm.borrow().clone() {
+                    if let Some(gm) = self.gm.borrow().clone().filter(|g| g.supports("typing")) {
                         gm.request(|id| crate::core::gm::typing_request(id, &conv), |_| {});
                     }
                 }
@@ -911,6 +918,7 @@ impl MessagesPage {
         use crate::core::gm::Incoming;
         let gm_source = self.inner.borrow().m.is_gm();
         match e {
+            Incoming::Hello(info) => self.list.set_chat_changes(info.supports("update_chat")),
             Incoming::Ready { me } => {
                 self.inner.borrow_mut().m.gm_me = me.clone();
                 self.gm_banner.set_revealed(false);
@@ -956,12 +964,16 @@ impl MessagesPage {
                     self.show_gm_banner("Your phone isn't answering Google Messages. Is it online?", None);
                 }
             }
-            Incoming::Fatal { kind, message: _ } => {
+            Incoming::Fatal { kind, message } => {
+                let title = self.source_title();
                 if kind == "logged_out" {
                     self.switch_to_kde();
-                    self.show_gm_banner("Google Messages signed out. Showing texts from KDE Connect.", None);
+                    self.show_gm_banner(&format!("{title} signed out. Showing texts from KDE Connect."), None);
+                } else if kind == "protocol" {
+                    self.switch_to_kde();
+                    self.show_gm_banner(&format!("{message}. Showing texts from KDE Connect."), None);
                 } else if gm_source {
-                    self.show_gm_banner("Reconnecting to Google Messages…", None);
+                    self.show_gm_banner(&format!("Reconnecting to {title}…"), None);
                 }
             }
         }
@@ -984,13 +996,20 @@ impl MessagesPage {
 
     /// Settings' Link / Unlink.
     pub fn gm_controls(self: &Rc<Self>) -> super::settings_page::GmControls {
-        let (w1, w2, w3) = (Rc::downgrade(self), Rc::downgrade(self), Rc::downgrade(self));
+        let (w1, w2, w3, w4, w5) =
+            (Rc::downgrade(self), Rc::downgrade(self), Rc::downgrade(self), Rc::downgrade(self), Rc::downgrade(self));
         super::settings_page::GmControls {
             linked: Rc::new(crate::core::phone_delete::available),
             linked_now: Rc::new(move || {
                 if let Some(this) = w1.upgrade() {
-                    this.show_gm_banner("Connecting to Google Messages…", None);
+                    this.show_gm_banner(&format!("Connecting to {}…", this.source_title()), None);
                     this.start_gm_link();
+                }
+            }),
+            helper: Rc::new(move || w4.upgrade().and_then(|t| t.gm.borrow().as_ref().and_then(|g| g.info()))),
+            helper_changed: Rc::new(move || {
+                if let Some(this) = w5.upgrade() {
+                    this.helper_changed();
                 }
             }),
             unlink: Rc::new(move |done| {
@@ -1024,6 +1043,39 @@ impl MessagesPage {
         self.inner.borrow_mut().m.catch_up.catch_up(now(), 0.5, 0.0);
         self.reschedule();
         Ok(())
+    }
+
+    /// What the texts come through while the link runs: the helper's
+    /// title once it has said hello.
+    fn source_title(&self) -> String {
+        if let Some(info) = self.gm.borrow().as_ref().and_then(|g| g.info()) {
+            return info.title().to_string();
+        }
+        if crate::core::phone_delete::custom_helper().is_some() { "your messages helper" } else { "Google Messages" }
+            .to_string()
+    }
+
+    /// Settings picked another messages helper (or the built-in one): stop
+    /// the old one, forget its texts (two helpers' ids can clash), and
+    /// start the new one.
+    fn helper_changed(self: &Rc<Self>) {
+        let old = self.gm.borrow_mut().take();
+        let weak = Rc::downgrade(self);
+        let restart = move || {
+            let Some(this) = weak.upgrade() else { return };
+            this.switch_to_kde();
+            this.inner.borrow().store.forget_helper_texts();
+            this.list.set_chat_changes(true);
+            this.gm_banner.set_revealed(false);
+            this.start_gm_link();
+            if this.gm.borrow().is_some() {
+                this.show_gm_banner(&format!("Connecting to {}…", this.source_title()), None);
+            }
+        };
+        match old {
+            Some(gm) => gm.stop(restart),
+            None => restart(),
+        }
     }
 
     /// Stop the link, unlink on the phone, and go back to KDE Connect.
@@ -1717,6 +1769,7 @@ impl MessagesPage {
             self.toast("Removed from PhoneRelay only: Google Messages isn't paired on this computer");
             return;
         }
+        let custom = crate::core::phone_delete::custom_helper().is_some();
         let weak = Rc::downgrade(self);
         let keys: Vec<String> = {
             let i = self.inner.borrow();
@@ -1743,6 +1796,11 @@ impl MessagesPage {
             if sent {
                 return;
             }
+        }
+        if custom {
+            // Only phonelink-gm deletes without the link running.
+            self.toast(&format!("Removed from PhoneRelay only: {} isn't connected", self.source_title()));
+            return;
         }
         let weak = Rc::downgrade(self);
         let members: Vec<Vec<String>> = keys.into_iter().map(|k| vec![k]).collect();
@@ -1777,7 +1835,9 @@ impl MessagesPage {
                 (Some(c), Some(d)) if any_real && !gm_source => c.supports_conversation_deletion(d).await,
                 _ => false,
             };
-            let google_deletes = any_real && !kde_deletes && crate::core::phone_delete::available();
+            let helper_deletes = this.gm.borrow().as_ref().is_none_or(|g| g.supports("delete"));
+            let google_deletes = any_real && !kde_deletes && crate::core::phone_delete::available() && helper_deletes;
+            let title = this.source_title();
             let can_delete_on_phone = kde_deletes || google_deletes;
             let (heading, mut body) = if let [thread_id] = thread_ids.as_slice() {
                 let i = this.inner.borrow();
@@ -1791,10 +1851,13 @@ impl MessagesPage {
                 let n = thread_ids.len();
                 (format!("Delete {n} Conversations"), format!("Remove these {n} conversations from PhoneRelay?"))
             };
+            let deletes_there = format!("\n\nThis also deletes them from your phone ({title}). It can't be undone.");
             body.push_str(if google_deletes {
-                "\n\nThis also deletes them from your phone (Google Messages). It can't be undone."
+                &deletes_there
             } else if kde_deletes {
                 "\n\nPhone Link will also ask your phone to delete them there."
+            } else if crate::core::phone_delete::custom_helper().is_some() {
+                "\n\nThis removes them from PhoneRelay only: your messages helper can't delete on the phone."
             } else {
                 "\n\nThis removes them from PhoneRelay only: phone-side deletion needs Google Messages paired (gmcli) and the phonelink-gm helper."
             });

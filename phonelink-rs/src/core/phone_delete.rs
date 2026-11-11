@@ -8,6 +8,7 @@
 
 use std::path::{Path, PathBuf};
 use std::process::Command;
+use std::sync::Mutex;
 
 use serde_json::Value;
 
@@ -49,9 +50,35 @@ pub fn linked(home: &Path) -> bool {
     !copied && gmcli_session_path(home).is_file()
 }
 
-/// Can the helper run? (No network: helper + a link exist.)
+/// The messages helper chosen in Settings instead of `phonelink-gm`
+/// (docs/HELPER_PROTOCOL.md), set at startup and when it changes.
+static CUSTOM_HELPER: Mutex<Option<PathBuf>> = Mutex::new(None);
+
+pub fn set_custom_helper(path: Option<PathBuf>) {
+    *CUSTOM_HELPER.lock().unwrap_or_else(|e| e.into_inner()) = path;
+}
+
+/// The other helper chosen in Settings, if any (it may be missing).
+pub fn custom_helper() -> Option<PathBuf> {
+    CUSTOM_HELPER.lock().unwrap_or_else(|e| e.into_inner()).clone()
+}
+
+/// The program the lasting link runs: the chosen helper, else
+/// `phonelink-gm`.
+pub fn serve_helper() -> Option<PathBuf> {
+    match custom_helper() {
+        Some(p) => p.is_file().then_some(p),
+        None => helper_path(),
+    }
+}
+
+/// Can the link run? (No network: the chosen helper exists, or
+/// `phonelink-gm` and a Google Messages link do.)
 pub fn available() -> bool {
-    helper_path().is_some() && linked(&home_dir())
+    match custom_helper() {
+        Some(p) => p.is_file(),
+        None => helper_path().is_some() && linked(&home_dir()),
+    }
 }
 
 /// One chat's outcome, in the order asked.

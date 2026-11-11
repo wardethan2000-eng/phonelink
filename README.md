@@ -185,6 +185,9 @@ To link, open **Settings → Google Messages → Link**. A sign-in window opens 
 
 Limits: it's an unofficial protocol, so Google can break it until the helper is updated. The phone must be online. Google drops a link unused for about 14 days. Google Messages allows one web session at a time, so opening messages.google.com in a browser takes the link away from PhoneRelay.
 
+### Other sources of texts
+The helper is a separate program that PhoneRelay talks to in JSON lines, and another program can take its place: a bridge to a different SMS app on the phone, for example. It must speak [PhoneRelay's helper protocol](docs/HELPER_PROTOCOL.md); its first line says what it can do, and PhoneRelay hides the rest. Choose it under **Settings → Google Messages → Messages Helper**.
+
 ---
 
 ## Usage

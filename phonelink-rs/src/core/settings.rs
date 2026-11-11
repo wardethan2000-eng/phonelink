@@ -240,6 +240,9 @@ pub struct Settings {
     ignored_apps: Vec<String>,
     google_background_sync: bool,
     google_account_label: String,
+    /// Another messages helper to run in place of phonelink-gm (a path;
+    /// empty = the built-in one). docs/HELPER_PROTOCOL.md.
+    messages_helper: String,
     google_last_sync_ts: f64,
     google_last_attempt_ts: f64,
     /// device id -> conversation key -> deleted_at
@@ -286,6 +289,7 @@ impl Settings {
             ignored_apps: Vec::new(),
             google_background_sync: true,
             google_account_label: String::new(),
+            messages_helper: String::new(),
             google_last_sync_ts: 0.0,
             google_last_attempt_ts: 0.0,
             hidden: BTreeMap::new(),
@@ -349,6 +353,7 @@ impl Settings {
         };
         self.google_background_sync = py_bool(m.remove("google_background_sync"), true);
         self.google_account_label = py_str(m.remove("google_account_label"));
+        self.messages_helper = py_str(m.remove("messages_helper"));
         self.google_last_sync_ts = py_float(m.remove("google_last_sync_ts"), 0.0);
         self.google_last_attempt_ts = py_float(m.remove("google_last_attempt_ts"), 0.0);
         self.message_font_scale = clamp_scale(py_float(m.remove("message_font_scale"), 1.0));
@@ -403,6 +408,9 @@ impl Settings {
             "google_account_label".into(),
             Value::from(self.google_account_label.clone()),
         );
+        if !self.messages_helper.is_empty() {
+            m.insert("messages_helper".into(), Value::from(self.messages_helper.clone()));
+        }
         m.insert("google_last_sync_ts".into(), Value::from(self.google_last_sync_ts));
         m.insert("google_last_attempt_ts".into(), Value::from(self.google_last_attempt_ts));
         m.insert(
@@ -568,6 +576,16 @@ impl Settings {
 
     pub fn set_google_account_label(&mut self, value: &str) -> io::Result<()> {
         self.google_account_label = value.to_string();
+        self.save()
+    }
+
+    /// The messages helper chosen in Settings, if not the built-in one.
+    pub fn messages_helper(&self) -> Option<std::path::PathBuf> {
+        (!self.messages_helper.is_empty()).then(|| self.messages_helper.clone().into())
+    }
+
+    pub fn set_messages_helper(&mut self, path: Option<&std::path::Path>) -> io::Result<()> {
+        self.messages_helper = path.map(|p| p.to_string_lossy().into_owned()).unwrap_or_default();
         self.save()
     }
 

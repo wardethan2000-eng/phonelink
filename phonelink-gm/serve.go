@@ -2,7 +2,11 @@ package main
 
 // serve: one lasting Google Messages connection for PhoneRelay.
 //
-// JSON lines. The app writes requests to stdin, and the helper answers on
+// JSON lines (docs/HELPER_PROTOCOL.md, version 1). The first line out is
+// the hello: {"event":"hello", "protocol":1, "name", "version", "title",
+// "supports":[...]}, the optional requests below.
+//
+// The app writes requests to stdin, and the helper answers on
 // stdout with the same id ({"id", "ok": true, ...} or {"id", "ok": false,
 // "error", "message"}):
 //
@@ -72,6 +76,21 @@ import (
 	"go.mau.fi/mautrix-gmessages/pkg/libgm/events"
 	"go.mau.fi/mautrix-gmessages/pkg/libgm/gmproto"
 )
+
+// version is PhoneRelay's, set by the release build (-X main.version=...).
+var version = "dev"
+
+// protocol is the helper protocol version spoken here.
+const protocol = 1
+
+// supported are the optional requests serve handles (and "reply":
+// send_text and send_media take reply_to).
+var supported = []string{"send_text", "send_media", "reply", "download", "fetch", "mark_read", "delete", "react", "typing", "update_chat", "open_conversation", "set_active", "list"}
+
+// hello is serve's first line.
+func hello() map[string]any {
+	return map[string]any{"event": "hello", "protocol": protocol, "name": "phonelink-gm", "version": version, "title": "Google Messages", "supports": supported}
+}
 
 type request struct {
 	ID         int64    `json:"id"`
@@ -235,6 +254,7 @@ func newTmpID() string {
 
 func serve(l *link, timeout time.Duration) int {
 	out := &lines{enc: json.NewEncoder(os.Stdout)}
+	out.put(hello())
 	state := &chats{byID: map[string]*gmproto.Conversation{}, simsSeen: make(chan struct{})}
 	// askFullSize asks the phone, once per picture, for the full file of
 	// one only a preview of is on Google's side (as the mautrix bridge does).

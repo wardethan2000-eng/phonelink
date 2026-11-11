@@ -170,9 +170,74 @@ pub struct Cursor {
     pub ts_ms: i64,
 }
 
+/// The newest helper protocol this app speaks (docs/HELPER_PROTOCOL.md);
+/// the helper gets it as `PHONERELAY_PROTOCOL`.
+pub const PROTOCOL: u32 = 1;
+
+/// What a helper says about itself in its hello (its first line).
+#[derive(Debug, Clone, PartialEq, Default, Deserialize)]
+#[serde(default)]
+pub struct HelperInfo {
+    pub protocol: u32,
+    pub name: String,
+    pub version: String,
+    /// What the texts come through, as the user sees it.
+    pub title: String,
+    /// The optional requests it handles (`op` names, and `reply`).
+    pub supports: Vec<String>,
+    /// An older phonelink-gm, which says no hello and does everything.
+    #[serde(skip)]
+    pub everything: bool,
+}
+
+impl HelperInfo {
+    /// A helper that reached `ready` without a hello.
+    pub fn without_hello() -> Self {
+        Self {
+            protocol: 1,
+            name: "phonelink-gm".into(),
+            title: "Google Messages".into(),
+            everything: true,
+            ..Default::default()
+        }
+    }
+
+    pub fn supports(&self, what: &str) -> bool {
+        self.everything || self.supports.iter().any(|s| s == what)
+    }
+
+    /// The name banners use ("Connecting to …").
+    pub fn title(&self) -> &str {
+        if !self.title.is_empty() {
+            &self.title
+        } else if !self.name.is_empty() {
+            &self.name
+        } else {
+            "the messages helper"
+        }
+    }
+
+    /// What request `line` needs that the helper didn't list (its op, or
+    /// `reply` for a send that replies), if anything.
+    pub fn refuses(&self, line: &str) -> Option<String> {
+        if self.everything {
+            return None;
+        }
+        let v: Value = serde_json::from_str(line).ok()?;
+        let op = v.get("op").and_then(Value::as_str)?;
+        if !self.supports(op) {
+            return Some(op.to_string());
+        }
+        let replies = v.get("reply_to").and_then(Value::as_str).is_some_and(|r| !r.is_empty());
+        (replies && !self.supports("reply")).then(|| "reply".to_string())
+    }
+}
+
 /// One line from the helper.
 #[derive(Debug, Clone, PartialEq)]
 pub enum Incoming {
+    /// The helper's introduction, before anything else.
+    Hello(HelperInfo),
     /// Connected (with my own number keys); every chat follows.
     Ready { me: Vec<String> },
     /// A chat (sent for every chat after `Ready`, then whenever one changes).
@@ -232,6 +297,7 @@ pub fn parse_line(line: &str) -> Option<Incoming> {
     let v: Value = serde_json::from_str(line.trim()).ok()?;
     let s = |k: &str| v.get(k).and_then(Value::as_str).unwrap_or_default().to_string();
     match v.get("event").and_then(Value::as_str) {
+        Some("hello") => serde_json::from_value(v).ok().map(Incoming::Hello),
         Some("ready") => Some(Incoming::Ready {
             me: v
                 .get("me")
@@ -503,6 +569,27 @@ pub const READ_SLACK_MS: i64 = 5_000;
 #[cfg(test)]
 mod tests {
     use super::*;
+
+    #[test]
+    fn a_hello_says_what_the_helper_does() {
+        let line = r#"{"event":"hello","protocol":1,"name":"bridge","version":"0.1","title":"Other Messages","supports":["send_text","fetch"],"extra":1}"#;
+        let Some(Incoming::Hello(info)) = parse_line(line) else { panic!("not a hello") };
+        assert_eq!((info.protocol, info.name.as_str(), info.title()), (1, "bridge", "Other Messages"));
+        assert!(info.supports("fetch") && !info.supports("react"));
+        let send = send_text_request(1, "c", "hi", "tmp_1", None);
+        assert_eq!(info.refuses(&send), None);
+        // Replying needs "reply" as well as send_text.
+        assert_eq!(info.refuses(&send_text_request(2, "c", "hi", "tmp_2", Some("m1"))).as_deref(), Some("reply"));
+        assert_eq!(info.refuses(&react_request(3, "c", "m1", "👍", "add")).as_deref(), Some("react"));
+        assert_eq!(info.refuses(&typing_request(4, "c")).as_deref(), Some("typing"));
+        // No title: its name; an older helper without a hello does everything.
+        let Some(Incoming::Hello(bare)) = parse_line(r#"{"event":"hello","name":"x"}"#) else { panic!() };
+        assert_eq!(bare.title(), "x");
+        assert!(bare.supports.is_empty() && !bare.supports("send_text"));
+        let old = HelperInfo::without_hello();
+        assert_eq!(old.refuses(&react_request(5, "c", "m1", "👍", "add")), None);
+        assert_eq!(old.title(), "Google Messages");
+    }
 
     #[test]
     fn chat_keys_match_the_helpers() {

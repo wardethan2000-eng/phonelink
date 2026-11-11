@@ -279,6 +279,23 @@ fn main() {
     }
     let out: Out = Arc::new(Mutex::new(std::io::stdout()));
     let start = now_ms();
+    // The hello. FAKE_GM_SUPPORTS="send_text,fetch" makes it another
+    // helper that does only those (docs/HELPER_PROTOCOL.md).
+    let app = std::env::var("PHONERELAY_PROTOCOL").unwrap_or_default();
+    eprintln!("fake_gm: PhoneRelay speaks protocol {app:?}");
+    match std::env::var("FAKE_GM_SUPPORTS") {
+        Ok(list) => put(
+            &out,
+            &json!({"event": "hello", "protocol": 1, "name": "fake-bridge", "version": "0.1.0",
+            "title": "Other Messages", "supports": list.split(',').filter(|s| !s.is_empty()).collect::<Vec<_>>()}),
+        ),
+        Err(_) => put(
+            &out,
+            &json!({"event": "hello", "protocol": 1, "name": "phonelink-gm", "version": "dev",
+            "title": "Google Messages", "supports": ["send_text", "send_media", "reply", "download", "fetch", "mark_read",
+            "delete", "react", "typing", "update_chat", "open_conversation", "set_active", "list"]}),
+        ),
+    }
     std::thread::sleep(Duration::from_millis(800));
     put(&out, &json!({"event": "ready", "me": ["5555550100"]}));
     for c in CHATS {

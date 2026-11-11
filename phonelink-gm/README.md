@@ -14,8 +14,9 @@ delete them, so this helper works through the Google Messages web link using lib
 
 `serve` keeps one connection open for the app: JSON lines on stdin/stdout
 (`mark_read` and `delete` requests; `ready` and per-chat `conversation`
-events with the phone's unread state). The protocol is at the top of
-`serve.go`. The app starts it when Google Messages is paired and restarts it
+events with the phone's unread state). The protocol is
+[docs/HELPER_PROTOCOL.md](../docs/HELPER_PROTOCOL.md), summed up at the top
+of `serve.go`. The app starts it when Google Messages is paired and restarts it
 if it exits. While it runs it holds the session lock, so a one-shot
 `delete` by hand answers `busy`.
 

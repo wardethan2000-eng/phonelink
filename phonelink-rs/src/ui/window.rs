@@ -108,6 +108,7 @@ impl Window {
         icons::register_app_icon();
         let mut settings = Settings::new();
         settings.load();
+        crate::core::phone_delete::set_custom_helper(settings.messages_helper());
         settings_page::apply_color_scheme(settings.color_scheme());
         // Phase 7: this app owns "Open on Login". If either app's entry is
         // there, point it at this binary and drop the Python one.
