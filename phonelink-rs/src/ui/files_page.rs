@@ -377,7 +377,10 @@ impl FilesPage {
         scroll.set_vexpand(true);
         scroll.set_policy(gtk::PolicyType::Never, gtk::PolicyType::Automatic);
         let file_list = gtk::ListBox::new();
-        file_list.set_selection_mode(gtk::SelectionMode::Single);
+        // Like a file manager: click selects, Ctrl/Shift+click and Ctrl+A
+        // select more, double-click (or Enter) opens.
+        file_list.set_selection_mode(gtk::SelectionMode::Multiple);
+        file_list.set_activate_on_single_click(false);
         let file_empty = adw::StatusPage::new();
         file_empty.set_icon_name(Some("folder-open-symbolic"));
         file_empty.set_title("No Files");
@@ -512,15 +515,19 @@ impl FilesPage {
                 }
             }
         });
-        // Ctrl+C copies the selected photos.
+        // Ctrl+C copies everything selected in the view that is showing.
         let keys = gtk::EventControllerKey::new();
         let weak = Rc::downgrade(&this);
         keys.connect_key_pressed(move |_, key, _, state| {
             let Some(this) = weak.upgrade() else { return glib::Propagation::Proceed };
-            if state.contains(gdk::ModifierType::CONTROL_MASK) && key == gdk::Key::c {
-                let paths = this.selected_paths();
+            if state.contains(gdk::ModifierType::CONTROL_MASK) && matches!(key, gdk::Key::c | gdk::Key::C) {
+                let (paths, status) = if this.showing_photos() {
+                    (this.selected_paths(), &this.photo_status)
+                } else {
+                    (this.selected_browse_files(), &this.status_bar)
+                };
                 if !paths.is_empty() {
-                    this.copy_paths(&paths, &this.photo_status);
+                    this.copy_paths(&paths, status);
                     return glib::Propagation::Stop;
                 }
             }
@@ -1181,7 +1188,8 @@ impl FilesPage {
         right.connect_pressed(move |g, _, x, y| {
             g.set_state(gtk::EventSequenceState::Claimed);
             if let Some(this) = weak.upgrade() {
-                this.file_menu(anchor.upcast_ref(), x, y, &p, false, this.photo_status.clone());
+                let targets = files::menu_targets(&p, this.selected_paths());
+                this.file_menu(anchor.upcast_ref(), x, y, &p, false, targets, this.photo_status.clone());
             }
         });
         child.add_controller(right);
@@ -1534,7 +1542,20 @@ impl FilesPage {
         });
     }
 
-    fn file_menu(self: &Rc<Self>, anchor: &gtk::Widget, x: f64, y: f64, path: &Path, is_dir: bool, status: gtk::Label) {
+    /// Right-click menu for `path`. Copy and Save act on `targets`: the
+    /// selected files when `path` is one of them, else `path` alone.
+    #[allow(clippy::too_many_arguments)]
+    fn file_menu(
+        self: &Rc<Self>,
+        anchor: &gtk::Widget,
+        x: f64,
+        y: f64,
+        path: &Path,
+        is_dir: bool,
+        targets: Vec<PathBuf>,
+        status: gtk::Label,
+    ) {
+        let (copy_label, save_label) = (files::copy_menu_label(targets.len()), files::save_menu_label(targets.len()));
         let mut items: Vec<super::MenuItem> = Vec::new();
         let (weak, p, st) = (Rc::downgrade(self), path.to_path_buf(), status.clone());
         items.push((
@@ -1549,22 +1570,22 @@ impl FilesPage {
                 }
             }),
         ));
-        if !is_dir {
-            let (weak, p, st) = (Rc::downgrade(self), path.to_path_buf(), status.clone());
+        if !targets.is_empty() {
+            let (weak, t, st) = (Rc::downgrade(self), targets.clone(), status.clone());
             items.push((
-                "Copy",
+                copy_label.as_str(),
                 Rc::new(move || {
                     if let Some(this) = weak.upgrade() {
-                        this.copy_paths(std::slice::from_ref(&p), &st);
+                        this.copy_paths(&t, &st);
                     }
                 }),
             ));
-            let (weak, p, st) = (Rc::downgrade(self), path.to_path_buf(), status);
+            let (weak, st) = (Rc::downgrade(self), status);
             items.push((
-                "Save As…",
+                save_label.as_str(),
                 Rc::new(move || {
                     if let Some(this) = weak.upgrade() {
-                        this.save_dialog(vec![p.clone()], st.clone());
+                        this.save_dialog(targets.clone(), st.clone());
                     }
                 }),
             ));
@@ -1646,13 +1667,30 @@ impl FilesPage {
             right.connect_pressed(move |g, _, x, y| {
                 g.set_state(gtk::EventSequenceState::Claimed);
                 if let Some(this) = weak.upgrade() {
-                    this.file_menu(anchor.upcast_ref(), x, y, &entry.path, entry.is_dir, this.status_bar.clone());
+                    if !anchor.is_selected() {
+                        this.file_list.unselect_all();
+                        this.file_list.select_row(Some(&anchor));
+                    }
+                    let targets = this.selected_browse_files();
+                    this.file_menu(anchor.upcast_ref(), x, y, &entry.path, entry.is_dir, targets, this.status_bar.clone());
                 }
             });
             row.add_controller(right);
             self.file_list.append(&row);
         }
         self.status_bar.set_label(&listing.summary());
+    }
+
+    /// The selected files in the browse list, top to bottom. Folders are
+    /// left out: copying a whole folder off the phone isn't offered.
+    fn selected_browse_files(&self) -> Vec<PathBuf> {
+        self.state
+            .borrow()
+            .entries
+            .iter()
+            .filter(|(row, e)| !e.is_dir && row.is_selected())
+            .map(|(_, e)| e.path.clone())
+            .collect()
     }
 
     fn go_up(self: &Rc<Self>) {

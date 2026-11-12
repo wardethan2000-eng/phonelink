@@ -324,6 +324,20 @@ pub fn copied_label(paths: &[PathBuf]) -> String {
     }
 }
 
+/// What a right-click Copy / Save acts on: the whole selection when the
+/// clicked item is part of it (as file managers do), else just that item.
+pub fn menu_targets(clicked: &Path, selected: Vec<PathBuf>) -> Vec<PathBuf> {
+    if selected.iter().any(|p| p == clicked) { selected } else { vec![clicked.to_path_buf()] }
+}
+
+pub fn copy_menu_label(count: usize) -> String {
+    if count > 1 { format!("Copy {count} Files") } else { "Copy".into() }
+}
+
+pub fn save_menu_label(count: usize) -> String {
+    if count > 1 { format!("Save {count} Files to Folder…") } else { "Save As…".into() }
+}
+
 pub fn selected_label(count: usize) -> String {
     format!("{count} photo{} selected", if count == 1 { "" } else { "s" })
 }
@@ -635,6 +649,13 @@ mod tests {
         assert!(rescan_changes_grid(&a, &[PathBuf::from("/b.jpg")]));
         assert_eq!(copied_label(&a), "Copied a.jpg to clipboard");
         assert_eq!(selected_label(1), "1 photo selected");
+        let two = vec![PathBuf::from("/a.jpg"), PathBuf::from("/b.jpg")];
+        assert_eq!(copied_label(&two), "Copied 2 files to clipboard");
+        assert_eq!(menu_targets(Path::new("/b.jpg"), two.clone()), two);
+        assert_eq!(menu_targets(Path::new("/c.jpg"), two.clone()), vec![PathBuf::from("/c.jpg")]);
+        assert_eq!(menu_targets(Path::new("/c.jpg"), vec![]), vec![PathBuf::from("/c.jpg")]);
+        assert_eq!((copy_menu_label(1).as_str(), copy_menu_label(2).as_str()), ("Copy", "Copy 2 Files"));
+        assert_eq!((save_menu_label(1).as_str(), save_menu_label(3).as_str()), ("Save As…", "Save 3 Files to Folder…"));
         assert_eq!(uri_list(&["file:///a".into(), "file:///b".into()]), "file:///a\r\nfile:///b\r\n");
         let mut r = RefreshLimit::default();
         assert!(r.allow(0.0) && !r.allow(29.0) && r.allow(31.0));
