@@ -82,6 +82,8 @@ struct State {
     /// Decoded thumbnails, kept across view changes.
     thumbs: HashMap<PathBuf, gdk::Texture>,
     drag: Option<Drag>,
+    /// The photo last clicked on its own: where a Shift+click range starts.
+    select_anchor: Option<PathBuf>,
     /// Sidebar row → location (a path, or [`PHOTOS`]).
     shortcuts: Vec<(gtk::ListBoxRow, String)>,
     /// Browse rows and what they stand for.
@@ -1174,11 +1176,15 @@ impl FilesPage {
             }
         });
         let (weak, p) = (Rc::downgrade(self), path.to_path_buf());
-        click.connect_released(move |_, n, _, _| {
+        click.connect_released(move |g, n, _, _| {
             let Some(this) = weak.upgrade() else { return };
             let dragged = this.state.borrow().drag.as_ref().is_some_and(|d| d.active);
             if n == 1 && !dragged {
-                this.toggle_photo(&p);
+                if g.current_event_state().contains(gdk::ModifierType::SHIFT_MASK) {
+                    this.select_range_to(&p);
+                } else {
+                    this.toggle_photo(&p);
+                }
             }
         });
         child.add_controller(click);
@@ -1458,9 +1464,35 @@ impl FilesPage {
     }
 
     fn toggle_photo(&self, path: &Path) {
-        if let Some(t) = self.state.borrow_mut().tiles.iter_mut().find(|t| t.path == path) {
-            let on = !t.selected;
-            t.set_selected(on);
+        {
+            let mut s = self.state.borrow_mut();
+            if let Some(t) = s.tiles.iter_mut().find(|t| t.path == path) {
+                let on = !t.selected;
+                t.set_selected(on);
+            }
+            s.select_anchor = Some(path.to_path_buf());
+        }
+        self.update_selection_buttons();
+    }
+
+    /// Shift+click: select every photo between the last one clicked and
+    /// this one, adding to what is already selected (the anchor stays put,
+    /// so another Shift+click extends from the same photo).
+    fn select_range_to(&self, path: &Path) {
+        let range = {
+            let s = self.state.borrow();
+            let order: Vec<PathBuf> = s.tiles.iter().map(|t| t.path.clone()).collect();
+            s.select_anchor.as_deref().and_then(|a| files::shift_range(&order, a, path))
+        };
+        let Some(range) = range else {
+            // Nothing clicked yet (or that photo is gone): a plain click.
+            self.toggle_photo(path);
+            return;
+        };
+        for t in &mut self.state.borrow_mut().tiles[range] {
+            if !t.selected {
+                t.set_selected(true);
+            }
         }
         self.update_selection_buttons();
     }

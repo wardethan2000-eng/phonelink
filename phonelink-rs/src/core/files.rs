@@ -338,6 +338,14 @@ pub fn save_menu_label(count: usize) -> String {
     if count > 1 { format!("Save {count} Files to Folder…") } else { "Save As…".into() }
 }
 
+/// Shift+click: the run of photos (in screen order) from the last one
+/// clicked to this one, either way round. `None` when either is gone.
+pub fn shift_range(order: &[PathBuf], anchor: &Path, clicked: &Path) -> Option<std::ops::RangeInclusive<usize>> {
+    let a = order.iter().position(|p| p == anchor)?;
+    let b = order.iter().position(|p| p == clicked)?;
+    Some(a.min(b)..=a.max(b))
+}
+
 pub fn selected_label(count: usize) -> String {
     format!("{count} photo{} selected", if count == 1 { "" } else { "s" })
 }
@@ -654,6 +662,11 @@ mod tests {
         assert_eq!(menu_targets(Path::new("/b.jpg"), two.clone()), two);
         assert_eq!(menu_targets(Path::new("/c.jpg"), two.clone()), vec![PathBuf::from("/c.jpg")]);
         assert_eq!(menu_targets(Path::new("/c.jpg"), vec![]), vec![PathBuf::from("/c.jpg")]);
+        let row: Vec<PathBuf> = ["/1", "/2", "/3", "/4"].iter().map(PathBuf::from).collect();
+        assert_eq!(shift_range(&row, Path::new("/2"), Path::new("/4")), Some(1..=3));
+        assert_eq!(shift_range(&row, Path::new("/4"), Path::new("/1")), Some(0..=3));
+        assert_eq!(shift_range(&row, Path::new("/3"), Path::new("/3")), Some(2..=2));
+        assert_eq!(shift_range(&row, Path::new("/gone"), Path::new("/3")), None);
         assert_eq!((copy_menu_label(1).as_str(), copy_menu_label(2).as_str()), ("Copy", "Copy 2 Files"));
         assert_eq!((save_menu_label(1).as_str(), save_menu_label(3).as_str()), ("Save As…", "Save 3 Files to Folder…"));
         assert_eq!(uri_list(&["file:///a".into(), "file:///b".into()]), "file:///a\r\nfile:///b\r\n");
