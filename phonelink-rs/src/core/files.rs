@@ -145,6 +145,35 @@ pub fn photos_in(folders: &[PathBuf]) -> Vec<Photo> {
     found
 }
 
+/// [`photo_folders`], read fresh from the phone rather than from sshfs's
+/// cache (see [`flush_cached`]).
+pub fn photo_folders_fresh(base: &Path) -> Vec<PathBuf> {
+    let roots = ["DCIM/Camera", "DCIM", "Pictures", "Download", "Movies"].map(|r| base.join(r));
+    for dir in roots.iter().filter(|d| d.is_dir()) {
+        flush_cached(dir);
+    }
+    let folders = photo_folders(base);
+    for dir in folders.iter().filter(|d| !roots.contains(d)) {
+        flush_cached(dir);
+    }
+    folders
+}
+
+/// The name of the empty folder [`flush_cached`] makes and removes at once.
+pub const FLUSH_DIR_NAME: &str = ".phonerelay-refresh";
+
+/// Make sshfs read `dir` from the phone again on the next look. It keeps
+/// listings and change times for about 20 s, and drops a folder's copies
+/// whenever something is made or removed in it: so make an empty hidden
+/// folder there and remove it. Off the main thread (it reaches the phone).
+/// Nothing happens where the phone doesn't allow it, and a leftover from
+/// an earlier try is removed.
+pub fn flush_cached(dir: &Path) {
+    let probe = dir.join(FLUSH_DIR_NAME);
+    let _ = std::fs::create_dir(&probe);
+    let _ = std::fs::remove_dir(&probe);
+}
+
 /// How often Files looks for new pictures or files while it is on screen.
 /// Each look only reads the watched folders' change times.
 pub const WATCH_INTERVAL_SECONDS: u32 = 5;
@@ -670,6 +699,22 @@ mod tests {
         let want: Vec<PathBuf> =
             ["DCIM/Camera", "DCIM", "Pictures", "Pictures/Screenshots"].iter().map(PathBuf::from).collect();
         assert_eq!(got, want);
+    }
+
+    #[test]
+    fn flushing_leaves_nothing_behind() {
+        let t = tempfile::tempdir().unwrap();
+        let b = t.path();
+        touch(&b.join("DCIM/Camera/a.jpg"), 1);
+        touch(&b.join("Pictures/Screenshots/s.png"), 1);
+        // A leftover from a try that never finished is cleaned up too.
+        std::fs::create_dir(b.join("DCIM/Camera").join(FLUSH_DIR_NAME)).unwrap();
+        assert_eq!(photo_folders_fresh(b), photo_folders(b));
+        assert!(!b.join("DCIM/Camera").join(FLUSH_DIR_NAME).exists());
+        assert!(!b.join("Pictures/Screenshots").join(FLUSH_DIR_NAME).exists());
+        // A missing folder is left alone.
+        flush_cached(&b.join("Movies"));
+        assert!(!b.join("Movies").exists());
     }
 
     #[test]

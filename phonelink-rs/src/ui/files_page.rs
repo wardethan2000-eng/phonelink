@@ -141,15 +141,20 @@ pub struct FilesPage {
 const STALLED_SECONDS: f64 = 60.0;
 
 /// The Recent Photos folders, watched from before they are read, and the
-/// pictures in them. Off the main thread: it reads the phone.
-fn scan_photos(base: &Path) -> (FolderWatch, Vec<Photo>) {
-    let watch = FolderWatch::take(files::photo_folders(base));
+/// pictures in them; `fresh` reads them from the phone, past sshfs's cache.
+/// Off the main thread: it reads the phone.
+fn scan_photos(base: &Path, fresh: bool) -> (FolderWatch, Vec<Photo>) {
+    let folders = if fresh { files::photo_folders_fresh(base) } else { files::photo_folders(base) };
+    let watch = FolderWatch::take(folders);
     let found = files::photos_in(&watch.folders);
     (watch, found)
 }
 
 /// A Browse folder, watched from before it is read, and its listing.
-fn read_directory(dir: &Path) -> (FolderWatch, Result<Listing, String>) {
+fn read_directory(dir: &Path, fresh: bool) -> (FolderWatch, Result<Listing, String>) {
+    if fresh {
+        files::flush_cached(dir);
+    }
     let watch = FolderWatch::take(vec![dir.to_path_buf()]);
     (watch, files::list_directory(dir))
 }
@@ -338,6 +343,8 @@ impl FilesPage {
         day_btn.add_css_class("flat");
         day_btn.set_active(by_day);
         photo_actions.append(&day_btn);
+        let photo_refresh = flat_icon("view-refresh-symbolic", "Check the phone for new photos");
+        photo_actions.append(&photo_refresh);
         photo_actions.append(&gtk::Separator::new(gtk::Orientation::Vertical));
         let select_all = flat_icon("edit-select-all-symbolic", "Select all");
         let save_btn = flat_icon("document-save-symbolic", "Save selected to folder");
@@ -513,6 +520,12 @@ impl FilesPage {
                 }
             });
         }
+        let weak = Rc::downgrade(&this);
+        photo_refresh.connect_clicked(move |_| {
+            if let Some(this) = weak.upgrade() {
+                this.refresh_view();
+            }
+        });
         let weak = Rc::downgrade(&this);
         select_all.connect_clicked(move |_| {
             if let Some(this) = weak.upgrade() {
@@ -922,7 +935,7 @@ impl FilesPage {
                 // A new connection unmounts the old storage: mount and reload.
                 this.sync_mount(true, false);
             } else if this.showing_photos() {
-                this.rescan_photos();
+                this.rescan_photos(false);
             } else {
                 let path = this.state.borrow().current_path.clone();
                 if !path.is_empty() {
@@ -1041,7 +1054,7 @@ impl FilesPage {
         glib::spawn_future_local(async move {
             let Ok((watch, found)) = gio::spawn_blocking(move || {
                 thumbs::prune(&thumbs::cache_dir(), 2000);
-                scan_photos(&base)
+                scan_photos(&base, false)
             })
             .await
             else {
@@ -1057,23 +1070,32 @@ impl FilesPage {
     }
 
     /// Rescan; rebuild the grid only when the set changed, keeping the
-    /// selection and the thumbnails already decoded.
-    fn rescan_photos(self: &Rc<Self>) {
+    /// selection and the thumbnails already decoded. `fresh` (the Refresh
+    /// button) reads the phone itself rather than sshfs's copy, and runs
+    /// even while an automatic rescan does: that one's older result is
+    /// then dropped, as the photos on screen changed under it.
+    fn rescan_photos(self: &Rc<Self>, fresh: bool) {
         let Some(base) = self.photo_base() else { return };
         let now = self.clock();
         let shown = {
             let mut s = self.state.borrow_mut();
-            if s.scanning_since.is_some_and(|t| now - t < STALLED_SECONDS) {
+            if !fresh && s.scanning_since.is_some_and(|t| now - t < STALLED_SECONDS) {
                 return;
             }
             s.scanning_since = Some(now);
             files::photo_paths(&s.photos)
         };
+        if fresh {
+            self.photo_status.set_label("Checking the phone for new photos…");
+        }
         let weak = Rc::downgrade(self);
         glib::spawn_future_local(async move {
-            let result = gio::spawn_blocking(move || scan_photos(&base)).await;
+            let result = gio::spawn_blocking(move || scan_photos(&base, fresh)).await;
             let Some(this) = weak.upgrade() else { return };
             this.state.borrow_mut().scanning_since = None;
+            if fresh {
+                this.show_photo_count();
+            }
             let Ok((mut watch, found)) = result else { return };
             let now = this.clock();
             let generation = {
@@ -1142,7 +1164,7 @@ impl FilesPage {
                 return;
             }
             if photos {
-                this.rescan_photos();
+                this.rescan_photos(false);
             } else {
                 this.refresh_directory();
             }
@@ -1638,6 +1660,13 @@ impl FilesPage {
         self.state.borrow().tiles.iter().filter(|t| t.selected).map(|t| t.path.clone()).collect()
     }
 
+    /// The status line under the photos: how many, or how many selected.
+    fn show_photo_count(&self) {
+        let total = self.state.borrow().photos.len();
+        self.photo_status.set_label(&if total > 0 { format!("{total} photos") } else { "No photos found".into() });
+        self.update_selection_buttons();
+    }
+
     fn update_selection_buttons(&self) {
         let count = self.state.borrow().tiles.iter().filter(|t| t.selected).count();
         self.save_btn.set_sensitive(count > 0);
@@ -1763,6 +1792,11 @@ impl FilesPage {
     }
 
     fn load_directory(self: &Rc<Self>, path: &str) {
+        self.read_folder(path, false);
+    }
+
+    /// List `path` into Browse; `fresh` reads it from the phone, past sshfs's cache.
+    fn read_folder(self: &Rc<Self>, path: &str, fresh: bool) {
         self.clear_listing();
         let generation = {
             let mut s = self.state.borrow_mut();
@@ -1773,7 +1807,7 @@ impl FilesPage {
         let (weak, dir) = (Rc::downgrade(self), path.to_string());
         glib::spawn_future_local(async move {
             let d = PathBuf::from(&dir);
-            let Ok((watch, result)) = gio::spawn_blocking(move || read_directory(&d)).await else { return };
+            let Ok((watch, result)) = gio::spawn_blocking(move || read_directory(&d, fresh)).await else { return };
             let Some(this) = weak.upgrade() else { return };
             {
                 let mut s = this.state.borrow_mut();
@@ -1805,7 +1839,7 @@ impl FilesPage {
         let weak = Rc::downgrade(self);
         glib::spawn_future_local(async move {
             let d = PathBuf::from(&dir);
-            let result = gio::spawn_blocking(move || read_directory(&d)).await;
+            let result = gio::spawn_blocking(move || read_directory(&d, false)).await;
             let Some(this) = weak.upgrade() else { return };
             this.state.borrow_mut().scanning_since = None;
             let Ok((mut watch, Ok(listing))) = result else { return };
@@ -1913,16 +1947,17 @@ impl FilesPage {
         }
     }
 
+    /// The Refresh buttons: read the phone itself, not sshfs's copy.
     fn refresh_view(self: &Rc<Self>) {
         if self.showing_photos() {
             if self.state.borrow().mounted {
-                self.load_recent_photos();
+                self.rescan_photos(true);
             }
             return;
         }
         let path = self.state.borrow().current_path.clone();
         if !path.is_empty() {
-            self.load_directory(&path);
+            self.read_folder(&path, true);
         }
     }
 
