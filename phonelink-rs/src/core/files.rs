@@ -106,29 +106,110 @@ pub fn directory_icon_name(label: &str) -> &'static str {
 /// Movies (plus one level of subfolders), dotfiles skipped, newest first,
 /// at most [`MAX_RECENT_PHOTOS`].
 pub fn recent_photos(base: &Path) -> Vec<Photo> {
+    photos_in(&photo_folders(base))
+}
+
+/// The folders [`recent_photos`] reads: the ones above that exist, and the
+/// subfolders of DCIM, Pictures, Download and Movies.
+pub fn photo_folders(base: &Path) -> Vec<PathBuf> {
     let roots = [base.join("DCIM").join("Camera"), base.join("DCIM"), base.join("Pictures"), base.join("Download"), base.join("Movies")];
-    let mut found: Vec<Photo> = Vec::new();
-    let mut seen = HashSet::new();
-    for dir in &roots {
+    let mut out: Vec<PathBuf> = Vec::new();
+    for dir in roots {
         if !dir.is_dir() {
             continue;
         }
-        collect_images(dir, &mut found, &mut seen);
         let top = dir.file_name().map(|n| n.to_string_lossy().to_lowercase()).unwrap_or_default();
-        if !["dcim", "pictures", "download", "movies"].contains(&top.as_str()) {
-            continue;
-        }
-        let Ok(entries) = std::fs::read_dir(dir) else { continue };
-        for e in entries.flatten() {
+        let subfolders = ["dcim", "pictures", "download", "movies"].contains(&top.as_str());
+        let entries = if subfolders { std::fs::read_dir(&dir).ok() } else { None };
+        out.push(dir);
+        for e in entries.into_iter().flatten().flatten() {
             let name = e.file_name().to_string_lossy().into_owned();
-            if !name.starts_with('.') && e.path().is_dir() {
-                collect_images(&e.path(), &mut found, &mut seen);
+            if !name.starts_with('.') && e.path().is_dir() && !out.contains(&e.path()) {
+                out.push(e.path());
             }
         }
+    }
+    out
+}
+
+/// The pictures directly in `folders`, newest first, at most
+/// [`MAX_RECENT_PHOTOS`].
+pub fn photos_in(folders: &[PathBuf]) -> Vec<Photo> {
+    let mut found: Vec<Photo> = Vec::new();
+    let mut seen = HashSet::new();
+    for dir in folders {
+        collect_images(dir, &mut found, &mut seen);
     }
     found.sort_by(|a, b| b.modified.cmp(&a.modified).then_with(|| a.path.cmp(&b.path)));
     found.truncate(MAX_RECENT_PHOTOS);
     found
+}
+
+/// How often Files looks for new pictures or files while it is on screen.
+/// Each look only reads the watched folders' change times.
+pub const WATCH_INTERVAL_SECONDS: u32 = 5;
+/// After a folder changed, rescan on every look for this long. sshfs keeps
+/// listings and change times for up to 20 s each, separately, so the first
+/// rescan after a change can still read the old listing.
+pub const WATCH_SETTLE_SECONDS: f64 = 30.0;
+
+/// Folders on the phone and when each last changed, to spot a new photo or
+/// file without listing them all again.
+#[derive(Debug, Default, Clone, PartialEq)]
+pub struct FolderWatch {
+    pub folders: Vec<PathBuf>,
+    stamps: Vec<Option<i64>>,
+    /// Rescan on every look until then (clock seconds).
+    settle_until: Option<f64>,
+}
+
+impl FolderWatch {
+    /// Watch `folders` as they are now. Take it before reading them: a
+    /// change in between shows on the next look.
+    pub fn take(folders: Vec<PathBuf>) -> Self {
+        let stamps = folder_stamps(&folders);
+        Self { folders, stamps, settle_until: None }
+    }
+
+    /// A look at `now` found `stamps` (from [`folder_stamps`] on
+    /// `self.folders`): should Files rescan?
+    pub fn changed(&mut self, stamps: Vec<Option<i64>>, now: f64) -> bool {
+        if stamps != self.stamps {
+            self.stamps = stamps;
+            self.settle_until = Some(now + WATCH_SETTLE_SECONDS);
+            return true;
+        }
+        match self.settle_until {
+            Some(t) if now < t => true,
+            Some(_) => {
+                self.settle_until = None;
+                false
+            }
+            None => false,
+        }
+    }
+
+    /// A rescan replaced the watch: keep rescanning while the last change
+    /// is still settling.
+    pub fn carry_settling(&mut self, old: &FolderWatch) {
+        self.settle_until = old.settle_until;
+    }
+
+    /// A rescan was dropped: keep rescanning on later looks.
+    pub fn keep_settling(&mut self, now: f64) {
+        self.settle_until = Some(now + WATCH_SETTLE_SECONDS);
+    }
+}
+
+/// When each folder last changed (seconds since 1970), None when it can't be read.
+pub fn folder_stamps(folders: &[PathBuf]) -> Vec<Option<i64>> {
+    folders
+        .iter()
+        .map(|d| {
+            let t = std::fs::metadata(d).ok()?.modified().ok()?;
+            Some(t.duration_since(SystemTime::UNIX_EPOCH).map(|d| d.as_secs() as i64).unwrap_or(0))
+        })
+        .collect()
 }
 
 /// One picture from [`recent_photos`].
@@ -222,7 +303,7 @@ pub struct Entry {
     pub size: u64,
 }
 
-#[derive(Debug, Default, PartialEq)]
+#[derive(Debug, Default, Clone, PartialEq)]
 pub struct Listing {
     pub dirs: Vec<Entry>,
     pub files: Vec<Entry>,
@@ -575,6 +656,46 @@ mod tests {
         let got: Vec<_> = photos.iter().map(|p| p.path.file_name().unwrap().to_string_lossy().into_owned()).collect();
         assert_eq!(got, ["new.jpg", "shot.png", "clip.webp", "old.jpg"]);
         assert!(photos[0].modified > photos[3].modified);
+    }
+
+    #[test]
+    fn photo_folders_are_the_ones_the_scan_reads() {
+        let t = tempfile::tempdir().unwrap();
+        let b = t.path();
+        touch(&b.join("DCIM/Camera/a.jpg"), 1);
+        touch(&b.join("DCIM/.thumbnails/t.jpg"), 1);
+        touch(&b.join("Pictures/Screenshots/s.png"), 1);
+        touch(&b.join("Pictures/Screenshots/deeper/no.png"), 1);
+        let got: Vec<_> = photo_folders(b).iter().map(|p| p.strip_prefix(b).unwrap().to_path_buf()).collect();
+        let want: Vec<PathBuf> =
+            ["DCIM/Camera", "DCIM", "Pictures", "Pictures/Screenshots"].iter().map(PathBuf::from).collect();
+        assert_eq!(got, want);
+    }
+
+    #[test]
+    fn a_folder_change_rescans_until_it_settles() {
+        let t = tempfile::tempdir().unwrap();
+        let cam = t.path().join("DCIM/Camera");
+        touch(&cam.join("a.jpg"), 0);
+        let mut w = FolderWatch::take(vec![cam.clone()]);
+        let same = folder_stamps(&w.folders);
+        assert!(!w.changed(same.clone(), 0.0));
+        // A new photo moves the folder's change time.
+        let moved = vec![same[0].map(|s| s + 7)];
+        assert!(w.changed(moved.clone(), 5.0));
+        // sshfs may still list the old folder: keep looking for a while.
+        assert!(w.changed(moved.clone(), 20.0));
+        let mut fresh = FolderWatch::take(vec![cam]);
+        fresh.carry_settling(&w);
+        assert!(fresh.changed(fresh.stamps.clone(), 34.0));
+        assert!(!fresh.changed(fresh.stamps.clone(), 36.0));
+        assert!(!fresh.changed(fresh.stamps.clone(), 40.0));
+        // A folder that disappears counts as a change.
+        assert!(fresh.changed(vec![None], 45.0));
+        // A dropped rescan tries again later.
+        let mut quiet = FolderWatch::take(fresh.folders.clone());
+        quiet.keep_settling(100.0);
+        assert!(quiet.changed(quiet.stamps.clone(), 110.0));
     }
 
     #[test]

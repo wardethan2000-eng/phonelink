@@ -13,7 +13,7 @@ use adw::prelude::*;
 use gtk::gdk;
 
 use super::icons;
-use crate::core::files::{self, Listing, Photo, RefreshLimit, THUMB_SIZE};
+use crate::core::files::{self, FolderWatch, Listing, Photo, RefreshLimit, THUMB_SIZE};
 use crate::core::models::Device;
 use crate::core::settings::Settings;
 use crate::core::thumbs;
@@ -93,6 +93,17 @@ struct State {
     remounts: files::RemountGuard,
     /// The next automatic remount, while one waits.
     retry: Option<glib::SourceId>,
+    /// The folders behind Recent Photos and the open Browse folder, to pick
+    /// up new photos and files while Files is on screen.
+    photo_watch: Option<FolderWatch>,
+    dir_watch: Option<FolderWatch>,
+    /// The Browse listing on screen.
+    listing: Option<Listing>,
+    /// Since when a look at the folders, or a rescan, has been running
+    /// (clock seconds). A stalled sftp link can hang one; after a minute
+    /// another may start.
+    looking_since: Option<f64>,
+    scanning_since: Option<f64>,
     subs: Vec<Subscription>,
 }
 
@@ -123,6 +134,24 @@ pub struct FilesPage {
     downloads: String,
     started: Instant,
     state: RefCell<State>,
+}
+
+/// A look or a rescan running this long is taken as stuck on a stalled
+/// sftp link; another may start.
+const STALLED_SECONDS: f64 = 60.0;
+
+/// The Recent Photos folders, watched from before they are read, and the
+/// pictures in them. Off the main thread: it reads the phone.
+fn scan_photos(base: &Path) -> (FolderWatch, Vec<Photo>) {
+    let watch = FolderWatch::take(files::photo_folders(base));
+    let found = files::photos_in(&watch.folders);
+    (watch, found)
+}
+
+/// A Browse folder, watched from before it is read, and its listing.
+fn read_directory(dir: &Path) -> (FolderWatch, Result<Listing, String>) {
+    let watch = FolderWatch::take(vec![dir.to_path_buf()]);
+    (watch, files::list_directory(dir))
 }
 
 fn caption(text: &str) -> gtk::Label {
@@ -446,6 +475,18 @@ impl FilesPage {
             }
         });
         this.wire_drag_select();
+        let weak = Rc::downgrade(&this);
+        glib::timeout_add_seconds_local(files::WATCH_INTERVAL_SECONDS, move || {
+            let Some(this) = weak.upgrade() else { return glib::ControlFlow::Break };
+            this.look_for_changes();
+            glib::ControlFlow::Continue
+        });
+        let weak = Rc::downgrade(&this);
+        this.widget.connect_map(move |_| {
+            if let Some(this) = weak.upgrade() {
+                this.look_for_changes();
+            }
+        });
         let weak = Rc::downgrade(&this);
         this.view_stack.connect_visible_child_name_notify(move |_| {
             if let Some(this) = weak.upgrade() {
@@ -998,35 +1039,113 @@ impl FilesPage {
         let generation = self.state.borrow().photo_generation;
         let weak = Rc::downgrade(self);
         glib::spawn_future_local(async move {
-            let Ok(found) = gio::spawn_blocking(move || {
+            let Ok((watch, found)) = gio::spawn_blocking(move || {
                 thumbs::prune(&thumbs::cache_dir(), 2000);
-                files::recent_photos(&base)
+                scan_photos(&base)
             })
             .await
             else {
                 return;
             };
             if let Some(this) = weak.upgrade() {
+                if this.state.borrow().photo_generation == generation {
+                    this.state.borrow_mut().photo_watch = Some(watch);
+                }
                 this.show_photos(generation, found);
             }
         });
     }
 
-    /// Rescan; rebuild the grid only when the set changed.
+    /// Rescan; rebuild the grid only when the set changed, keeping the
+    /// selection and the thumbnails already decoded.
     fn rescan_photos(self: &Rc<Self>) {
         let Some(base) = self.photo_base() else { return };
-        let shown = files::photo_paths(&self.state.borrow().photos);
-        let weak = Rc::downgrade(self);
-        glib::spawn_future_local(async move {
-            let Ok(found) = gio::spawn_blocking(move || files::recent_photos(&base)).await else { return };
-            let Some(this) = weak.upgrade() else { return };
-            let current = files::photo_paths(&this.state.borrow().photos);
-            if current != shown || !files::rescan_changes_grid(&current, &files::photo_paths(&found)) {
+        let now = self.clock();
+        let shown = {
+            let mut s = self.state.borrow_mut();
+            if s.scanning_since.is_some_and(|t| now - t < STALLED_SECONDS) {
                 return;
             }
-            this.clear_photos();
-            let generation = this.state.borrow().photo_generation;
+            s.scanning_since = Some(now);
+            files::photo_paths(&s.photos)
+        };
+        let weak = Rc::downgrade(self);
+        glib::spawn_future_local(async move {
+            let result = gio::spawn_blocking(move || scan_photos(&base)).await;
+            let Some(this) = weak.upgrade() else { return };
+            this.state.borrow_mut().scanning_since = None;
+            let Ok((mut watch, found)) = result else { return };
+            let now = this.clock();
+            let generation = {
+                let mut s = this.state.borrow_mut();
+                if s.drag.is_some() {
+                    // Not mid drag-select: try again on a later look.
+                    if let Some(w) = s.photo_watch.as_mut() {
+                        w.keep_settling(now);
+                    }
+                    return;
+                }
+                if let Some(old) = &s.photo_watch {
+                    watch.carry_settling(old);
+                }
+                s.photo_watch = Some(watch);
+                let current = files::photo_paths(&s.photos);
+                if current != shown || !files::rescan_changes_grid(&current, &files::photo_paths(&found)) {
+                    return;
+                }
+                // Drops thumbnails still decoding for the old set; the
+                // redraw asks again for any it still lacks.
+                s.photo_generation += 1;
+                s.photo_generation
+            };
             this.show_photos(generation, found);
+        });
+    }
+
+    /// Every few seconds while Files is on screen: has a watched folder
+    /// changed (a new photo, a file saved on the phone)? Then rescan it.
+    /// Only the folders' change times are read, not their listings.
+    fn look_for_changes(self: &Rc<Self>) {
+        if !self.widget.is_mapped() {
+            return;
+        }
+        let photos = self.showing_photos();
+        let now = self.clock();
+        let folders = {
+            let mut s = self.state.borrow_mut();
+            let busy = |t: Option<f64>| t.is_some_and(|t| now - t < STALLED_SECONDS);
+            if !s.mounted || s.mounting || s.drag.is_some() || busy(s.looking_since) || busy(s.scanning_since) {
+                return;
+            }
+            let watch = if photos { &s.photo_watch } else { &s.dir_watch };
+            let Some(folders) = watch.as_ref().map(|w| w.folders.clone()) else { return };
+            s.looking_since = Some(now);
+            folders
+        };
+        let weak = Rc::downgrade(self);
+        glib::spawn_future_local(async move {
+            let watched = folders.clone();
+            let result = gio::spawn_blocking(move || files::folder_stamps(&watched)).await;
+            let Some(this) = weak.upgrade() else { return };
+            this.state.borrow_mut().looking_since = None;
+            let Ok(stamps) = result else { return };
+            let changed = {
+                let mut s = this.state.borrow_mut();
+                let watch = if photos { s.photo_watch.as_mut() } else { s.dir_watch.as_mut() };
+                // A scan or another folder may have replaced the watch meanwhile.
+                match watch {
+                    Some(w) if w.folders == folders => w.changed(stamps, this.clock()),
+                    _ => false,
+                }
+            };
+            if !changed || photos != this.showing_photos() {
+                return;
+            }
+            if photos {
+                this.rescan_photos();
+            } else {
+                this.refresh_directory();
+            }
         });
     }
 
@@ -1654,17 +1773,76 @@ impl FilesPage {
         let (weak, dir) = (Rc::downgrade(self), path.to_string());
         glib::spawn_future_local(async move {
             let d = PathBuf::from(&dir);
-            let Ok(result) = gio::spawn_blocking(move || files::list_directory(&d)).await else { return };
+            let Ok((watch, result)) = gio::spawn_blocking(move || read_directory(&d)).await else { return };
             let Some(this) = weak.upgrade() else { return };
             {
-                let s = this.state.borrow();
+                let mut s = this.state.borrow_mut();
                 if s.dir_generation != generation || s.current_path != dir {
                     return;
                 }
+                s.dir_watch = Some(watch);
+                s.listing = result.as_ref().ok().cloned();
             }
             match result {
                 Ok(listing) => this.show_listing(&listing),
                 Err(e) => this.status_bar.set_label(&e),
+            }
+        });
+    }
+
+    /// The open folder changed on the phone: list it again, and redraw only
+    /// when the listing differs, keeping the selection.
+    fn refresh_directory(self: &Rc<Self>) {
+        let now = self.clock();
+        let (dir, generation) = {
+            let mut s = self.state.borrow_mut();
+            if s.current_path.is_empty() || s.scanning_since.is_some_and(|t| now - t < STALLED_SECONDS) {
+                return;
+            }
+            s.scanning_since = Some(now);
+            (s.current_path.clone(), s.dir_generation)
+        };
+        let weak = Rc::downgrade(self);
+        glib::spawn_future_local(async move {
+            let d = PathBuf::from(&dir);
+            let result = gio::spawn_blocking(move || read_directory(&d)).await;
+            let Some(this) = weak.upgrade() else { return };
+            this.state.borrow_mut().scanning_since = None;
+            let Ok((mut watch, Ok(listing))) = result else { return };
+            {
+                let mut s = this.state.borrow_mut();
+                if s.dir_generation != generation || s.current_path != dir {
+                    return;
+                }
+                if let Some(old) = &s.dir_watch {
+                    watch.carry_settling(old);
+                }
+                s.dir_watch = Some(watch);
+                if s.listing.as_ref() == Some(&listing) {
+                    return;
+                }
+                s.listing = Some(listing.clone());
+            }
+            let selected: HashSet<PathBuf> = this
+                .state
+                .borrow()
+                .entries
+                .iter()
+                .filter(|(r, _)| r.is_selected())
+                .map(|(_, e)| e.path.clone())
+                .collect();
+            this.clear_listing();
+            this.show_listing(&listing);
+            let rows: Vec<gtk::ListBoxRow> = this
+                .state
+                .borrow()
+                .entries
+                .iter()
+                .filter(|(_, e)| selected.contains(&e.path))
+                .map(|(r, _)| r.clone())
+                .collect();
+            for row in rows {
+                this.file_list.select_row(Some(&row));
             }
         });
     }

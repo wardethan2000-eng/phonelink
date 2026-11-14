@@ -228,6 +228,7 @@ The Files tab has two views, switchable at the top:
 
 - Shows up to 200 most recent photos from your phone's camera and Pictures folders, as a **grid** or a **list** (with time and size), **newest or oldest first**, optionally **grouped by day**; the view is remembered
 - Thumbnails come from each photo's built-in preview and are kept on the computer, so they load quickly and each photo is fetched only once
+- New photos taken while PhoneRelay is open show up on their own, usually within half a minute
 - **Click** a tile to select it (blue checkmark appears); click again to deselect
 - **Drag** across photos to select a run of them, from the first to the last you pass over (it scrolls at the edges)
 - **Double-click** to open the photo in your default image viewer
@@ -240,6 +241,7 @@ The Files tab has two views, switchable at the top:
 - Navigate your phone's full file system
 - Click **folders** to open them; click **files** to open them in the default app
 - Use the **← back** button or the breadcrumb path label to navigate up
+- Files added on the phone appear in the open folder on their own
 - **Right-click** any file → **Open / Copy / Save As…**
 - **Right-click** any folder → **Open**
 
