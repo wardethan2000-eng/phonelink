@@ -307,6 +307,7 @@ func newLink(auth *libgm.AuthData, session string) *link {
 		fatal:   make(chan error, 1),
 	}
 	l.cli = libgm.NewClient(auth, nil, l.logger)
+	l.cli.SetPingInterval(phonePingInterval)
 	var once sync.Once
 	l.cli.SetEventHandler(func(evt any) {
 		switch e := evt.(type) {
@@ -329,6 +330,14 @@ func newLink(auth *libgm.AuthData, session string) *link {
 }
 
 var errLoggedOut = errors.New("Google account signed out of Google Messages")
+
+// phonePingInterval is how often libgm checks that the phone is still
+// reachable. libgm's default is one minute, and every check wakes Google
+// Messages on the phone: on a Galaxy S25 that kept the phone awake for about
+// 4 of 10 hours. mautrix's own bridge uses 20 minutes. New messages do not
+// depend on these checks (Google pushes them), and a slow request still
+// triggers an immediate check, so only "phone not responding" is slower to show.
+const phonePingInterval = 20 * time.Minute
 
 func (l *link) die(err error) {
 	select {
